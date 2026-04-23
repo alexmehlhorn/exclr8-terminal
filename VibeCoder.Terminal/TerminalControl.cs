@@ -316,6 +316,15 @@ public class TerminalControl : Control
         }
     }
 
+    // Smooth pixel scroll. Avalonia's PointerWheelEventArgs.Delta.Y
+    // is OS-normalised — mouse wheels deliver ±1 per notch, macOS
+    // trackpads emit fractional values matching finger motion. We
+    // scale by PixelsPerTick (roughly the height of 3 text lines, the
+    // Windows default feel) so one notch advances about three rows.
+    // The buffer does the fractional accumulation internally via
+    // PixelScrollOffset — no integer rounding on our side.
+    private const double PixelsPerTick = 40.0;
+
     protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
     {
         base.OnPointerWheelChanged(e);
@@ -331,9 +340,9 @@ public class TerminalControl : Control
             return;
         }
 
-        int lines = Math.Max(1, (int)Math.Abs(e.Delta.Y) * 3);
-        if (e.Delta.Y > 0) _buffer.ScrollViewUp(lines);
-        else               _buffer.ScrollViewDown(lines);
+        // Positive wheel delta = scroll up (toward scrollback) in pixel
+        // units. Buffer clamps at scrollback bounds.
+        _buffer.ScrollByPixels(e.Delta.Y * PixelsPerTick, _renderer.CellHeight);
         e.Handled = true;
     }
 

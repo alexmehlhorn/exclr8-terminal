@@ -80,15 +80,23 @@ public sealed class TerminalRenderer
         var defBg = theme?.Background ?? TerminalPalette.DefaultBackground;
         ctx.FillRectangle(new SolidColorBrush(defBg), new Rect(size));
 
-        for (int r = 0; r < buf.Rows; r++)
+        // Smooth scroll: when PixelScrollOffset > 0 we're mid-line
+        // between two buffer rows. Shift everything up by that many
+        // pixels and render one extra row above (bleeds off the top)
+        // + one extra below (fills the bottom gap). The control's
+        // ClipToBounds hides anything drawn outside the visible area.
+        double dy = buf.PixelScrollOffset;
+        int startRow = dy > 0 ? -1 : 0;
+        int endRow   = dy > 0 ? buf.Rows : buf.Rows - 1;
+        for (int r = startRow; r <= endRow; r++)
         {
             var row = buf.GetRowForRender(r);
-            if (row != null) DrawRow(ctx, buf, row, r, defBg, theme);
+            if (row != null) DrawRow(ctx, buf, row, r, dy, defBg, theme);
         }
 
-        if (buf.Selection != null) DrawSelection(ctx, buf);
+        if (buf.Selection != null) DrawSelection(ctx, buf, dy);
 
-        DrawCursor(ctx, buf, focused, theme);
+        DrawCursor(ctx, buf, dy, focused, theme);
         DrawScrollbar(ctx, buf, size);
     }
 
@@ -98,7 +106,7 @@ public sealed class TerminalRenderer
     /// total), position driven by ScrollOffset. No interaction paint —
     /// hit-testing and drag live on TerminalControl.
     /// </summary>
-    private static void DrawScrollbar(DrawingContext ctx, TerminalBuffer buf, Size size)
+    private void DrawScrollbar(DrawingContext ctx, TerminalBuffer buf, Size size)
     {
         int sb = buf.ScrollbackCount;
         if (sb <= 0) return;
@@ -116,11 +124,16 @@ public sealed class TerminalRenderer
         // (scrollback). At ScrollOffset=0 we're showing the bottom
         // Rows rows → thumb flush to the bottom. At ScrollOffset=sb
         // we're showing the top Rows of the scrollback → thumb at top.
+        // Smooth scroll: include the sub-line pixel offset so the thumb
+        // tracks smoothly while the user drags a trackpad.
         double total = buf.Rows + sb;
         double thumbRatio = buf.Rows / total;
         double thumbHeight = Math.Max(24, h * thumbRatio);
-        // Travel range of the thumb top: [0, h - thumbHeight].
-        double topInverted = (sb - buf.ScrollOffset) / (double)sb;
+        // Pixel offset is in pixels inside a line; convert to a line
+        // fraction by dividing by the cell height.
+        double scrolledLines = buf.ScrollOffset + (CellHeight > 0 ? buf.PixelScrollOffset / CellHeight : 0);
+        double topInverted = (sb - scrolledLines) / sb;
+        topInverted = Math.Clamp(topInverted, 0.0, 1.0);
         double thumbY = topInverted * (h - thumbHeight);
 
         ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(0xb0, 0xc9, 0xd1, 0xd9)),
@@ -128,9 +141,9 @@ public sealed class TerminalRenderer
     }
 
     private void DrawRow(DrawingContext ctx, TerminalBuffer buf,
-        TerminalCell[] row, int r, Color defBg, TerminalTheme? theme)
+        TerminalCell[] row, int r, double pixelShift, Color defBg, TerminalTheme? theme)
     {
-        double y = r * CellHeight;
+        double y = r * CellHeight - pixelShift;
         int c = 0;
         while (c < row.Length)
         {
@@ -230,7 +243,7 @@ public sealed class TerminalRenderer
         }
     }
 
-    private void DrawSelection(DrawingContext ctx, TerminalBuffer buf)
+    private void DrawSelection(DrawingContext ctx, TerminalBuffer buf, double pixelShift)
     {
         var sel = buf.Selection!;
         var (r1, c1, r2, c2) = sel.Normalized();
@@ -240,18 +253,20 @@ public sealed class TerminalRenderer
             int cs = r == r1 ? c1 : 0;
             int ce = r == r2 ? c2 : buf.Cols - 1;
             ctx.FillRectangle(brush,
-                new Rect(cs * CellWidth, r * CellHeight,
+                new Rect(cs * CellWidth, r * CellHeight - pixelShift,
                          (ce - cs + 1) * CellWidth, CellHeight));
         }
     }
 
     private void DrawCursor(DrawingContext ctx, TerminalBuffer buf,
-        bool focused, TerminalTheme? theme)
+        double pixelShift, bool focused, TerminalTheme? theme)
     {
-        if (!buf.CursorVisible || buf.ScrollOffset > 0) return;
+        // Hide when viewing scrollback: ScrollOffset>0 OR mid-scroll
+        // (PixelScrollOffset>0) both count as "not at the live prompt".
+        if (!buf.CursorVisible || buf.ScrollOffset > 0 || pixelShift > 0) return;
 
         double x = buf.CursorCol * CellWidth;
-        double y = buf.CursorRow * CellHeight;
+        double y = buf.CursorRow * CellHeight - pixelShift;
         var color = theme?.Cursor ?? TerminalPalette.DefaultCursor;
         var brush = new SolidColorBrush(color);
 

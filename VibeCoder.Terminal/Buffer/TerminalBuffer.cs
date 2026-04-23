@@ -66,7 +66,12 @@ public sealed class TerminalBuffer : IParserActions
 
     // Scrollback viewport. 0 = at bottom; positive = scrolled up into
     // scrollback. TerminalControl resets this to 0 on any keystroke.
+    // <see cref="PixelScrollOffset"/> carries the sub-line pixel
+    // remainder so the renderer can slide content smoothly — wheel
+    // events accumulate in pixel space and turn over into whole-line
+    // <see cref="ScrollOffset"/> bumps as they cross a line height.
     public int ScrollOffset { get; private set; }
+    public double PixelScrollOffset { get; private set; }
 
     public TerminalSelection? Selection { get; private set; }
 
@@ -149,6 +154,7 @@ public sealed class TerminalBuffer : IParserActions
         ScrollTop    = 0;
         ScrollBottom = rows - 1;
         ScrollOffset = 0; // viewport must follow new bottom
+        PixelScrollOffset = 0;
         Bump();
     }
 
@@ -163,15 +169,49 @@ public sealed class TerminalBuffer : IParserActions
     public void SetScrollOffset(int offset)
     {
         int clamped = Math.Clamp(offset, 0, _active.Scrollback.Count);
-        if (clamped != ScrollOffset) { ScrollOffset = clamped; Bump(); }
+        if (clamped != ScrollOffset || PixelScrollOffset != 0)
+        {
+            ScrollOffset = clamped;
+            PixelScrollOffset = 0;
+            Bump();
+        }
     }
 
     public void ScrollViewUp(int n)   => SetScrollOffset(ScrollOffset + n);
     public void ScrollViewDown(int n) => SetScrollOffset(ScrollOffset - n);
 
+    /// <summary>
+    /// Add <paramref name="pixels"/> to the scroll position (positive =
+    /// scroll up into scrollback, negative = scroll toward bottom).
+    /// Crosses into whole-line <see cref="ScrollOffset"/> bumps as the
+    /// accumulated pixel distance reaches <paramref name="lineHeight"/>.
+    /// Clamps to the scrollback bounds.
+    /// </summary>
+    public void ScrollByPixels(double pixels, double lineHeight)
+    {
+        if (lineHeight <= 0) return;
+        double total  = ScrollOffset * lineHeight + PixelScrollOffset + pixels;
+        double maxTot = _active.Scrollback.Count * lineHeight;
+        total = Math.Clamp(total, 0.0, maxTot);
+
+        int   newOffset = (int)(total / lineHeight);
+        double newPixel = total - newOffset * lineHeight;
+        if (newOffset != ScrollOffset || Math.Abs(newPixel - PixelScrollOffset) > 0.01)
+        {
+            ScrollOffset      = newOffset;
+            PixelScrollOffset = newPixel;
+            Bump();
+        }
+    }
+
     public void ResetScrollOffset()
     {
-        if (ScrollOffset != 0) { ScrollOffset = 0; Bump(); }
+        if (ScrollOffset != 0 || PixelScrollOffset != 0)
+        {
+            ScrollOffset = 0;
+            PixelScrollOffset = 0;
+            Bump();
+        }
     }
 
     // ---- Selection ----
