@@ -26,6 +26,14 @@ public struct TerminalCell
     /// <summary>Style + rgb-or-indexed flags.</summary>
     public CellFlags Flags;
 
+    /// <summary>Wide-char / continuation flags. Separate byte so CellFlags
+    /// stays a 7-bit legacy palette + stays easy to binary-compare.</summary>
+    public CellFlags2 Flags2;
+
+    /// <summary>OSC 8 hyperlink ID (0 = no link). Maps to a URL via
+    /// <see cref="TerminalBuffer.TryGetHyperlink(ushort,out string)"/>.</summary>
+    public ushort HyperlinkId;
+
     // RGB packing when FgRgb / BgRgb are set — stored in a separate uint
     // (kept out of the main struct for size; zero == default colors).
     public uint FgRgb;
@@ -37,17 +45,28 @@ public struct TerminalCell
 }
 
 [System.Flags]
+public enum CellFlags2 : byte
+{
+    None           = 0,
+    /// <summary>East Asian Wide / emoji — this cell occupies 2 columns.</summary>
+    IsWide         = 1 << 0,
+    /// <summary>Right half of a wide cell — carries no glyph of its own.</summary>
+    IsContinuation = 1 << 1,
+}
+
+[System.Flags]
 public enum CellFlags : byte
 {
-    None       = 0,
-    Bold       = 1 << 0,
-    Italic     = 1 << 1,
-    Underline  = 1 << 2,
-    Inverse    = 1 << 3,
-    Dim        = 1 << 4,
+    None          = 0,
+    Bold          = 1 << 0,
+    Italic        = 1 << 1,
+    Underline     = 1 << 2,
+    Inverse       = 1 << 3,
+    Dim           = 1 << 4,
     /// <summary>When set, <see cref="TerminalCell.FgRgb"/> is authoritative
     /// (24-bit color) instead of <see cref="TerminalCell.FgIndex"/>.</summary>
-    FgRgb      = 1 << 5,
+    FgRgb         = 1 << 5,
     /// <summary>Same for background.</summary>
-    BgRgb      = 1 << 6,
+    BgRgb         = 1 << 6,
+    Strikethrough = 1 << 7,
 }
