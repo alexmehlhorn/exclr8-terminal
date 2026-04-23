@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Native Avalonia terminal renderer. Intentionally separate from
+       VibeCoder.App so it can be extracted/distributed. Depends only on
+       Avalonia and Skia — no PTY, no process management, no app-shell
+       concerns. Consumers feed it bytes via Write() and handle Input +
+       Resized events to wire it to a PTY. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.3.12" />
+    <PackageReference Include="Avalonia.Skia" Version="11.3.12" />
+  </ItemGroup>
+
+</Project>
