@@ -63,7 +63,12 @@ public static class KeyMapper
             case Key.F12:      return Esc("[24~");
             case Key.Enter:    return new byte[] { 0x0D };
             case Key.Tab:      return shift ? Esc("[Z") : new byte[] { 0x09 };
-            case Key.Back:     return new byte[] { 0x7F };
+            // Backspace: Unix shells expect DEL (0x7F — stty erase);
+            // Windows cmd.exe / PowerShell ConPTY expect BS (0x08) and
+            // render DEL as a literal glyph when they see it (the
+            // symptom: each press echoes a box-char, pushes the cursor
+            // past the right margin, and scrolls the prompt off-screen).
+            case Key.Back:     return new byte[] { OperatingSystem.IsWindows() ? (byte)0x08 : (byte)0x7F };
             case Key.Escape:   return new byte[] { 0x1B };
             case Key.Space:    return new byte[] { 0x20 };
         }

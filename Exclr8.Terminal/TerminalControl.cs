@@ -379,6 +379,15 @@ public class TerminalControl : Control
     {
         base.OnTextInput(e);
         if (string.IsNullOrEmpty(e.Text)) return;
+        // Skip control chars — OnKeyDown / KeyMapper already dispatched
+        // them (Enter → CR, Tab → 0x09, Backspace → BS/DEL, Escape →
+        // ESC). On Windows, Avalonia's TextInput fires alongside
+        // KeyDown for keys like Enter, so without this filter we'd
+        // double-send every Enter as "\r\r" which cmd.exe renders as
+        // two newlines — the "prompt keeps scrolling up" symptom.
+        // e.Handled on KeyDown does NOT suppress the subsequent
+        // TextInput in Avalonia; they're separate event channels.
+        if (e.Text.Length == 1 && e.Text[0] < 0x20) { e.Handled = true; return; }
         _buffer.ResetScrollOffset();
         var bytes = KeyMapper.MapTextInput(e.Text, _altHeld);
         if (bytes.Length > 0) { Input?.Invoke(this, bytes); e.Handled = true; }
