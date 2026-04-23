@@ -33,6 +33,11 @@ public class TerminalControl : Control
     private DateTime _lastClickTime = DateTime.MinValue;
     private static readonly TimeSpan DoubleClickThreshold = TimeSpan.FromMilliseconds(400);
 
+    // Scrollbar drag state. When the user pointer-presses on the right-
+    // edge strip we enter scrollbar-drag mode; subsequent PointerMoved
+    // events update ScrollOffset until PointerReleased.
+    private bool _scrollbarDrag;
+
     // Cursor blink timer — toggles the renderer's BlinkVisible flag.
     private readonly DispatcherTimer _blinkTimer;
     private bool _blinkVisible = true;
@@ -194,8 +199,24 @@ public class TerminalControl : Control
         base.OnPointerPressed(e);
         Focus();
 
-        var (row, col) = GridPos(e.GetPosition(this));
+        var pos = e.GetPosition(this);
+
+        // Scrollbar drag: left-click on the right-edge strip starts
+        // a scrollbar drag. Take priority over selection.
         var props = e.GetCurrentPoint(this).Properties;
+        if (props.IsLeftButtonPressed
+            && _buffer.ScrollbackCount > 0
+            && pos.X >= Bounds.Width - TerminalRenderer.ScrollbarWidth)
+        {
+            _scrollbarDrag = true;
+            _buffer.SetScrollOffset(
+                TerminalRenderer.YToScrollOffset(pos.Y, _buffer.ScrollbackCount, _buffer.Rows, Bounds.Height));
+            e.Pointer.Capture(this);
+            e.Handled = true;
+            return;
+        }
+
+        var (row, col) = GridPos(pos);
         int btn = props.IsLeftButtonPressed   ? 0
                 : props.IsMiddleButtonPressed ? 1
                 : props.IsRightButtonPressed  ? 2 : -1;
@@ -243,7 +264,17 @@ public class TerminalControl : Control
     protected override void OnPointerMoved(PointerEventArgs e)
     {
         base.OnPointerMoved(e);
-        var (row, col) = GridPos(e.GetPosition(this));
+        var pos = e.GetPosition(this);
+
+        if (_scrollbarDrag)
+        {
+            _buffer.SetScrollOffset(
+                TerminalRenderer.YToScrollOffset(pos.Y, _buffer.ScrollbackCount, _buffer.Rows, Bounds.Height));
+            e.Handled = true;
+            return;
+        }
+
+        var (row, col) = GridPos(pos);
 
         if (_mouseDown)
         {
@@ -261,6 +292,15 @@ public class TerminalControl : Control
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
         base.OnPointerReleased(e);
+
+        if (_scrollbarDrag)
+        {
+            _scrollbarDrag = false;
+            e.Pointer.Capture(null);
+            e.Handled = true;
+            return;
+        }
+
         var (row, col) = GridPos(e.GetPosition(this));
         bool wasDown = _mouseDown;
         _mouseDown = false;

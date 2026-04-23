@@ -22,6 +22,28 @@ public sealed class TerminalRenderer
     public double CellWidth  { get; private set; }
     public double CellHeight { get; private set; }
 
+    /// <summary>Width of the scrollbar strip on the right edge. Used by
+    /// the hit-tester in <see cref="TerminalControl"/> so pointer
+    /// presses on the bar can become a scroll drag rather than a
+    /// selection start.</summary>
+    public const double ScrollbarWidth = 8;
+
+    /// <summary>Map a vertical pointer Y (in control-local coords) to a
+    /// scroll offset, given the current buffer state and the control
+    /// size. Returns 0 when there is no scrollback.</summary>
+    public static int YToScrollOffset(double y, int scrollbackCount, int rows, double height)
+    {
+        if (scrollbackCount <= 0 || height <= 0) return 0;
+        double total = rows + scrollbackCount;
+        double thumbRatio = rows / total;
+        double thumbHeight = Math.Max(24, height * thumbRatio);
+        double travel = Math.Max(1, height - thumbHeight);
+        // Center the grab so the thumb tracks the cursor.
+        double topInverted = Math.Clamp((y - thumbHeight / 2) / travel, 0.0, 1.0);
+        // topInverted=0 → top of scrollback (offset=sb); topInverted=1 → bottom (offset=0).
+        return (int)Math.Round(scrollbackCount * (1.0 - topInverted));
+    }
+
     /// <summary>Toggled by the cursor-blink timer on
     /// <see cref="TerminalControl"/>. When <c>false</c> and the active
     /// cursor style is a "blink" variant, the cursor is hidden for one
@@ -67,6 +89,42 @@ public sealed class TerminalRenderer
         if (buf.Selection != null) DrawSelection(ctx, buf);
 
         DrawCursor(ctx, buf, focused, theme);
+        DrawScrollbar(ctx, buf, size);
+    }
+
+    /// <summary>
+    /// Thin scrollbar on the right edge. Only drawn when there's
+    /// scrollback to represent. Proportional thumb size (viewport /
+    /// total), position driven by ScrollOffset. No interaction paint —
+    /// hit-testing and drag live on TerminalControl.
+    /// </summary>
+    private static void DrawScrollbar(DrawingContext ctx, TerminalBuffer buf, Size size)
+    {
+        int sb = buf.ScrollbackCount;
+        if (sb <= 0) return;
+
+        const double width = 8;
+        double x = size.Width - width;
+        double h = size.Height;
+
+        // Track (faint). We're using a muted tone so it doesn't fight
+        // the terminal's usual content.
+        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(0x28, 0x8a, 0x92, 0x9c)),
+            new Rect(x, 0, width, h));
+
+        // Thumb. Total "virtual rows" = buf.Rows (visible) + sb
+        // (scrollback). At ScrollOffset=0 we're showing the bottom
+        // Rows rows → thumb flush to the bottom. At ScrollOffset=sb
+        // we're showing the top Rows of the scrollback → thumb at top.
+        double total = buf.Rows + sb;
+        double thumbRatio = buf.Rows / total;
+        double thumbHeight = Math.Max(24, h * thumbRatio);
+        // Travel range of the thumb top: [0, h - thumbHeight].
+        double topInverted = (sb - buf.ScrollOffset) / (double)sb;
+        double thumbY = topInverted * (h - thumbHeight);
+
+        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(0xb0, 0xc9, 0xd1, 0xd9)),
+            new Rect(x + 1, thumbY, width - 2, thumbHeight));
     }
 
     private void DrawRow(DrawingContext ctx, TerminalBuffer buf,
