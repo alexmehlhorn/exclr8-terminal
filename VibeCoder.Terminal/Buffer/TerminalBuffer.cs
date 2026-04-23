@@ -578,15 +578,19 @@ public sealed class TerminalBuffer : IParserActions
             row[CursorCol + 1].Flags2 &= ~CellFlags2.IsContinuation;
         }
 
+        // Preserve SGR-driven Flags2 bits (Blink) from the pen, but
+        // override the cell-shape flags (IsWide / IsContinuation) we
+        // set based on the rune width.
+        var penExtras = PenTemplate.Flags2 & CellFlags2.Blink;
         if (width == 2)
         {
-            cell.Flags2 = CellFlags2.IsWide;
+            cell.Flags2 = CellFlags2.IsWide | penExtras;
             row[CursorCol] = cell;
             if (CursorCol + 1 < Cols)
             {
                 var cont = PenTemplate;
                 cont.Rune        = 0;
-                cont.Flags2      = CellFlags2.IsContinuation;
+                cont.Flags2      = CellFlags2.IsContinuation | penExtras;
                 cont.HyperlinkId = _activeLinkId;
                 row[CursorCol + 1] = cont;
             }
@@ -594,7 +598,7 @@ public sealed class TerminalBuffer : IParserActions
         }
         else
         {
-            cell.Flags2    = CellFlags2.None;
+            cell.Flags2    = penExtras;
             row[CursorCol] = cell;
             CursorCol++;
         }
@@ -1288,17 +1292,20 @@ public sealed class TerminalBuffer : IParserActions
             switch (p[i])
             {
                 case 0:   PenTemplate = TerminalCell.Blank; break;
-                case 1:   PenTemplate.Flags |=  CellFlags.Bold;          break;
-                case 2:   PenTemplate.Flags |=  CellFlags.Dim;           break;
-                case 3:   PenTemplate.Flags |=  CellFlags.Italic;        break;
-                case 4:   PenTemplate.Flags |=  CellFlags.Underline;     break;
-                case 7:   PenTemplate.Flags |=  CellFlags.Inverse;       break;
-                case 9:   PenTemplate.Flags |=  CellFlags.Strikethrough; break;
-                case 22:  PenTemplate.Flags &= ~(CellFlags.Bold | CellFlags.Dim); break;
-                case 23:  PenTemplate.Flags &= ~CellFlags.Italic;        break;
-                case 24:  PenTemplate.Flags &= ~CellFlags.Underline;     break;
-                case 27:  PenTemplate.Flags &= ~CellFlags.Inverse;       break;
-                case 29:  PenTemplate.Flags &= ~CellFlags.Strikethrough; break;
+                case 1:   PenTemplate.Flags  |=  CellFlags.Bold;          break;
+                case 2:   PenTemplate.Flags  |=  CellFlags.Dim;           break;
+                case 3:   PenTemplate.Flags  |=  CellFlags.Italic;        break;
+                case 4:   PenTemplate.Flags  |=  CellFlags.Underline;     break;
+                case 5:
+                case 6:   PenTemplate.Flags2 |=  CellFlags2.Blink;        break;
+                case 7:   PenTemplate.Flags  |=  CellFlags.Inverse;       break;
+                case 9:   PenTemplate.Flags  |=  CellFlags.Strikethrough; break;
+                case 22:  PenTemplate.Flags  &= ~(CellFlags.Bold | CellFlags.Dim); break;
+                case 23:  PenTemplate.Flags  &= ~CellFlags.Italic;        break;
+                case 24:  PenTemplate.Flags  &= ~CellFlags.Underline;     break;
+                case 25:  PenTemplate.Flags2 &= ~CellFlags2.Blink;        break;
+                case 27:  PenTemplate.Flags  &= ~CellFlags.Inverse;       break;
+                case 29:  PenTemplate.Flags  &= ~CellFlags.Strikethrough; break;
 
                 case 30: case 31: case 32: case 33:
                 case 34: case 35: case 36: case 37:

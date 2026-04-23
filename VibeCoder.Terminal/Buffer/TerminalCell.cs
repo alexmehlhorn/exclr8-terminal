@@ -52,6 +52,17 @@ public enum CellFlags2 : byte
     IsWide         = 1 << 0,
     /// <summary>Right half of a wide cell — carries no glyph of its own.</summary>
     IsContinuation = 1 << 1,
+    /// <summary>SGR 5 (slow blink) / SGR 6 (rapid). The renderer toggles
+    /// visibility on the shared blink timer; SGR 25 clears this flag.</summary>
+    Blink          = 1 << 2,
+    /// <summary>DECDWL/DECDHL line attribute — tracked but not
+    /// fully rendered (see the feature matrix note). Used so we can
+    /// surface the "not implemented" state if the app layer inspects.</summary>
+    DoubleWidth    = 1 << 3,
+    /// <summary>DECDHL top half.</summary>
+    DoubleHeightTop    = 1 << 4,
+    /// <summary>DECDHL bottom half.</summary>
+    DoubleHeightBottom = 1 << 5,
 }
 
 [System.Flags]

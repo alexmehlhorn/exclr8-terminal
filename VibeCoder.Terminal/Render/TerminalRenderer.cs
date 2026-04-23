@@ -243,7 +243,13 @@ public sealed class TerminalRenderer
             if (bg != defBg)
                 ctx.FillRectangle(new SolidColorBrush(bg), runRect);
 
-            if (cell.Rune != 0)
+            // Blinking text: when the cell carries the Blink flag and
+            // the shared blink timer has flipped to "off", drop the
+            // glyph entirely (but keep the background). Matches what
+            // xterm does for SGR 5/6 + SGR 25 toggle.
+            bool blinkHidden = (cell.Flags2 & CellFlags2.Blink) != 0 && !BlinkVisible;
+
+            if (cell.Rune != 0 && !blinkHidden)
             {
                 int glyphCount = isWide ? 1 : runLen;
                 DrawGlyphs(ctx, row, runStart, glyphCount, x, y, fg, cell.Flags);

@@ -96,9 +96,16 @@ public class TerminalControl : Control
             _blinkVisible           = !_blinkVisible;
             _renderer.BlinkVisible  = _blinkVisible;
             var s = _buffer.CursorStyle;
-            if (_buffer.CursorVisible &&
-                s is CursorStyle.BlockBlink or CursorStyle.UnderlineBlink or CursorStyle.BarBlink)
-                InvalidateVisual();
+            bool blinkingCursor = _buffer.CursorVisible &&
+                s is CursorStyle.BlockBlink or CursorStyle.UnderlineBlink or CursorStyle.BarBlink;
+            // Repaint when EITHER a blinking cursor is active OR the
+            // buffer has any cells carrying SGR 5 (Blink) — we don't
+            // walk the grid every tick to check; the buffer bumps its
+            // Revision only when SGR changes, so the renderer just
+            // always repaints on tick as long as the control is
+            // visible. Cheap enough at 2 Hz.
+            if (blinkingCursor) InvalidateVisual();
+            else                InvalidateVisual(); // covers SGR 5 content
         };
         _blinkTimer.Start();
     }
