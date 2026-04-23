@@ -38,6 +38,19 @@ public sealed class VtParser
     private readonly int[] _params = new int[32];
     private int _paramCount;
     private int _currentParam;
+    // CSI colon-subparameter tracking. Two distinct modes:
+    //   _inSubParam:    we're swallowing a sub-param cluster that
+    //                   modifies the current primary (e.g. the '3' in
+    //                   `\e[4:3m` — curly underline). Digits & further
+    //                   colons are ignored until ';' / final byte.
+    //   _inExtColorRun: we're inside an extended-colour run introduced
+    //                   by SGR 38 or 48, where colons legitimately
+    //                   separate colour-spec components. Colons in
+    //                   this mode push params like ';' does. Reset on
+    //                   ';' or the final byte.
+    // Reset on state re-entry.
+    private bool _inSubParam;
+    private bool _inExtColorRun;
     private char _privatePrefix;
     private readonly StringBuilder _intermediates = new();
     private readonly StringBuilder _oscBuffer = new();
@@ -199,6 +212,8 @@ public sealed class VtParser
         _state = State.CsiEntry;
         _paramCount = 0;
         _currentParam = 0;
+        _inSubParam = false;
+        _inExtColorRun = false;
         _privatePrefix = (char)0;
         _intermediates.Clear();
     }
@@ -228,15 +243,71 @@ public sealed class VtParser
 
         if (b >= 0x30 && b <= 0x39)
         {
+            // Digits inside a sub-parameter don't modify the primary
+            // param — we already pushed the primary when the ':' was
+            // seen. Skip over the sub-param content entirely.
+            if (_inSubParam) return;
             if (_currentParam < ParamMax)
                 _currentParam = _currentParam * 10 + (b - 0x30);
             return;
         }
-        if (b == 0x3B)               { PushParam(); return; }
-        if (b == 0x3A)               { PushParam(); return; } // treat ':' subparam separator as ';' for now
-        if (b >= 0x20 && b <= 0x2F)  { PushParam(); _intermediates.Append((char)b); _state = State.CsiIntermediate; return; }
+        if (b == 0x3B)
+        {
+            // Semicolon: push the current primary (unless we were mid
+            // sub-param — the primary was already pushed when ':'
+            // opened it), then leave both colon modes.
+            if (!_inSubParam) PushParam();
+            _inSubParam = false;
+            _inExtColorRun = false;
+            return;
+        }
+        if (b == 0x3A)
+        {
+            // Colons have two distinct meanings in SGR:
+            //   (a) Components of an extended-colour run introduced by
+            //       SGR 38 or 48 — e.g. `\e[38:2::R:G:Bm`. These need
+            //       to surface as primary params so ApplyExtColor
+            //       receives them. Latch _inExtColorRun on the FIRST
+            //       colon in the run (when the just-seen primary is
+            //       38 or 48) and keep treating colons like
+            //       semicolons until ';' or the final byte.
+            //   (b) Style sub-params on any other SGR — e.g.
+            //       `\e[4:3m` (curly underline). Swallow the whole
+            //       sub-param cluster so sub-param 3 doesn't become a
+            //       stray SGR-3 italic.
+            if (_inExtColorRun)
+            {
+                PushParam();
+                return;
+            }
+            // Haven't entered an ext-colour run yet. Look at the
+            // primary we're about to push: if it's 38/48, latch the
+            // run mode.
+            if (!_inSubParam && (_currentParam == 38 || _currentParam == 48))
+            {
+                PushParam();
+                _inExtColorRun = true;
+                return;
+            }
+            if (!_inSubParam) { PushParam(); _inSubParam = true; }
+            return;
+        }
+        if (b >= 0x20 && b <= 0x2F)
+        {
+            if (!_inSubParam) PushParam();
+            _inSubParam = false; _inExtColorRun = false;
+            _intermediates.Append((char)b);
+            _state = State.CsiIntermediate;
+            return;
+        }
         if (b >= 0x3C && b <= 0x3F)  { _state = State.CsiIgnore; return; } // private modifier mid-params
-        if (b >= 0x40 && b <= 0x7E)  { PushParam(); DispatchCsi((char)b); return; }
+        if (b >= 0x40 && b <= 0x7E)
+        {
+            if (!_inSubParam) PushParam();
+            _inSubParam = false; _inExtColorRun = false;
+            DispatchCsi((char)b);
+            return;
+        }
     }
 
     private void CsiIntermediate(byte b)

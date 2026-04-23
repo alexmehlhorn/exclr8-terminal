@@ -152,15 +152,32 @@ public class ParserTests
     [Fact]
     public void Csi_ColonSubparamTreatedAsSemi()
     {
-        // Modern SGR: ESC [ 38:2::255:128:0 m — truecolor via colon
-        // subparams. Parser reports them as separate params so SGR
-        // handling works the same as semicolon-separated.
-        var r = ParseString("\x1b[38:2::255:128:0m");
-        var c = Assert.Single(r.Csi);
-        Assert.Equal('m', c.Final);
-        // Params = [38, 2, 0, 255, 128, 0]
-        Assert.Contains(38, c.Params);
-        Assert.Contains(255, c.Params);
+        // Colon sub-params have two meanings in SGR and the parser
+        // must distinguish:
+        //
+        //  (a) `\e[38:2::255:128:0m` — truecolor via colons. These
+        //      components MUST reach the ApplyExtColor dispatcher, so
+        //      after a primary SGR 38 or 48 we treat ':' like ';'.
+        //  (b) `\e[4:3m` — curly underline. Sub-param 3 modifies the
+        //      underline style; it must NOT turn into a separate SGR
+        //      primary param (that would cause SGR 4 + SGR 3 = adds
+        //      italic, the classic "line I'm typing got italicised"
+        //      bug). Sub-params here are swallowed.
+
+        // Truecolor form still surfaces all components as primary
+        // params so the SGR handler works the same as the ';' form.
+        var r1 = ParseString("\x1b[38:2::255:128:0m");
+        var c1 = Assert.Single(r1.Csi);
+        Assert.Equal('m', c1.Final);
+        Assert.Contains(38, c1.Params);
+        Assert.Contains(255, c1.Params);
+
+        // Underline-style form collapses to just the primary — the
+        // sub-param 3 does not become a stray SGR 3 italic op.
+        var r2 = ParseString("\x1b[4:3m");
+        var c2 = Assert.Single(r2.Csi);
+        Assert.Equal('m', c2.Final);
+        Assert.Equal(new[] { 4 }, c2.Params);
     }
 
     [Fact]
