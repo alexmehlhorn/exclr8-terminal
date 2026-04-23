@@ -16,7 +16,8 @@ namespace Exclr8.Terminal.Render;
 /// </summary>
 public sealed class TerminalRenderer
 {
-    private readonly Typeface _typeface;
+    private Typeface _typeface;
+    private string   _fontFamily;
     private double   _fontSize;
 
     public double CellWidth  { get; private set; }
@@ -37,9 +38,31 @@ public sealed class TerminalRenderer
         }
     }
 
+    /// <summary>Current font family string — fed straight into
+    /// Avalonia's <see cref="Typeface"/> constructor, so accepts both
+    /// simple family names and the fonts:Asset#Name, fallback list
+    /// syntax. Setting triggers a typeface rebuild + cell re-measure;
+    /// callers should trigger a grid reflow.</summary>
+    public string FontFamily
+    {
+        get => _fontFamily;
+        set
+        {
+            var v = string.IsNullOrWhiteSpace(value) ? DefaultFontFamily : value;
+            if (v == _fontFamily) return;
+            _fontFamily = v;
+            _typeface   = new Typeface(_fontFamily);
+            MeasureCell();
+        }
+    }
+
     /// <summary>Default font size captured at construction — used by
     /// Cmd+0 to reset zoom.</summary>
     public double DefaultFontSize { get; }
+
+    /// <summary>Default font family captured at construction — used
+    /// as the fallback when a caller clears <see cref="FontFamily"/>.</summary>
+    public string DefaultFontFamily { get; }
 
     /// <summary>Visual width of the scrollbar strip on the right edge.</summary>
     public const double ScrollbarWidth = 6;
@@ -81,9 +104,11 @@ public sealed class TerminalRenderer
         string fontFamily = "JetBrainsMono, Menlo, monospace",
         double fontSize   = 13)
     {
-        _typeface       = new Typeface(fontFamily);
-        _fontSize       = fontSize;
-        DefaultFontSize = fontSize;
+        _fontFamily       = fontFamily;
+        _typeface         = new Typeface(fontFamily);
+        _fontSize         = fontSize;
+        DefaultFontFamily = fontFamily;
+        DefaultFontSize   = fontSize;
         MeasureCell();
     }
 

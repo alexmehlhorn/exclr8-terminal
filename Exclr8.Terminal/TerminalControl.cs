@@ -263,6 +263,23 @@ public class TerminalControl : Control
         }
     }
 
+    /// <summary>Terminal font family. Passed straight to Avalonia's
+    /// <see cref="Typeface"/> constructor, so both simple family names
+    /// (<c>"Menlo"</c>) and fallback-list syntax
+    /// (<c>"fonts:JetBrainsMono#JetBrains Mono, Menlo, monospace"</c>)
+    /// work. Triggers cell re-measure and grid reflow.</summary>
+    public string FontFamily
+    {
+        get => _renderer.FontFamily;
+        set
+        {
+            if (_renderer.FontFamily == value) return;
+            _renderer.FontFamily = value;
+            RecomputeGrid();
+            InvalidateVisual();
+        }
+    }
+
     /// <summary>Step the terminal font size by whole points. Positive
     /// direction enlarges (Cmd+=), negative shrinks (Cmd+-). Reflows
     /// the grid so the cell count matches the new cell metrics.</summary>
