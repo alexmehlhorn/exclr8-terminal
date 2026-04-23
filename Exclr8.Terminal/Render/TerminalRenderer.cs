@@ -112,12 +112,67 @@ public sealed class TerminalRenderer
         MeasureCell();
     }
 
+    /// <summary>True when the configured <see cref="FontFamily"/>
+    /// failed a monospace-width probe and <see cref="MeasureCell"/>
+    /// substituted an OS-default monospace fallback. Host code can
+    /// surface this to the user if it wants to flag that the
+    /// configured family isn't actually monospace.</summary>
+    public bool UsingMonospaceFallback { get; private set; }
+
+    /// <summary>Family actually in use for rendering — may differ from
+    /// <see cref="FontFamily"/> if a proportional family was
+    /// substituted for a platform monospace fallback.</summary>
+    public string EffectiveFontFamily { get; private set; } = "";
+
     private void MeasureCell()
     {
-        var ft = new FormattedText("M", CultureInfo.InvariantCulture,
+        (CellWidth, CellHeight) = Measure(_typeface);
+        UsingMonospaceFallback  = false;
+        EffectiveFontFamily     = _fontFamily;
+
+        // Verify the configured font is actually monospace. Compare
+        // the width of a wide glyph (M) against a narrow one (i);
+        // real monospace fonts draw them at the same advance, while
+        // proportional families (Inter, Segoe UI, the Avalonia
+        // default when a fonts: URI doesn't resolve) differ by a lot.
+        // Tolerance picked empirically — 10% catches every common
+        // proportional family without false-positives on legitimate
+        // monospace faces like JetBrains Mono where metrics round.
+        var iFt = new FormattedText("i", CultureInfo.InvariantCulture,
             FlowDirection.LeftToRight, _typeface, _fontSize, Brushes.White);
-        CellWidth  = ft.WidthIncludingTrailingWhitespace;
-        CellHeight = ft.Height;
+        var iWidth = iFt.WidthIncludingTrailingWhitespace;
+        if (CellWidth > 0 && Math.Abs(CellWidth - iWidth) / CellWidth > 0.10)
+        {
+            // Not monospace — fall back to a platform-specific
+            // monospace family. Do not recurse through FontFamily
+            // setter (would loop); rebuild the typeface directly.
+            var fallback = PlatformMonospaceFamily();
+            _typeface              = new Typeface(fallback);
+            (CellWidth, CellHeight) = Measure(_typeface);
+            UsingMonospaceFallback  = true;
+            EffectiveFontFamily     = fallback;
+        }
+    }
+
+    private (double w, double h) Measure(Typeface tf)
+    {
+        var ft = new FormattedText("M", CultureInfo.InvariantCulture,
+            FlowDirection.LeftToRight, tf, _fontSize, Brushes.White);
+        return (ft.WidthIncludingTrailingWhitespace, ft.Height);
+    }
+
+    /// <summary>Platform default monospace family — always available
+    /// on the target OS without needing to ship the font ourselves.
+    /// Used when the caller-supplied family turns out to be
+    /// proportional.</summary>
+    private static string PlatformMonospaceFamily()
+    {
+        if (OperatingSystem.IsMacOS())   return "Menlo";
+        if (OperatingSystem.IsWindows()) return "Consolas";
+        // Linux + anything else: these three cover almost every
+        // distro. The first one actually installed wins via the
+        // Avalonia fallback chain.
+        return "DejaVu Sans Mono, Liberation Mono, monospace";
     }
 
     public (int Cols, int Rows) ComputeGrid(Size available)
