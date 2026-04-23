@@ -61,12 +61,16 @@ public sealed class ScreenBuffer
         }
         else if (rows < Rows)
         {
+            // Shrink: drop the top rows on the floor. We deliberately do
+            // NOT push them to scrollback — repeated grow/shrink cycles
+            // (e.g. moving a cell between layouts with different cell
+            // sizes) would otherwise add the same content to scrollback
+            // on every shrink, creating duplicate history. Scrollback
+            // should grow from live shell output scrolling off the top,
+            // not from layout-driven resizes. (A full fix would reflow
+            // lines to the new width; tracked separately.)
             int extra = Rows - rows;
-            for (int i = 0; i < extra; i++)
-            {
-                PushScrollback(_rows[0]);
-                _rows.RemoveAt(0);
-            }
+            for (int i = 0; i < extra; i++) _rows.RemoveAt(0);
         }
         Rows = rows;
     }

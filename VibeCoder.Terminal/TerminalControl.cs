@@ -35,6 +35,13 @@ public class TerminalControl : Control
     private DateTime _lastClickTime = DateTime.MinValue;
     private static readonly TimeSpan DoubleClickThreshold = TimeSpan.FromMilliseconds(400);
 
+    // Deferred-selection state: we hold off creating a Selection until
+    // the pointer actually moves to a different cell. A plain click with
+    // no drag should never produce a 1-cell "smudge" selection — click
+    // alone clears any existing selection, drag starts a new one.
+    private bool _selectionPending;
+    private int  _pressedRow = -1, _pressedCol = -1;
+
     // Scrollbar drag state. When the user pointer-presses on the right-
     // edge strip we enter scrollbar-drag mode; subsequent PointerMoved
     // events update ScrollOffset until PointerReleased.
@@ -43,6 +50,15 @@ public class TerminalControl : Control
     // Cursor blink timer — toggles the renderer's BlinkVisible flag.
     private readonly DispatcherTimer _blinkTimer;
     private bool _blinkVisible = true;
+
+    // Auto-hide scrollbar: visible during scrolling and while the
+    // pointer is inside the right-edge hit zone; fades out after a
+    // short idle. The timer ticks at ~60Hz while the bar is on screen;
+    // we stop it once opacity reaches zero to avoid idle CPU wakeups.
+    private readonly DispatcherTimer _scrollbarTimer;
+    private DateTime _scrollbarShownAt = DateTime.MinValue;
+    private static readonly TimeSpan ScrollbarIdleDelay    = TimeSpan.FromMilliseconds(900);
+    private static readonly TimeSpan ScrollbarFadeDuration = TimeSpan.FromMilliseconds(250);
 
     private bool _altHeld;
     private TerminalTheme? _theme;
@@ -101,6 +117,45 @@ public class TerminalControl : Control
                 InvalidateVisual();
         };
         _blinkTimer.Start();
+
+        _scrollbarTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _scrollbarTimer.Tick += OnScrollbarTick;
+    }
+
+    /// <summary>Surface "scrollbar-worthy activity". Snaps opacity to
+    /// 1.0, starts the tick timer, and requests a repaint. Anything
+    /// that involves the scrollback viewport calls this.</summary>
+    private void ShowScrollbar()
+    {
+        if (_buffer.ScrollbackCount <= 0) return;
+        _scrollbarShownAt = DateTime.UtcNow;
+        _renderer.ScrollbarOpacity = 1.0;
+        if (!_scrollbarTimer.IsEnabled) _scrollbarTimer.Start();
+        InvalidateVisual();
+    }
+
+    private void OnScrollbarTick(object? s, EventArgs e)
+    {
+        // Dragging the thumb pins the bar at full opacity.
+        if (_scrollbarDrag)
+        {
+            _scrollbarShownAt = DateTime.UtcNow;
+            _renderer.ScrollbarOpacity = 1.0;
+            return;
+        }
+
+        var elapsed = DateTime.UtcNow - _scrollbarShownAt;
+        if (elapsed < ScrollbarIdleDelay)
+        {
+            _renderer.ScrollbarOpacity = 1.0;
+            return;
+        }
+
+        var fade = (elapsed - ScrollbarIdleDelay).TotalMilliseconds / ScrollbarFadeDuration.TotalMilliseconds;
+        double newOpacity = Math.Max(0, 1.0 - fade);
+        _renderer.ScrollbarOpacity = newOpacity;
+        InvalidateVisual();
+        if (newOpacity <= 0.001) _scrollbarTimer.Stop();
     }
 
     // ---- PTY I/O ----
@@ -123,6 +178,10 @@ public class TerminalControl : Control
     public void Paste(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
+        // Paste is about to push PTY bytes that will move the cursor
+        // and almost certainly paint over wherever the selection was.
+        // Drop it now so the stale highlight doesn't linger.
+        _buffer.ClearSelection();
         byte[] payload;
         if (_buffer.BracketedPaste)
         {
@@ -146,10 +205,18 @@ public class TerminalControl : Control
         _lastRevision = _buffer.Revision;
     }
 
+    // Minimum grid size we'll honour. Anything smaller is almost
+    // certainly a transient layout pass (e.g. mid-reparent after a
+    // MoveCell) — resizing to those dimensions would shove live-screen
+    // rows into scrollback and trigger a SIGWINCH redraw from the
+    // shell, which looks to the user like the history got duplicated.
+    private const int MinUsableCols = 10;
+    private const int MinUsableRows = 3;
+
     private void RecomputeGrid()
     {
         var (cols, rows) = _renderer.ComputeGrid(Bounds.Size);
-        if (cols <= 0 || rows <= 0) return;
+        if (cols < MinUsableCols || rows < MinUsableRows) return;
         if (cols == _buffer.Cols && rows == _buffer.Rows) return;
         _buffer.Resize(cols, rows);
         Resized?.Invoke(this, (cols, rows));
@@ -157,6 +224,21 @@ public class TerminalControl : Control
     }
 
     // ---- Font zoom ----
+
+    /// <summary>Absolute terminal font size (pt). Mostly for hosts that
+    /// want to push a user-configured size from Settings. Keyboard
+    /// zoom uses <see cref="AdjustFontSize"/> / <see cref="ResetFontSize"/>.</summary>
+    public double FontSize
+    {
+        get => _renderer.FontSize;
+        set
+        {
+            if (Math.Abs(_renderer.FontSize - value) < 0.01) return;
+            _renderer.FontSize = value;
+            RecomputeGrid();
+            InvalidateVisual();
+        }
+    }
 
     /// <summary>Step the terminal font size by whole points. Positive
     /// direction enlarges (Cmd+=), negative shrinks (Cmd+-). Reflows
@@ -271,16 +353,17 @@ public class TerminalControl : Control
 
         var pos = e.GetPosition(this);
 
-        // Scrollbar drag: left-click on the right-edge strip starts
-        // a scrollbar drag. Take priority over selection.
+        // Scrollbar drag: left-click inside the right-edge hit zone
+        // (wider than the visible bar) starts a scrollbar drag.
         var props = e.GetCurrentPoint(this).Properties;
         if (props.IsLeftButtonPressed
             && _buffer.ScrollbackCount > 0
-            && pos.X >= Bounds.Width - TerminalRenderer.ScrollbarWidth)
+            && pos.X >= Bounds.Width - TerminalRenderer.ScrollbarHitZone)
         {
             _scrollbarDrag = true;
             _buffer.SetScrollOffset(
                 TerminalRenderer.YToScrollOffset(pos.Y, _buffer.ScrollbackCount, _buffer.Rows, Bounds.Height));
+            ShowScrollbar();
             e.Pointer.Capture(this);
             e.Handled = true;
             return;
@@ -325,9 +408,26 @@ public class TerminalControl : Control
             }
         }
 
-        if      (_clickCount >= 3) _buffer.SelectLine(row);
-        else if (_clickCount == 2) _buffer.SelectWord(row, col);
-        else                       _buffer.StartSelection(row, col);
+        if (_clickCount >= 3)
+        {
+            _buffer.SelectLine(row);
+            _selectionPending = false;
+        }
+        else if (_clickCount == 2)
+        {
+            _buffer.SelectWord(row, col);
+            _selectionPending = false;
+        }
+        else
+        {
+            // Single press: drop any previous selection and mark a
+            // pending anchor. A real Selection object only materialises
+            // when the pointer reaches a different cell (see OnPointerMoved).
+            _buffer.ClearSelection();
+            _selectionPending = true;
+            _pressedRow = row;
+            _pressedCol = col;
+        }
         e.Handled = true;
     }
 
@@ -340,8 +440,17 @@ public class TerminalControl : Control
         {
             _buffer.SetScrollOffset(
                 TerminalRenderer.YToScrollOffset(pos.Y, _buffer.ScrollbackCount, _buffer.Rows, Bounds.Height));
+            ShowScrollbar();
             e.Handled = true;
             return;
+        }
+
+        // Hovering the right-edge hit zone keeps the bar visible so
+        // the user can grab it without wiggling the wheel first.
+        if (pos.X >= Bounds.Width - TerminalRenderer.ScrollbarHitZone
+            && _buffer.ScrollbackCount > 0)
+        {
+            ShowScrollbar();
         }
 
         var (row, col) = GridPos(pos);
@@ -351,7 +460,17 @@ public class TerminalControl : Control
             if (_buffer.MouseMode >= 1002 && _buffer.ScrollOffset == 0)
             { SendMouse(_pressedBtn + 32, row, col, e.KeyModifiers, pressed: true); return; }
             if (_buffer.MouseMode == 0 || _buffer.ScrollOffset > 0)
-                _buffer.ExtendSelection(row, col);
+            {
+                // First drag movement — materialise the selection
+                // anchored at the press position.
+                if (_selectionPending && (row != _pressedRow || col != _pressedCol))
+                {
+                    _buffer.StartSelection(_pressedRow, _pressedCol);
+                    _selectionPending = false;
+                }
+                if (_buffer.Selection != null)
+                    _buffer.ExtendSelection(row, col);
+            }
         }
         else if (_buffer.MouseMode >= 1003 && _buffer.ScrollOffset == 0)
         {
@@ -378,11 +497,21 @@ public class TerminalControl : Control
         if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
         { SendMouse(_pressedBtn, row, col, e.KeyModifiers, pressed: false); return; }
 
-        if (wasDown && _buffer.Selection != null)
+        if (wasDown)
         {
-            _buffer.ExtendSelection(row, col);
-            var text = _buffer.GetSelectedText();
-            if (!string.IsNullOrEmpty(text)) _ = CopyToClipboardAsync(text);
+            // Pure click, no drag: _selectionPending is still set.
+            // The earlier ClearSelection in OnPointerPressed already
+            // cleared any prior selection; we just drop the flag.
+            if (_selectionPending)
+            {
+                _selectionPending = false;
+            }
+            else if (_buffer.Selection != null)
+            {
+                _buffer.ExtendSelection(row, col);
+                var text = _buffer.GetSelectedText();
+                if (!string.IsNullOrEmpty(text)) _ = CopyToClipboardAsync(text);
+            }
         }
     }
 
@@ -414,6 +543,7 @@ public class TerminalControl : Control
         // units. Buffer clamps at scrollback bounds. Buffer.Changed
         // handler drives the repaint.
         _buffer.ScrollByPixels(e.Delta.Y * PixelsPerTick, _renderer.CellHeight);
+        ShowScrollbar();
         e.Handled = true;
     }
 

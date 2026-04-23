@@ -41,11 +41,19 @@ public sealed class TerminalRenderer
     /// Cmd+0 to reset zoom.</summary>
     public double DefaultFontSize { get; }
 
-    /// <summary>Width of the scrollbar strip on the right edge. Used by
-    /// the hit-tester in <see cref="TerminalControl"/> so pointer
-    /// presses on the bar can become a scroll drag rather than a
-    /// selection start.</summary>
-    public const double ScrollbarWidth = 8;
+    /// <summary>Visual width of the scrollbar strip on the right edge.</summary>
+    public const double ScrollbarWidth = 6;
+
+    /// <summary>Width of the pointer hit zone on the right edge — a
+    /// little wider than the visible bar so the user can grab it
+    /// comfortably even when it's been auto-hidden.</summary>
+    public const double ScrollbarHitZone = 14;
+
+    /// <summary>0..1 multiplier applied to the scrollbar fill alphas.
+    /// <see cref="TerminalControl"/> drives this to fade the bar in
+    /// when the user is scrolling or hovering the hit zone, and out
+    /// again after a short idle period.</summary>
+    public double ScrollbarOpacity { get; set; } = 0.0;
 
     /// <summary>Map a vertical pointer Y (in control-local coords) to a
     /// scroll offset, given the current buffer state and the control
@@ -164,14 +172,18 @@ public sealed class TerminalRenderer
     {
         int sb = buf.ScrollbackCount;
         if (sb <= 0) return;
+        double opacity = Math.Clamp(ScrollbarOpacity, 0.0, 1.0);
+        if (opacity <= 0.001) return;      // fully hidden — skip draw entirely
 
-        const double width = 8;
+        double width = ScrollbarWidth;
         double x = size.Width - width;
         double h = size.Height;
 
         // Track (faint). We're using a muted tone so it doesn't fight
-        // the terminal's usual content.
-        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(0x28, 0x8a, 0x92, 0x9c)),
+        // the terminal's usual content. Alpha is multiplied by
+        // ScrollbarOpacity so the whole bar fades together.
+        byte trackA = (byte)(0x28 * opacity);
+        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(trackA, 0x8a, 0x92, 0x9c)),
             new Rect(x, 0, width, h));
 
         // Thumb. Total "virtual rows" = buf.Rows (visible) + sb
@@ -190,7 +202,8 @@ public sealed class TerminalRenderer
         topInverted = Math.Clamp(topInverted, 0.0, 1.0);
         double thumbY = topInverted * (h - thumbHeight);
 
-        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(0xb0, 0xc9, 0xd1, 0xd9)),
+        byte thumbA = (byte)(0xb0 * opacity);
+        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(thumbA, 0xc9, 0xd1, 0xd9)),
             new Rect(x + 1, thumbY, width - 2, thumbHeight));
     }
 
