@@ -310,15 +310,26 @@ public class TerminalControl : Control
         bool meta  = (e.KeyModifiers & KeyModifiers.Meta)    != 0;
         bool ctrl  = (e.KeyModifiers & KeyModifiers.Control) != 0;
         bool shift = (e.KeyModifiers & KeyModifiers.Shift)   != 0;
+        bool alt   = (e.KeyModifiers & KeyModifiers.Alt)     != 0;
 
         // Clipboard & editor-style shortcuts. Handled BEFORE any
         // scroll-reset so the user can scroll up → select → copy
         // without the view snapping back and invalidating their
-        // selection. ⌘ on macOS, Ctrl+Shift elsewhere — Ctrl+C alone
-        // is SIGINT and must reach the shell.
-        bool macShortcut   = isMac  && meta && !ctrl;
-        bool otherShortcut = !isMac && ctrl && shift;
-        if (macShortcut || otherShortcut)
+        // selection.
+        //
+        // Modifier convention:
+        //  - macOS: ⌘ (Meta) alone — the Apple standard.
+        //  - Windows/Linux: two tiers. Ctrl+Shift variants are the
+        //    "power-user" gestures (match gnome-terminal / Windows
+        //    Terminal). On top of that, plain Ctrl+V always pastes
+        //    (Windows Terminal default), and plain Ctrl+C copies the
+        //    selection if there is one, falling through to SIGINT
+        //    (0x03) otherwise so shells still receive a Ctrl+C break
+        //    when no selection exists.
+        bool macShortcut      = isMac  && meta && !ctrl;
+        bool ctrlShiftEditor  = !isMac && ctrl && shift;
+        bool winCtrlOnly      = !isMac && ctrl && !shift && !alt;
+        if (macShortcut || ctrlShiftEditor)
         {
             switch (e.Key)
             {
@@ -343,6 +354,27 @@ public class TerminalControl : Control
                 case Key.D0:
                 case Key.NumPad0:
                     ResetFontSize();                 e.Handled = true; return;
+            }
+        }
+
+        // Plain Ctrl+V on Windows/Linux → paste (Windows Terminal
+        // convention — the literal "Ctrl+V character" 0x16 has almost
+        // no modern use). Plain Ctrl+C → copy if there's a selection,
+        // otherwise fall through so KeyMapper sends SIGINT (0x03).
+        if (winCtrlOnly)
+        {
+            if (e.Key == Key.V)
+            {
+                _ = PasteFromClipboardAsync();
+                e.Handled = true;
+                return;
+            }
+            if (e.Key == Key.C && _buffer.Selection != null)
+            {
+                _ = CopySelectionAsync();
+                _buffer.ClearSelection();
+                e.Handled = true;
+                return;
             }
         }
 
