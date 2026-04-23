@@ -112,9 +112,16 @@ public class TerminalControl : Control
             _blinkVisible           = !_blinkVisible;
             _renderer.BlinkVisible  = _blinkVisible;
             var s = _buffer.CursorStyle;
-            if (_buffer.CursorVisible &&
-                s is CursorStyle.BlockBlink or CursorStyle.UnderlineBlink or CursorStyle.BarBlink)
-                InvalidateVisual();
+            bool blinkingCursor = _buffer.CursorVisible &&
+                s is CursorStyle.BlockBlink or CursorStyle.UnderlineBlink or CursorStyle.BarBlink;
+            // Repaint when EITHER a blinking cursor is active OR the
+            // buffer has any cells carrying SGR 5 (Blink) — we don't
+            // walk the grid every tick to check; the buffer bumps its
+            // Revision only when SGR changes, so the renderer just
+            // always repaints on tick as long as the control is
+            // visible. Cheap enough at 2 Hz.
+            if (blinkingCursor) InvalidateVisual();
+            else                InvalidateVisual(); // covers SGR 5 content
         };
         _blinkTimer.Start();
 
@@ -170,22 +177,38 @@ public class TerminalControl : Control
 
     public void Write(byte[] bytes) => Write(bytes.AsSpan());
 
+    /// <summary>Hard cap on paste payload size. Past this the paste
+    /// is silently dropped — shells don't handle a 100 MiB paste
+    /// gracefully and we don't want to surprise the host process.</summary>
+    public const int PasteMaxBytes = 10 * 1024 * 1024;
+
     /// <summary>
     /// Paste text into the terminal. Wraps in <c>ESC[200~</c> /
     /// <c>ESC[201~</c> when DECSET 2004 (bracketed paste) is active —
-    /// lets the shell distinguish typed vs pasted input.
+    /// lets the shell distinguish typed vs pasted input. Rejects
+    /// anything containing NUL (0x00), which is a tell-tale sign of a
+    /// mis-identified binary payload that would confuse a PTY.
     /// </summary>
     public void Paste(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
+        if (text.IndexOf('\0') >= 0) return; // binary payload — refuse
+        var inner = Encoding.UTF8.GetBytes(text);
+        if (inner.Length > PasteMaxBytes) return;
+
         // Paste is about to push PTY bytes that will move the cursor
         // and almost certainly paint over wherever the selection was.
-        // Drop it now so the stale highlight doesn't linger.
+        // Drop the selection now so the stale highlight doesn't linger.
         _buffer.ClearSelection();
+
         byte[] payload;
         if (_buffer.BracketedPaste)
         {
-            var inner = Encoding.UTF8.GetBytes(text);
+            // ESC[200~ text ESC[201~. Note: do NOT translate CR
+            // inside the brackets — bracketed paste intentionally
+            // lets the shell see the raw newlines so it can decide
+            // how to handle them (often, interpret them as input
+            // separators).
             payload = new byte[inner.Length + 12];
             "\x1b[200~"u8.CopyTo(payload);
             inner.CopyTo(payload, 6);
@@ -193,7 +216,7 @@ public class TerminalControl : Control
         }
         else
         {
-            payload = Encoding.UTF8.GetBytes(text);
+            payload = inner;
         }
         Input?.Invoke(this, payload);
     }
@@ -698,7 +721,10 @@ public class TerminalControl : Control
     protected override void OnGotFocus(GotFocusEventArgs e)
     {
         base.OnGotFocus(e);
-        if (_buffer.FocusEvents) Input?.Invoke(this, "\x1b[I"u8.ToArray());
+        _buffer.NotifyFocus(true);
+        // NotifyFocus queues a reply via ReplyToPty; drain + forward.
+        var replies = _buffer.TakeReplies();
+        if (replies != null) Output?.Invoke(this, replies);
         _blinkVisible = true;
         _renderer.BlinkVisible = true;
         InvalidateVisual();
@@ -707,7 +733,9 @@ public class TerminalControl : Control
     protected override void OnLostFocus(Avalonia.Interactivity.RoutedEventArgs e)
     {
         base.OnLostFocus(e);
-        if (_buffer.FocusEvents) Input?.Invoke(this, "\x1b[O"u8.ToArray());
+        _buffer.NotifyFocus(false);
+        var replies = _buffer.TakeReplies();
+        if (replies != null) Output?.Invoke(this, replies);
         InvalidateVisual();
     }
 

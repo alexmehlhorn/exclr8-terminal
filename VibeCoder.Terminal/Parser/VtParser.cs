@@ -215,12 +215,23 @@ public sealed class VtParser
         if (b >= 0x40 && b <= 0x7E)  { DispatchCsi((char)b); return; }
     }
 
+    /// <summary>Upper bound on a single CSI parameter. Matches xterm's
+    /// MAX_PARAM = 0x3FFF — big enough for anything a real app emits,
+    /// small enough to prevent integer overflow from malicious input
+    /// like CSI 9999999999999999999A.</summary>
+    private const int ParamMax = 0x7FFFFFFF / 10;
+
     private void CsiParam(byte b)
     {
         if (b < 0x20)       { _actions.Execute(b); return; }
         if (b == 0x7F)      { return; }
 
-        if (b >= 0x30 && b <= 0x39) { _currentParam = _currentParam * 10 + (b - 0x30); return; }
+        if (b >= 0x30 && b <= 0x39)
+        {
+            if (_currentParam < ParamMax)
+                _currentParam = _currentParam * 10 + (b - 0x30);
+            return;
+        }
         if (b == 0x3B)               { PushParam(); return; }
         if (b == 0x3A)               { PushParam(); return; } // treat ':' subparam separator as ';' for now
         if (b >= 0x20 && b <= 0x2F)  { PushParam(); _intermediates.Append((char)b); _state = State.CsiIntermediate; return; }
@@ -267,6 +278,12 @@ public sealed class VtParser
         _oscBuffer.Clear();
     }
 
+    /// <summary>Hard cap on accumulated OSC payload length (bytes).
+    /// Anything past this is silently dropped until the sequence
+    /// terminator arrives — prevents a runaway emitter from blowing
+    /// memory.</summary>
+    private const int OscMaxLength = 64 * 1024;
+
     private void OscString(byte b)
     {
         if (b == 0x07) { _actions.OscDispatch(_oscBuffer.ToString()); _state = State.Ground; return; }
@@ -277,6 +294,7 @@ public sealed class VtParser
             return;
         }
         if (b < 0x20) return; // ignore other C0 in OSC
+        if (_oscBuffer.Length >= OscMaxLength) return;
         _oscBuffer.Append((char)b);
     }
 

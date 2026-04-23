@@ -63,6 +63,43 @@ public sealed class TerminalBuffer : IParserActions
     public bool ApplicationKeypad     { get; private set; }
     public int  MouseMode             { get; private set; } // 0 / 1000 / 1002 / 1003
     public bool FocusEvents           { get; private set; }
+    /// <summary>DECAWM — auto-wrap mode. On by default; when off, the
+    /// cursor stays on the right margin and subsequent prints stomp
+    /// the last cell instead of wrapping.</summary>
+    public bool AutoWrap              { get; private set; } = true;
+    /// <summary>DECOM — origin mode. When on, CUP/HVP row parameters
+    /// are interpreted relative to the scroll region and the cursor
+    /// is constrained within it.</summary>
+    public bool OriginMode            { get; private set; }
+    /// <summary>DECSCNM — reverse video. Flag for the renderer; the
+    /// buffer itself does not swap pen colours.</summary>
+    public bool ReverseVideo          { get; private set; }
+    /// <summary>IRM — ANSI insert/replace mode (default replace).</summary>
+    public bool InsertMode            { get; private set; }
+    /// <summary>LNM — line feed/new line mode. When on, LF/VT/FF
+    /// imply a carriage return as well.</summary>
+    public bool LineFeedNewLine       { get; private set; }
+
+    /// <summary>OSC 52 clipboard routing. Gated off by default because
+    /// it lets remote processes silently scrape the host clipboard.
+    /// The host opts in explicitly when it has user consent.</summary>
+    public bool AllowClipboardAccess  { get; set; }
+
+    /// <summary>Default foreground reported to OSC 10 queries. Packed
+    /// as 0xRRGGBB. Host layers that theme the terminal (e.g. the
+    /// VibeCoder app) update this when the theme changes.</summary>
+    public uint DefaultForegroundRgb { get; set; } = 0xD0D0D0;
+
+    /// <summary>Default background for OSC 11 queries.</summary>
+    public uint DefaultBackgroundRgb { get; set; } = 0x1E1E1E;
+
+    /// <summary>Cursor colour for OSC 12 queries.</summary>
+    public uint DefaultCursorRgb     { get; set; } = 0xD0D0D0;
+
+    /// <summary>Current 256-palette colours for OSC 4 queries. Array
+    /// is lazily populated on first read to avoid a static table
+    /// that would couple this layer to the renderer's theme.</summary>
+    private uint[]? _palette256;
 
     // Scrollback viewport. 0 = at bottom; positive = scrolled up into
     // scrollback. TerminalControl resets this to 0 on any keystroke.
@@ -97,12 +134,55 @@ public sealed class TerminalBuffer : IParserActions
     // handles it, but kept for future external Write(byte) callers).
     private readonly List<byte> _pendingReplies = new();
 
+    // Last printable codepoint emitted — used by REP (CSI Ps b) to
+    // repeat the preceding character. Reset to 0 on any control
+    // sequence other than REP itself so REP after e.g. a newline is
+    // a no-op, matching xterm.js's <c>precedingJoinState</c>.
+    private int _lastPrintRune;
+    private int _lastPrintWidth;
+
+    // Custom tab stops. When null, defaults to every 8 cols.
+    // HTS (ESC H) adds a stop, TBC (CSI g) clears.
+    private bool[]? _tabStops;
+
+    // Window title buffer. Most recent OSC 0/1/2 payload — used to
+    // reply to CSI 21 t (report title).
+    private string _windowTitle = string.Empty;
+
     public byte[]? TakeReplies()
     {
         if (_pendingReplies.Count == 0) return null;
         var b = _pendingReplies.ToArray();
         _pendingReplies.Clear();
         return b;
+    }
+
+    /// <summary>Fired when an OSC 0 or OSC 2 sets the window title.</summary>
+    public event EventHandler<string>? TitleChanged;
+
+    /// <summary>Fired when OSC 0 or OSC 1 sets the icon name. Most
+    /// shells emit OSC 0 which sets both title and icon name.</summary>
+    public event EventHandler<string>? IconNameChanged;
+
+    /// <summary>Fired when an OSC 52 ; c ; &lt;base64&gt; request
+    /// arrives AND <see cref="AllowClipboardAccess"/> is true. The
+    /// host decides whether to honour (copy to clipboard) or ignore.</summary>
+    public event EventHandler<ClipboardRequestEventArgs>? ClipboardRequested;
+
+    public sealed class ClipboardRequestEventArgs : EventArgs
+    {
+        public string Text { get; }
+        public ClipboardRequestEventArgs(string text) { Text = text; }
+    }
+
+    /// <summary>Host focus change. When DECSET 1004 (focus events) is
+    /// enabled, we reply with ESC [ I (focus in) or ESC [ O (focus
+    /// out). No-op otherwise.</summary>
+    public void NotifyFocus(bool focused)
+    {
+        if (!FocusEvents) return;
+        ReplyToPty(focused ? "\x1b[I"u8 : "\x1b[O"u8);
+        Bump();
     }
 
     public TerminalBuffer(int cols, int rows)
@@ -169,6 +249,7 @@ public sealed class TerminalBuffer : IParserActions
         ScrollBottom = rows - 1;
         ScrollOffset = 0; // viewport must follow new bottom
         PixelScrollOffset = 0;
+        _tabStops = null; // rebuild with new column count
         Bump();
     }
 
@@ -453,18 +534,21 @@ public sealed class TerminalBuffer : IParserActions
 
         int width = UnicodeWidth.Of(rune);
 
+        // When the cursor has fallen off the right edge (past the
+        // last valid column), behaviour depends on DECAWM: wrap if
+        // on, stomp the right-margin cell if off.
         if (CursorCol >= Cols)
         {
-            CarriageReturn();
-            LineFeedInternal();
+            if (AutoWrap) { CarriageReturn(); LineFeedInternal(); }
+            else          { CursorCol = Cols - 1; }
         }
 
         // Wide glyphs need two columns; wrap if the right half would
-        // spill off the line.
+        // spill off the line (or stomp if autowrap is disabled).
         if (width == 2 && CursorCol >= Cols - 1)
         {
-            CarriageReturn();
-            LineFeedInternal();
+            if (AutoWrap) { CarriageReturn(); LineFeedInternal(); }
+            else          { CursorCol = Cols - 2; }
         }
 
         var row  = _active.GetRow(CursorRow);
@@ -472,15 +556,41 @@ public sealed class TerminalBuffer : IParserActions
         cell.Rune        = rune;
         cell.HyperlinkId = _activeLinkId;
 
+        // IRM (insert mode): shift the row right by `width` before
+        // writing. Cells pushed past the right margin are discarded.
+        if (InsertMode)
+            ShiftRowRight(row, CursorCol, width);
+
+        // Clean up orphan half-cells we're about to stomp. If the
+        // incoming cell lands on the continuation side of an existing
+        // wide glyph, the glyph's left half must have its IsWide flag
+        // dropped (otherwise the renderer will still draw it 2-col).
+        // Symmetrically, if we're about to write the left half of a
+        // new narrow/wide and the cell below us was a wide-left, the
+        // orphaned continuation to our right must be blanked.
+        if (CursorCol > 0 && (row[CursorCol].Flags2 & CellFlags2.IsContinuation) != 0)
+        {
+            row[CursorCol - 1].Flags2 &= ~CellFlags2.IsWide;
+            row[CursorCol - 1].Rune    = 0;
+        }
+        if ((row[CursorCol].Flags2 & CellFlags2.IsWide) != 0 && CursorCol + 1 < Cols)
+        {
+            row[CursorCol + 1].Flags2 &= ~CellFlags2.IsContinuation;
+        }
+
+        // Preserve SGR-driven Flags2 bits (Blink) from the pen, but
+        // override the cell-shape flags (IsWide / IsContinuation) we
+        // set based on the rune width.
+        var penExtras = PenTemplate.Flags2 & CellFlags2.Blink;
         if (width == 2)
         {
-            cell.Flags2 = CellFlags2.IsWide;
+            cell.Flags2 = CellFlags2.IsWide | penExtras;
             row[CursorCol] = cell;
             if (CursorCol + 1 < Cols)
             {
                 var cont = PenTemplate;
                 cont.Rune        = 0;
-                cont.Flags2      = CellFlags2.IsContinuation;
+                cont.Flags2      = CellFlags2.IsContinuation | penExtras;
                 cont.HyperlinkId = _activeLinkId;
                 row[CursorCol + 1] = cont;
             }
@@ -488,10 +598,25 @@ public sealed class TerminalBuffer : IParserActions
         }
         else
         {
-            cell.Flags2    = CellFlags2.None;
+            cell.Flags2    = penExtras;
             row[CursorCol] = cell;
             CursorCol++;
         }
+
+        _lastPrintRune  = rune;
+        _lastPrintWidth = width;
+    }
+
+    /// <summary>Shift cells at and after <paramref name="from"/> right
+    /// by <paramref name="by"/>, filling in blanks. Cells pushed off
+    /// the right margin are dropped (matches xterm's IRM).</summary>
+    private void ShiftRowRight(TerminalCell[] row, int from, int by)
+    {
+        if (by <= 0 || from >= row.Length) return;
+        for (int c = row.Length - 1; c >= from + by; c--)
+            row[c] = row[c - by];
+        for (int c = from; c < Math.Min(from + by, row.Length); c++)
+            row[c] = BlankPenCell();
     }
 
     public void Execute(byte c0)
@@ -499,10 +624,15 @@ public sealed class TerminalBuffer : IParserActions
         switch (c0)
         {
             case 0x07: return;                                // BEL
-            case 0x08: if (CursorCol > 0) CursorCol--; return; // BS
-            case 0x09: HorizontalTab(); return;
-            case 0x0A: case 0x0B: case 0x0C: LineFeedInternal(); return;
-            case 0x0D: CarriageReturn(); return;
+            case 0x08: if (CursorCol > 0) CursorCol--; _lastPrintRune = 0; return; // BS
+            case 0x09: HorizontalTab(); _lastPrintRune = 0; return;
+            case 0x0A: case 0x0B: case 0x0C:
+                // LF/VT/FF: when LNM is on, treat as NEL (CR+LF).
+                if (LineFeedNewLine) CarriageReturn();
+                LineFeedInternal();
+                _lastPrintRune = 0;
+                return;
+            case 0x0D: CarriageReturn(); _lastPrintRune = 0; return;
             case 0x0E: _activeG = 1; return;                  // SO → G1
             case 0x0F: _activeG = 0; return;                  // SI → G0
         }
@@ -520,6 +650,12 @@ public sealed class TerminalBuffer : IParserActions
             return;
         }
 
+        // DECSTR — soft reset. Private intermediate "!" followed by 'p'.
+        if (intermediates == "!" && final == 'p') { SoftReset(); return; }
+
+        // Any non-REP CSI invalidates the "last printable" state.
+        if (final != 'b') _lastPrintRune = 0;
+
         switch (final)
         {
             case 'A': MoveCursorRows(-Max1(p0)); return;
@@ -531,9 +667,9 @@ public sealed class TerminalBuffer : IParserActions
             case 'G': CursorCol = Clamp((p0 > 0 ? p0 : 1) - 1, 0, Cols - 1); return;
             case 'H':
             case 'f':
-                CursorRow = Clamp((p0 > 0 ? p0 : 1) - 1, 0, Rows - 1);
-                CursorCol = Clamp((p1 > 0 ? p1 : 1) - 1, 0, Cols - 1);
+                MoveCursorAbs(p0, p1);
                 return;
+            case 'I': CursorTabForward (Max1(p0)); return; // CHT
             case 'J': EraseDisplay(p0); return;
             case 'K': EraseLine(p0); return;
             case 'L': _active.InsertLines(CursorRow, Max1(p0), ScrollBottom); return;
@@ -542,16 +678,40 @@ public sealed class TerminalBuffer : IParserActions
             case 'S': _active.ScrollUpRegion  (ScrollTop, ScrollBottom, Max1(p0)); return;
             case 'T': _active.ScrollDownRegion(ScrollTop, ScrollBottom, Max1(p0)); return;
             case 'X': EraseChars(Max1(p0)); return;
+            case 'Z': CursorTabBackward(Max1(p0)); return; // CBT
             case '@': InsertBlanks(Max1(p0)); return;
+            case 'b': RepeatPrecedingChar(Max1(p0)); return; // REP
             case 'd': CursorRow = Clamp((p0 > 0 ? p0 : 1) - 1, 0, Rows - 1); return;
+            case 'g': ClearTabStop(p0); return;             // TBC
+            case 'h': SetAnsiMode(p, true);  return;         // SM (IRM, LNM)
+            case 'l': SetAnsiMode(p, false); return;         // RM
             case 'm': ApplySgr(p); return;
             case 'n': HandleDsr(p0); return;
             case 'c': ReplyToPty("\x1b[?62;4;22c"u8); return;  // VT220 DA
             case 'r': SetScrollRegion(p0, p1); return;
             case 's': SaveCursor(); return;
+            case 't': HandleWindowManip(p); return;          // CSI t — window ops
             case 'u': RestoreCursor(); return;
             case 'q': SetCursorStyle(p0); return;              // DECSCUSR (with/without SP intermediate)
         }
+    }
+
+    // ---- CUP/HVP with DECOM origin mode ----
+
+    private void MoveCursorAbs(int row1Based, int col1Based)
+    {
+        int row = (row1Based > 0 ? row1Based : 1) - 1;
+        int col = (col1Based > 0 ? col1Based : 1) - 1;
+        if (OriginMode)
+        {
+            row += ScrollTop;
+            CursorRow = Clamp(row, ScrollTop, ScrollBottom);
+        }
+        else
+        {
+            CursorRow = Clamp(row, 0, Rows - 1);
+        }
+        CursorCol = Clamp(col, 0, Cols - 1);
     }
 
     public void EscDispatch(char final, string intermediates)
@@ -563,6 +723,7 @@ public sealed class TerminalBuffer : IParserActions
             _gSlots[slot] = final == '0' ? Charset.DecSpecialGraphics : Charset.Ascii;
             return;
         }
+        _lastPrintRune = 0; // anything here is a control dispatch
         switch (final)
         {
             case '7': SaveCursor(); return;                    // DECSC
@@ -571,6 +732,7 @@ public sealed class TerminalBuffer : IParserActions
             case '>': ApplicationKeypad = false; return;       // DECKPNM
             case 'D': LineFeedInternal(); return;              // IND
             case 'E': CarriageReturn(); LineFeedInternal(); return; // NEL
+            case 'H': SetTabStop(CursorCol); return;           // HTS
             case 'M': ReverseIndex(); return;                  // RI
             case 'c': FullReset(); return;                     // RIS
         }
@@ -582,9 +744,28 @@ public sealed class TerminalBuffer : IParserActions
         if (semi < 0) return;
         if (!int.TryParse(payload.AsSpan(0, semi), out int cmd)) return;
         var data = payload.Substring(semi + 1);
-        if (cmd == 8) HandleOsc8(data);
-        // 0 / 2 (window title) — ignored for now. Wire to a TitleChanged
-        // event when the tab UI wants it.
+        switch (cmd)
+        {
+            case 0:
+                // OSC 0 sets both window title and icon name.
+                _windowTitle = data;
+                TitleChanged?.Invoke(this, data);
+                IconNameChanged?.Invoke(this, data);
+                return;
+            case 1:
+                IconNameChanged?.Invoke(this, data);
+                return;
+            case 2:
+                _windowTitle = data;
+                TitleChanged?.Invoke(this, data);
+                return;
+            case 4:  HandleOsc4 (data); return;
+            case 8:  HandleOsc8 (data); return;
+            case 10: HandleOscSpecialColor(10, () => DefaultForegroundRgb, v => DefaultForegroundRgb = v, data); return;
+            case 11: HandleOscSpecialColor(11, () => DefaultBackgroundRgb, v => DefaultBackgroundRgb = v, data); return;
+            case 12: HandleOscSpecialColor(12, () => DefaultCursorRgb,     v => DefaultCursorRgb     = v, data); return;
+            case 52: HandleOsc52(data); return;
+        }
     }
 
     public void ReplyToPty(ReadOnlySpan<byte> bytes)
@@ -601,10 +782,277 @@ public sealed class TerminalBuffer : IParserActions
         if (t >= b || b >= Rows) { t = 0; b = Rows - 1; }
         ScrollTop    = t;
         ScrollBottom = b;
-        // DECSTBM parks the cursor at home.
-        CursorRow = 0;
+        // DECSTBM parks the cursor at home (origin-mode respecting).
         CursorCol = 0;
+        CursorRow = OriginMode ? ScrollTop : 0;
     }
+
+    // ---- ANSI mode (CSI h/l without `?`): IRM, LNM ----
+
+    private void SetAnsiMode(int[] p, bool on)
+    {
+        foreach (var m in p)
+        {
+            switch (m)
+            {
+                case 4:  InsertMode        = on; break;
+                case 20: LineFeedNewLine   = on; break;
+            }
+        }
+    }
+
+    // ---- Tab stops ----
+
+    private bool[] EnsureTabStops()
+    {
+        if (_tabStops == null || _tabStops.Length != Cols)
+        {
+            _tabStops = new bool[Cols];
+            for (int c = 8; c < Cols; c += 8) _tabStops[c] = true;
+        }
+        return _tabStops;
+    }
+
+    private void SetTabStop(int col)
+    {
+        var ts = EnsureTabStops();
+        if (col >= 0 && col < ts.Length) ts[col] = true;
+    }
+
+    private void ClearTabStop(int mode)
+    {
+        var ts = EnsureTabStops();
+        switch (mode)
+        {
+            case 0: if (CursorCol >= 0 && CursorCol < ts.Length) ts[CursorCol] = false; break;
+            case 3: Array.Clear(ts, 0, ts.Length); break;
+        }
+    }
+
+    private void CursorTabForward(int n)
+    {
+        var ts = EnsureTabStops();
+        while (n-- > 0 && CursorCol < Cols - 1)
+        {
+            int next = CursorCol + 1;
+            while (next < Cols - 1 && !ts[next]) next++;
+            CursorCol = next;
+        }
+    }
+
+    private void CursorTabBackward(int n)
+    {
+        var ts = EnsureTabStops();
+        while (n-- > 0 && CursorCol > 0)
+        {
+            int prev = CursorCol - 1;
+            while (prev > 0 && !ts[prev]) prev--;
+            CursorCol = prev;
+        }
+    }
+
+    // ---- REP ----
+
+    private void RepeatPrecedingChar(int count)
+    {
+        if (_lastPrintRune == 0) return;
+        int rune = _lastPrintRune;
+        for (int i = 0; i < count; i++) Print(rune);
+    }
+
+    // ---- DECSTR (soft reset) ----
+
+    private void SoftReset()
+    {
+        CursorVisible = true;
+        ScrollTop     = 0;
+        ScrollBottom  = Rows - 1;
+        InsertMode    = false;
+        OriginMode    = false;
+        PenTemplate   = TerminalCell.Blank;
+        _savedRow = _savedCol = 0; _savedPen = TerminalCell.Blank;
+        _altSavedRow = _altSavedCol = 0; _altSavedPen = TerminalCell.Blank;
+        _gSlots[0] = Charset.Ascii; _gSlots[1] = Charset.Ascii;
+        _activeG = 0;
+    }
+
+    // ---- Window manipulation CSI t — safe subset ----
+
+    private void HandleWindowManip(int[] p)
+    {
+        // We implement only the reporting operations; anything that
+        // would change the host window (resize, raise, iconify) is
+        // ignored on purpose — those belong to the host shell.
+        int op = p.Length > 0 ? p[0] : 0;
+        switch (op)
+        {
+            case 14: // report window size in pixels — respond with cell×cell approximation
+                ReplyAscii($"\x1b[4;{Rows * 16};{Cols * 8}t");
+                return;
+            case 16: // report cell size in pixels (approximate)
+                ReplyAscii("\x1b[6;16;8t");
+                return;
+            case 18: // report text area size in characters
+                ReplyAscii($"\x1b[8;{Rows};{Cols}t");
+                return;
+            case 19: // report screen size in characters (assume same as text area)
+                ReplyAscii($"\x1b[9;{Rows};{Cols}t");
+                return;
+            case 20: // report icon name via OSC L
+                ReplyAscii("\x1b]L" + _windowTitle + "\x1b\\");
+                return;
+            case 21: // report window title via OSC l
+                ReplyAscii("\x1b]l" + _windowTitle + "\x1b\\");
+                return;
+            // All other ops (resize, move, raise, etc.) are no-ops.
+        }
+    }
+
+    // ---- OSC 4: palette entry query/set. OSC 10/11/12: fg/bg/cursor ----
+
+    private uint[] EnsurePalette256()
+    {
+        if (_palette256 != null) return _palette256;
+        _palette256 = new uint[256];
+        // Standard xterm 256 palette. Same numbers we reference in
+        // the renderer (see Render/TerminalPalette.cs) so queries are
+        // consistent with what's on screen.
+        uint[] basic =
+        {
+            0x000000, 0x800000, 0x008000, 0x808000,
+            0x000080, 0x800080, 0x008080, 0xC0C0C0,
+            0x808080, 0xFF0000, 0x00FF00, 0xFFFF00,
+            0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+        };
+        for (int i = 0; i < 16; i++) _palette256[i] = basic[i];
+        int idx = 16;
+        int[] levels = { 0, 95, 135, 175, 215, 255 };
+        for (int r = 0; r < 6; r++)
+        for (int g = 0; g < 6; g++)
+        for (int b = 0; b < 6; b++)
+            _palette256[idx++] = (uint)((levels[r] << 16) | (levels[g] << 8) | levels[b]);
+        for (int i = 0; i < 24; i++)
+        {
+            int v = 8 + i * 10;
+            _palette256[idx++] = (uint)((v << 16) | (v << 8) | v);
+        }
+        return _palette256;
+    }
+
+    private void HandleOsc4(string data)
+    {
+        // Payload is "idx;spec[;idx;spec...]". If spec == "?" we reply
+        // with the current rgb: form; otherwise parse + set.
+        var parts = data.Split(';');
+        for (int i = 0; i + 1 < parts.Length; i += 2)
+        {
+            if (!int.TryParse(parts[i], out int idx) || idx < 0 || idx > 255) continue;
+            var spec = parts[i + 1];
+            if (spec == "?")
+            {
+                var pal = EnsurePalette256();
+                ReplyAscii($"\x1b]4;{idx};{RgbSpec(pal[idx])}\x1b\\");
+            }
+            else if (TryParseRgbSpec(spec, out var rgb))
+            {
+                EnsurePalette256()[idx] = rgb;
+            }
+        }
+    }
+
+    private void HandleOscSpecialColor(int cmd, Func<uint> getter, Action<uint> setter, string data)
+    {
+        // Data is either "?" (query) or an rgb:RRRR/GGGG/BBBB (or
+        // #RRGGBB) spec to set.
+        if (data == "?")
+        {
+            ReplyAscii($"\x1b]{cmd};{RgbSpec(getter())}\x1b\\");
+        }
+        else if (TryParseRgbSpec(data, out var rgb))
+        {
+            setter(rgb);
+        }
+    }
+
+    private void HandleOsc52(string data)
+    {
+        // Syntax: "clipboards;payload". Payload is base64 for set or
+        // "?" for get. We gate both behind AllowClipboardAccess; get
+        // isn't wired (the host decides whether to leak data back).
+        if (!AllowClipboardAccess) return;
+        int semi = data.IndexOf(';');
+        if (semi < 0) return;
+        var body = data.Substring(semi + 1);
+        if (body == "?") return; // get-from-clipboard requests are ignored
+        string decoded;
+        try
+        {
+            var bytes = Convert.FromBase64String(body);
+            decoded = Encoding.UTF8.GetString(bytes);
+        }
+        catch (FormatException)
+        {
+            return;
+        }
+        ClipboardRequested?.Invoke(this, new ClipboardRequestEventArgs(decoded));
+    }
+
+    private static string RgbSpec(uint rgb)
+    {
+        int r = (int)((rgb >> 16) & 0xFF);
+        int g = (int)((rgb >>  8) & 0xFF);
+        int b = (int)( rgb        & 0xFF);
+        // xterm replies with 16-bit components so most consumers work
+        // even when they expect the VT5xx format. Repeat the 8-bit
+        // value in both halves (e.g. 0xAB → 0xABAB).
+        return $"rgb:{r:x2}{r:x2}/{g:x2}{g:x2}/{b:x2}{b:x2}";
+    }
+
+    private static bool TryParseRgbSpec(string spec, out uint rgb)
+    {
+        rgb = 0;
+        if (spec.StartsWith('#') && (spec.Length == 7 || spec.Length == 13))
+        {
+            // #RRGGBB or #RRRRGGGGBBBB — take the high byte of each.
+            int step = spec.Length == 7 ? 2 : 4;
+            if (!int.TryParse(spec.AsSpan(1,         2), System.Globalization.NumberStyles.HexNumber, null, out int r)) return false;
+            if (!int.TryParse(spec.AsSpan(1+step,    2), System.Globalization.NumberStyles.HexNumber, null, out int g)) return false;
+            if (!int.TryParse(spec.AsSpan(1+step*2,  2), System.Globalization.NumberStyles.HexNumber, null, out int b)) return false;
+            rgb = (uint)((r << 16) | (g << 8) | b);
+            return true;
+        }
+        if (spec.StartsWith("rgb:", StringComparison.Ordinal))
+        {
+            var parts = spec.Substring(4).Split('/');
+            if (parts.Length != 3) return false;
+            if (!TryTopByte(parts[0], out int r)) return false;
+            if (!TryTopByte(parts[1], out int g)) return false;
+            if (!TryTopByte(parts[2], out int b)) return false;
+            rgb = (uint)((r << 16) | (g << 8) | b);
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryTopByte(string hex, out int value)
+    {
+        value = 0;
+        if (hex.Length == 0 || hex.Length > 4) return false;
+        if (!int.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out int raw)) return false;
+        // Scale to 8-bit by taking the top byte of the hex length.
+        int scaled = hex.Length switch
+        {
+            1 => raw * 0x11,
+            2 => raw,
+            3 => (raw >> 4),
+            4 => (raw >> 8),
+            _ => raw,
+        };
+        value = scaled & 0xFF;
+        return true;
+    }
+
+    private void ReplyAscii(string s) => ReplyToPty(Encoding.ASCII.GetBytes(s));
 
     private void SetDecMode(int[] p, bool on)
     {
@@ -613,6 +1061,15 @@ public sealed class TerminalBuffer : IParserActions
             switch (m)
             {
                 case 1:    ApplicationCursorKeys = on; break;
+                case 5:    ReverseVideo = on; break;              // DECSCNM
+                case 6:                                            // DECOM
+                    OriginMode = on;
+                    // Entering origin mode parks the cursor at the
+                    // top of the region; leaving it returns to home.
+                    CursorRow = on ? ScrollTop : 0;
+                    CursorCol = 0;
+                    break;
+                case 7:    AutoWrap = on; break;                   // DECAWM
                 case 25:   CursorVisible = on; break;
                 case 47: case 1047: case 1049:
                     if (on) EnterAlt(m == 1049); else LeaveAlt(m == 1049);
@@ -708,7 +1165,11 @@ public sealed class TerminalBuffer : IParserActions
 
     private void HorizontalTab()
     {
-        int next = (CursorCol + 8) & ~7;
+        // Use the custom tab-stop array. Falls back to every-8-cols
+        // stops when no HTS/TBC has customised anything.
+        var ts = EnsureTabStops();
+        int next = CursorCol + 1;
+        while (next < Cols - 1 && !ts[next]) next++;
         CursorCol = Math.Min(next, Cols - 1);
     }
 
@@ -726,8 +1187,12 @@ public sealed class TerminalBuffer : IParserActions
         {
             case 0: EraseLine(0); for (int r = CursorRow + 1; r < Rows;      r++) ClearRow(r); break;
             case 1: EraseLine(1); for (int r = 0;              r < CursorRow; r++) ClearRow(r); break;
-            case 2:
-            case 3: for (int r = 0; r < Rows; r++) ClearRow(r); break;
+            case 2: for (int r = 0; r < Rows; r++) ClearRow(r); break;
+            case 3:
+                // xterm: mode 3 clears the scrollback buffer but
+                // leaves the visible screen intact. Linux ED 3 extension.
+                ClearScrollback();
+                break;
         }
     }
 
@@ -806,8 +1271,13 @@ public sealed class TerminalBuffer : IParserActions
         _activeG = 0; _gSlots[0] = Charset.Ascii; _gSlots[1] = Charset.Ascii;
         MouseMode = 0; BracketedPaste = false; FocusEvents = false;
         ApplicationCursorKeys = false; ApplicationKeypad = false;
+        AutoWrap = true; OriginMode = false; ReverseVideo = false;
+        InsertMode = false; LineFeedNewLine = false;
         ScrollOffset = 0; Selection = null;
         _activeLinkId = 0; _hyperlinks.Clear();
+        _tabStops = null; // will rebuild with defaults on next access
+        _lastPrintRune = 0;
+        _windowTitle = string.Empty;
     }
 
     // ---- SGR ----
@@ -822,17 +1292,20 @@ public sealed class TerminalBuffer : IParserActions
             switch (p[i])
             {
                 case 0:   PenTemplate = TerminalCell.Blank; break;
-                case 1:   PenTemplate.Flags |=  CellFlags.Bold;          break;
-                case 2:   PenTemplate.Flags |=  CellFlags.Dim;           break;
-                case 3:   PenTemplate.Flags |=  CellFlags.Italic;        break;
-                case 4:   PenTemplate.Flags |=  CellFlags.Underline;     break;
-                case 7:   PenTemplate.Flags |=  CellFlags.Inverse;       break;
-                case 9:   PenTemplate.Flags |=  CellFlags.Strikethrough; break;
-                case 22:  PenTemplate.Flags &= ~(CellFlags.Bold | CellFlags.Dim); break;
-                case 23:  PenTemplate.Flags &= ~CellFlags.Italic;        break;
-                case 24:  PenTemplate.Flags &= ~CellFlags.Underline;     break;
-                case 27:  PenTemplate.Flags &= ~CellFlags.Inverse;       break;
-                case 29:  PenTemplate.Flags &= ~CellFlags.Strikethrough; break;
+                case 1:   PenTemplate.Flags  |=  CellFlags.Bold;          break;
+                case 2:   PenTemplate.Flags  |=  CellFlags.Dim;           break;
+                case 3:   PenTemplate.Flags  |=  CellFlags.Italic;        break;
+                case 4:   PenTemplate.Flags  |=  CellFlags.Underline;     break;
+                case 5:
+                case 6:   PenTemplate.Flags2 |=  CellFlags2.Blink;        break;
+                case 7:   PenTemplate.Flags  |=  CellFlags.Inverse;       break;
+                case 9:   PenTemplate.Flags  |=  CellFlags.Strikethrough; break;
+                case 22:  PenTemplate.Flags  &= ~(CellFlags.Bold | CellFlags.Dim); break;
+                case 23:  PenTemplate.Flags  &= ~CellFlags.Italic;        break;
+                case 24:  PenTemplate.Flags  &= ~CellFlags.Underline;     break;
+                case 25:  PenTemplate.Flags2 &= ~CellFlags2.Blink;        break;
+                case 27:  PenTemplate.Flags  &= ~CellFlags.Inverse;       break;
+                case 29:  PenTemplate.Flags  &= ~CellFlags.Strikethrough; break;
 
                 case 30: case 31: case 32: case 33:
                 case 34: case 35: case 36: case 37:
