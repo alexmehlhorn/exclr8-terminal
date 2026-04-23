@@ -1,0 +1,40 @@
+[?1049h[40;1H[?1h=#
+# Network services, Internet style
+#
+# Note that it is presently the policy of IANA to assign a single well-known
+# port number for both TCP and UDP; hence, most entries here have two entries
+# even if the protocol doesn't support UDP operations.
+#
+# The latest IANA port assignments can be gotten from
+#
+#       http://www.iana.org/assignments/port-numbers
+#
+# The Well Known Ports are those from 0 through 1023.
+# The Registered Ports are those from 1024 through 49151
+# The Dynamic and/or Private Ports are those from 49152 through 65535
+#
+# $FreeBSD: src/etc/services,v 1.89 2002/12/17 23:59:10 eric Exp $
+#       From: @(#)services      5.8 (Berkeley) 5/9/91
+#
+# WELL KNOWN PORT NUMBERS
+#
+rtmp              1/ddp    #Routing Table Maintenance Protocol
+tcpmux            1/udp     # TCP Port Service Multiplexer
+tcpmux            1/tcp     # TCP Port Service Multiplexer
+#                          Mark Lottor <MKL@nisc.sri.com>
+nbp               2/ddp    #Name Binding Protocol
+compressnet       2/udp     # Management Utility
+compressnet       2/tcp     # Management Utility
+compressnet       3/udp     # Compression Process
+compressnet       3/tcp     # Compression Process
+#                          Bernie Volz <VOLZ@PROCESS.COM>
+echo              4/ddp    #AppleTalk Echo Protocol
+#                 4/tcp    Unassigned
+#                 4/udp    Unassigned
+rje               5/udp     # Remote Job Entry
+rje               5/tcp     # Remote Job Entry
+#                          Jon Postel <postel@isi.edu>
+zip               6/ddp    #Zone Information Protocol
+#                 6/tcp    Unassigned
+#                 6/udp    Unassigned
+[7m/etc/services[27m[K[K[?1l>[?1049l

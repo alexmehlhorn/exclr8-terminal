@@ -1,0 +1,17 @@
+Processes: 1063 total, 5 running, 1058 sleeping, 8075 threads 
+2026/04/23 22:48:24
+Load Avg: 6.66, 5.91, 5.94 
+CPU usage: 17.64% user, 12.26% sys, 70.8% idle 
+SharedLibs: 1153M resident, 178M data, 436M linkedit.
+MemRegions: 1163488 total, 21G resident, 728M private, 23G shared.
+PhysMem: 119G used (9287M wired, 8702M compressor), 7499M unused.
+VM: 1078T vsize, 6144M framework vsize, 680156293(0) swapins, 710004471(0) swapouts.
+Networks: packets: 113605773/180G in, 67412844/130G out.
+Disks: 464109671/13T read, 232968877/12T written.
+
+PID    COMMAND %CPU TIME     #TH #WQ #PORTS MEM PURG CMPRS PGRP  PPID  STATE    BOOSTS %CPU_ME %CPU_OTHRS UID FAULTS COW MSGSENT MSGRECV SYSBSD SYSMACH CSW   PAGEINS IDLEW POWER INSTRS CYCLES JETPRI USER #MREGS RPRVT VPRVT VSIZE KPRVT KSHRD
+99917  node    0.0  00:13.58 12  1   35     45M 0B   8000K 99789 99908 sleeping *0[1]  0.00000 0.00000    501 14283  68  118     37      304788 1913    93332 88      51    0.0   0      0      180    ahm  N/A    N/A   N/A   N/A   N/A   N/A  
+99908  node    0.0  00:00.02 7   0   23     12M 0B   11M   99789 99822 sleeping *0[1]  0.00000 0.00000    501 3623   140 162     77      1046   526     46    75      0     0.0   0      0      180    ahm  N/A    N/A   N/A   N/A   N/A   N/A  
+99889  node    0.0  00:00.27 7   0   19     45M 0B   39M   99789 99821 sleeping *0[1]  0.00000 0.00000    501 7454   168 157     76      8214   666     889   82      0     0.0   0      0      180    ahm  N/A    N/A   N/A   N/A   N/A   N/A  
+99870  node    0.0  00:00.28 8   1   25     45M 0B   39M   99789 99819 sleeping *0[1]  0.00000 0.00000    501 7373   142 169     78      10611  553     833   88      0     0.0   0      0      180    ahm  N/A    N/A   N/A   N/A   N/A   N/A  
+99822  node    0.0  00:00.34 12  1   51     42M 0B   36M   99789 99789 sleeping *0[1]  0.00000 0.00000    501 7767   100 168     128     18854  581     2595  92      0     0.0   0      0      180    ahm  N/A    N/A   N/A   N/A   N/A   N/A  

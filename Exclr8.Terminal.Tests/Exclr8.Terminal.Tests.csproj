@@ -28,4 +28,14 @@
     <ProjectReference Include="..\Exclr8.Terminal\Exclr8.Terminal.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Recorded real-program byte streams replayed by WorkloadReplayTests.
+         CopyToOutputDirectory makes them available under
+         bin/<Config>/net10.0/Fixtures/*.bin at test run time. -->
+    <None Include="Fixtures\*.bin">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>Fixtures\%(Filename)%(Extension)</Link>
+    </None>
+  </ItemGroup>
+
 </Project>
