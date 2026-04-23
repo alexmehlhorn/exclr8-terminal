@@ -561,6 +561,23 @@ public sealed class TerminalBuffer : IParserActions
         if (InsertMode)
             ShiftRowRight(row, CursorCol, width);
 
+        // Clean up orphan half-cells we're about to stomp. If the
+        // incoming cell lands on the continuation side of an existing
+        // wide glyph, the glyph's left half must have its IsWide flag
+        // dropped (otherwise the renderer will still draw it 2-col).
+        // Symmetrically, if we're about to write the left half of a
+        // new narrow/wide and the cell below us was a wide-left, the
+        // orphaned continuation to our right must be blanked.
+        if (CursorCol > 0 && (row[CursorCol].Flags2 & CellFlags2.IsContinuation) != 0)
+        {
+            row[CursorCol - 1].Flags2 &= ~CellFlags2.IsWide;
+            row[CursorCol - 1].Rune    = 0;
+        }
+        if ((row[CursorCol].Flags2 & CellFlags2.IsWide) != 0 && CursorCol + 1 < Cols)
+        {
+            row[CursorCol + 1].Flags2 &= ~CellFlags2.IsContinuation;
+        }
+
         if (width == 2)
         {
             cell.Flags2 = CellFlags2.IsWide;
