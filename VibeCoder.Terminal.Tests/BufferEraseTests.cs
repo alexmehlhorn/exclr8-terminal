@@ -44,17 +44,8 @@ public class BufferEraseTests
         Assert.Equal("", buf.RowText(2));
     }
 
-    [Fact(Skip = "Phase 2: ED 3 (clear scrollback) not yet implemented")]
-    public void ED_3_ClearsAllIncludingScrollback()
-    {
-        var buf = NewBuffer(10, 3);
-        buf.ScrollbackLimit = 100;
-        // Force scrollback by printing more lines than rows.
-        buf.Feed("A\r\nB\r\nC\r\nD\r\nE\r\nF");
-        Assert.True(buf.ScrollbackCount > 0);
-        buf.Feed(CSI + "3J");
-        Assert.Equal(0, buf.ScrollbackCount);
-    }
+    // ED 3 (clear scrollback) lives in Phase2GapTests since it's a
+    // gap that was explicitly listed in the Phase 2 checklist.
 
     // ---- EL: CSI Ps K ----
 
