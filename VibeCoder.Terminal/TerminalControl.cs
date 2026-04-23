@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Text;
 using System.Threading.Tasks;
 using Avalonia;
@@ -73,8 +74,15 @@ public class TerminalControl : Control
         Focusable    = true;
         ClipToBounds = true;
 
+        // I-beam over the cell grid so the hotspot sits at the centre
+        // of the cursor and the pointer visually aligns with the
+        // character it's over. The default arrow's hotspot is at the
+        // top-left tip which makes drag-selection feel offset.
+        Cursor = new Cursor(StandardCursorType.Ibeam);
+
         _renderer = new TerminalRenderer();
         _buffer   = new TerminalBuffer(80, 24);
+        _buffer.Changed += (_, _) => InvalidateVisual();
 
         this.GetObservable(BoundsProperty)
             .Subscribe(new ActionObserver<Rect>(_ => RecomputeGrid()));
@@ -151,30 +159,51 @@ public class TerminalControl : Control
     {
         base.OnKeyDown(e);
         _altHeld = (e.KeyModifiers & KeyModifiers.Alt) != 0;
-        _buffer.ResetScrollOffset();
 
         bool isMac = OperatingSystem.IsMacOS();
         bool meta  = (e.KeyModifiers & KeyModifiers.Meta)    != 0;
         bool ctrl  = (e.KeyModifiers & KeyModifiers.Control) != 0;
         bool shift = (e.KeyModifiers & KeyModifiers.Shift)   != 0;
 
-        // Clipboard shortcuts. ⌘C / ⌘V on macOS, Ctrl+Shift+C/V elsewhere —
-        // Ctrl+C alone is SIGINT and must reach the shell.
-        if ((isMac && meta && e.Key == Key.V) || (!isMac && ctrl && shift && e.Key == Key.V))
+        // Clipboard & editor-style shortcuts. Handled BEFORE any
+        // scroll-reset so the user can scroll up → select → copy
+        // without the view snapping back and invalidating their
+        // selection. ⌘ on macOS, Ctrl+Shift elsewhere — Ctrl+C alone
+        // is SIGINT and must reach the shell.
+        bool macShortcut   = isMac  && meta && !ctrl;
+        bool otherShortcut = !isMac && ctrl && shift;
+        if (macShortcut || otherShortcut)
         {
-            _ = PasteFromClipboardAsync();
-            e.Handled = true;
-            return;
+            switch (e.Key)
+            {
+                case Key.V: _ = PasteFromClipboardAsync(); e.Handled = true; return;
+                case Key.C: _ = CopySelectionAsync();      e.Handled = true; return;
+                case Key.A: _buffer.SelectAll();           e.Handled = true; return;
+                case Key.K: _buffer.ClearScrollback();     e.Handled = true; return;
+            }
         }
-        if ((isMac && meta && e.Key == Key.C) || (!isMac && ctrl && shift && e.Key == Key.C))
+
+        // Shift+PgUp/PgDn page the scrollback viewport without sending
+        // the key to the shell. Matches xterm/iTerm2 behaviour. Without
+        // Shift, PgUp/PgDn fall through to KeyMapper and reach the shell.
+        if (shift && (e.Key == Key.PageUp || e.Key == Key.PageDown))
         {
-            _ = CopySelectionAsync();
+            int page = Math.Max(1, _buffer.Rows - 1);
+            if (e.Key == Key.PageUp) _buffer.ScrollViewUp(page);
+            else                     _buffer.ScrollViewDown(page);
             e.Handled = true;
             return;
         }
 
         var bytes = KeyMapper.Map(e, _buffer.ApplicationCursorKeys, _buffer.ApplicationKeypad);
-        if (bytes.Length > 0) { Input?.Invoke(this, bytes); e.Handled = true; }
+        if (bytes.Length > 0)
+        {
+            // Actual shell input — snap to live buffer so the user
+            // sees the prompt they're typing into.
+            _buffer.ResetScrollOffset();
+            Input?.Invoke(this, bytes);
+            e.Handled = true;
+        }
     }
 
     protected override void OnKeyUp(KeyEventArgs e)
@@ -341,7 +370,8 @@ public class TerminalControl : Control
         }
 
         // Positive wheel delta = scroll up (toward scrollback) in pixel
-        // units. Buffer clamps at scrollback bounds.
+        // units. Buffer clamps at scrollback bounds. Buffer.Changed
+        // handler drives the repaint.
         _buffer.ScrollByPixels(e.Delta.Y * PixelsPerTick, _renderer.CellHeight);
         e.Handled = true;
     }
@@ -369,7 +399,21 @@ public class TerminalControl : Control
 
     // ---- Clipboard ----
 
-    private async Task CopySelectionAsync()
+    /// <summary>Public façade: copy the current selection (if any) to
+    /// the OS clipboard. No-op when nothing is selected.</summary>
+    public Task CopySelectionAsync() => CopySelectionAsyncCore();
+
+    /// <summary>Public façade: read the OS clipboard and feed it into
+    /// the terminal. Prefers image payloads over text — when an image
+    /// is on the clipboard we spill it to a temp file and paste the
+    /// path, which is how Claude Code and similar CLIs consume
+    /// pasted images on macOS.</summary>
+    public Task PasteFromClipboardAsync() => PasteFromClipboardAsyncCore();
+
+    /// <summary>Public façade: select the current viewport.</summary>
+    public void SelectAll() => _buffer.SelectAll();
+
+    private async Task CopySelectionAsyncCore()
     {
         var t = _buffer.GetSelectedText();
         if (!string.IsNullOrEmpty(t)) await CopyToClipboardAsync(t);
@@ -381,16 +425,66 @@ public class TerminalControl : Control
         catch { }
     }
 
-    private async Task PasteFromClipboardAsync()
+    // Clipboard format names. macOS exposes UTI-style names; the others
+    // use MIME. We try all plausible spellings since Avalonia's clipboard
+    // surface varies by platform backend.
+    private static readonly string[] ImageFormats =
+    {
+        "public.png",  "image/png",  "PNG",
+        "public.tiff", "image/tiff",
+        "public.jpeg", "image/jpeg", "JPEG",
+    };
+
+    private async Task PasteFromClipboardAsyncCore()
     {
         try
         {
             var cb = TopLevel.GetTopLevel(this)?.Clipboard;
             if (cb == null) return;
+
+            // Prefer image → temp-file-path pastes (Claude Code workflow).
+            string[] formats;
+            try { formats = await cb.GetFormatsAsync(); }
+            catch { formats = Array.Empty<string>(); }
+
+            foreach (var fmt in ImageFormats)
+            {
+                if (Array.IndexOf(formats, fmt) < 0) continue;
+                var data = await cb.GetDataAsync(fmt) as byte[];
+                if (data is { Length: > 0 })
+                {
+                    var path = WriteClipboardImageToTemp(data, fmt);
+                    if (path != null) { Paste(path); return; }
+                }
+            }
+
             var t = await cb.GetTextAsync();
             if (!string.IsNullOrEmpty(t)) Paste(t);
         }
         catch { }
+    }
+
+    /// <summary>Write clipboard image bytes to a temp file and return
+    /// its path. Extension is derived from the clipboard format so
+    /// consumers (Claude Code) can identify the format correctly.</summary>
+    private static string? WriteClipboardImageToTemp(byte[] data, string format)
+    {
+        try
+        {
+            string ext = format switch
+            {
+                "public.png"  or "image/png"  or "PNG"  => ".png",
+                "public.tiff" or "image/tiff"           => ".tiff",
+                "public.jpeg" or "image/jpeg" or "JPEG" => ".jpg",
+                _                                       => ".bin",
+            };
+            var dir = Path.Combine(Path.GetTempPath(), "vibecoder-paste");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"paste-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}{ext}");
+            File.WriteAllBytes(path, data);
+            return path;
+        }
+        catch { return null; }
     }
 
     // ---- Focus ----

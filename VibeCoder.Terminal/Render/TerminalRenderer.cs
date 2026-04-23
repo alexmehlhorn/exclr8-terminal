@@ -80,14 +80,16 @@ public sealed class TerminalRenderer
         var defBg = theme?.Background ?? TerminalPalette.DefaultBackground;
         ctx.FillRectangle(new SolidColorBrush(defBg), new Rect(size));
 
-        // Smooth scroll: when PixelScrollOffset > 0 we're mid-line
-        // between two buffer rows. Shift everything up by that many
-        // pixels and render one extra row above (bleeds off the top)
-        // + one extra below (fills the bottom gap). The control's
-        // ClipToBounds hides anything drawn outside the visible area.
+        // Smooth scroll: when PixelScrollOffset > 0 we're partway
+        // between two rows. The whole display shifts DOWN by that
+        // many pixels so an older row can bleed in at the top.
+        // We render visualRow -1 (one older row, partially above
+        // the viewport at the top edge) through visualRow Rows-1
+        // (partly clipped at the bottom by P pixels). ClipToBounds
+        // on the control hides the overflow.
         double dy = buf.PixelScrollOffset;
         int startRow = dy > 0 ? -1 : 0;
-        int endRow   = dy > 0 ? buf.Rows : buf.Rows - 1;
+        int endRow   = buf.Rows - 1;
         for (int r = startRow; r <= endRow; r++)
         {
             var row = buf.GetRowForRender(r);
@@ -143,7 +145,7 @@ public sealed class TerminalRenderer
     private void DrawRow(DrawingContext ctx, TerminalBuffer buf,
         TerminalCell[] row, int r, double pixelShift, Color defBg, TerminalTheme? theme)
     {
-        double y = r * CellHeight - pixelShift;
+        double y = r * CellHeight + pixelShift;
         int c = 0;
         while (c < row.Length)
         {
@@ -253,7 +255,7 @@ public sealed class TerminalRenderer
             int cs = r == r1 ? c1 : 0;
             int ce = r == r2 ? c2 : buf.Cols - 1;
             ctx.FillRectangle(brush,
-                new Rect(cs * CellWidth, r * CellHeight - pixelShift,
+                new Rect(cs * CellWidth, r * CellHeight + pixelShift,
                          (ce - cs + 1) * CellWidth, CellHeight));
         }
     }
@@ -266,7 +268,7 @@ public sealed class TerminalRenderer
         if (!buf.CursorVisible || buf.ScrollOffset > 0 || pixelShift > 0) return;
 
         double x = buf.CursorCol * CellWidth;
-        double y = buf.CursorRow * CellHeight - pixelShift;
+        double y = buf.CursorRow * CellHeight + pixelShift;
         var color = theme?.Cursor ?? TerminalPalette.DefaultCursor;
         var brush = new SolidColorBrush(color);
 

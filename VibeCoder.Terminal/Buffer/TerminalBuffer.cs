@@ -123,8 +123,9 @@ public sealed class TerminalBuffer : IParserActions
     /// </summary>
     public TerminalCell[]? GetRowForRender(int visualRow)
     {
-        if (ScrollOffset == 0) return _active.GetRow(visualRow);
-
+        // Generalized mapping works for all offsets, including a
+        // negative visualRow produced by smooth-scroll (we draw one
+        // row above visual 0 when PixelScrollOffset > 0).
         int sbCount     = _active.Scrollback.Count;
         int startInSb   = sbCount - ScrollOffset;
         int absoluteRow = startInSb + visualRow;
@@ -140,7 +141,7 @@ public sealed class TerminalBuffer : IParserActions
             return null;
         }
         int screenRow = absoluteRow - sbCount;
-        return screenRow < Rows ? _active.GetRow(screenRow) : null;
+        return screenRow >= 0 && screenRow < Rows ? _active.GetRow(screenRow) : null;
     }
 
     public void Resize(int cols, int rows)
@@ -214,6 +215,17 @@ public sealed class TerminalBuffer : IParserActions
         }
     }
 
+    /// <summary>Discard the scrollback buffer entirely (Cmd+K on macOS,
+    /// Ctrl+L / `clear` alternative). Snaps the view to the live
+    /// screen.</summary>
+    public void ClearScrollback()
+    {
+        _active.ClearScrollback();
+        ScrollOffset = 0;
+        PixelScrollOffset = 0;
+        Bump();
+    }
+
     // ---- Selection ----
 
     public void StartSelection(int row, int col)
@@ -248,6 +260,15 @@ public sealed class TerminalBuffer : IParserActions
     public void SelectLine(int row)
     {
         Selection = new TerminalSelection(row, 0, row, Cols - 1, SelectionMode.Line);
+        Bump();
+    }
+
+    /// <summary>Select every visible row in the current viewport. If
+    /// the user is viewing scrollback, this selects that region; at
+    /// the live prompt it selects the visible screen.</summary>
+    public void SelectAll()
+    {
+        Selection = new TerminalSelection(0, 0, Rows - 1, Cols - 1, SelectionMode.Line);
         Bump();
     }
 
@@ -735,5 +756,14 @@ public sealed class TerminalBuffer : IParserActions
 
     private static int Max1(int n)                    => n > 0 ? n : 1;
     private static int Clamp(int v, int lo, int hi)   => v < lo ? lo : v > hi ? hi : v;
-    private void Bump() { unchecked { Revision++; } }
+    /// <summary>Fires after any state change that should trigger a
+    /// repaint. Hosts (e.g. TerminalControl) subscribe once rather than
+    /// guarding every mutation site with an InvalidateVisual.</summary>
+    public event EventHandler? Changed;
+
+    private void Bump()
+    {
+        unchecked { Revision++; }
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
 }
