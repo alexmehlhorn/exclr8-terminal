@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Exclr8.Terminal/Exclr8.Terminal.csproj" />
+  <Project Path="Exclr8.Terminal.Tests/Exclr8.Terminal.Tests.csproj" />
+</Solution>
