@@ -180,7 +180,21 @@ public sealed class ScreenBuffer
     private void PushScrollback(TerminalCell[] row)
     {
         if (ScrollbackLimit <= 0) return;
+        // Skip fully-blank rows: on initial layout the buffer starts at
+        // its default 24 rows and then shrinks to whatever the cell
+        // height accommodates. The top rows evicted by that shrink are
+        // always empty (no output yet) and shouldn't count as
+        // scrollback the user can navigate into — it'd give them a
+        // phantom screen of nothing above the first prompt.
+        if (IsBlankRow(row)) return;
         Scrollback.AddLast(row);
         while (Scrollback.Count > ScrollbackLimit) Scrollback.RemoveFirst();
+    }
+
+    private static bool IsBlankRow(TerminalCell[] row)
+    {
+        for (int i = 0; i < row.Length; i++)
+            if (row[i].Rune != 0) return false;
+        return true;
     }
 }
