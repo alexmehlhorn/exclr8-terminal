@@ -63,12 +63,17 @@ public static class KeyMapper
             case Key.F12:      return Esc("[24~");
             case Key.Enter:    return new byte[] { 0x0D };
             case Key.Tab:      return shift ? Esc("[Z") : new byte[] { 0x09 };
-            // Backspace: Unix shells expect DEL (0x7F — stty erase);
-            // Windows cmd.exe / PowerShell ConPTY expect BS (0x08) and
-            // render DEL as a literal glyph when they see it (the
-            // symptom: each press echoes a box-char, pushes the cursor
-            // past the right margin, and scrolls the prompt off-screen).
-            case Key.Back:     return new byte[] { OperatingSystem.IsWindows() ? (byte)0x08 : (byte)0x7F };
+            // Backspace: DEL (0x7F) on every platform. Windows
+            // Terminal, iTerm2, gnome-terminal, xterm all agree.
+            // ConPTY on Windows translates 0x7F to VK_BACK without
+            // modifiers; sending 0x08 (BS) would be interpreted as
+            // Ctrl+H instead, which PSReadline maps to
+            // BackwardKillWord — i.e. "Backspace deletes whole
+            // words". Matches the one earlier symptom of a glyph
+            // being printed in `cmd.exe`: that was the raw byte
+            // being echoed by a program that wasn't doing line
+            // editing, not a real Backspace-doesn't-work bug.
+            case Key.Back:     return new byte[] { 0x7F };
             case Key.Escape:   return new byte[] { 0x1B };
             case Key.Space:    return new byte[] { 0x20 };
         }
