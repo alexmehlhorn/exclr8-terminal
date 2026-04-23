@@ -75,6 +75,19 @@ public sealed class TerminalBuffer : IParserActions
 
     public TerminalSelection? Selection { get; private set; }
 
+    // ---- Find / search state ----
+    // Matches are stored in ABSOLUTE row coordinates: row 0 is the
+    // oldest scrollback row, row (ScrollbackCount + Rows - 1) is the
+    // bottom visible row. Rendering and navigation map these into
+    // whatever visual rows the current ScrollOffset is showing — stable
+    // even as the user scrolls.
+    public readonly record struct SearchMatch(int Row, int Col, int Length);
+
+    public string? SearchNeedle { get; private set; }
+    private readonly List<SearchMatch> _matches = new();
+    public IReadOnlyList<SearchMatch> SearchMatches => _matches;
+    public int CurrentMatchIndex { get; private set; } = -1;
+
     // OSC 8 hyperlinks.
     private readonly Dictionary<ushort, string> _hyperlinks = new();
     private ushort _nextHyperlinkId = 1;
@@ -270,6 +283,135 @@ public sealed class TerminalBuffer : IParserActions
     {
         Selection = new TerminalSelection(0, 0, Rows - 1, Cols - 1, SelectionMode.Line);
         Bump();
+    }
+
+    // ---- Find / search ----
+
+    /// <summary>
+    /// Populate <see cref="SearchMatches"/> with every case-insensitive
+    /// occurrence of <paramref name="needle"/> across scrollback + live
+    /// screen. Empty needle clears the match list.
+    /// <see cref="CurrentMatchIndex"/> is set to the match closest to
+    /// the current viewport so <see cref="NextMatch"/> feels natural.
+    /// </summary>
+    public void Search(string? needle)
+    {
+        SearchNeedle = string.IsNullOrEmpty(needle) ? null : needle;
+        _matches.Clear();
+        CurrentMatchIndex = -1;
+
+        if (SearchNeedle == null) { Bump(); return; }
+
+        int sbCount = _active.Scrollback.Count;
+        int totalRows = sbCount + Rows;
+        for (int absRow = 0; absRow < totalRows; absRow++)
+        {
+            TerminalCell[]? row = AbsoluteRow(absRow, sbCount);
+            if (row == null) continue;
+            FindInRow(row, absRow, SearchNeedle, _matches);
+        }
+
+        if (_matches.Count > 0)
+        {
+            // Pick the match nearest the current viewport bottom so
+            // "next" moves forward from where the user is looking.
+            int viewBottom = sbCount + Rows - 1 - ScrollOffset;
+            CurrentMatchIndex = NearestMatchIndex(viewBottom);
+            ScrollCurrentMatchIntoView();
+        }
+        Bump();
+    }
+
+    /// <summary>Advance to the next match, wrapping at the end.</summary>
+    public void NextMatch()
+    {
+        if (_matches.Count == 0) return;
+        CurrentMatchIndex = (CurrentMatchIndex + 1) % _matches.Count;
+        ScrollCurrentMatchIntoView();
+        Bump();
+    }
+
+    /// <summary>Go to the previous match, wrapping at the start.</summary>
+    public void PrevMatch()
+    {
+        if (_matches.Count == 0) return;
+        CurrentMatchIndex = (CurrentMatchIndex - 1 + _matches.Count) % _matches.Count;
+        ScrollCurrentMatchIntoView();
+        Bump();
+    }
+
+    /// <summary>Drop the search state and hide match highlights.</summary>
+    public void ClearSearch()
+    {
+        if (SearchNeedle == null && _matches.Count == 0) return;
+        SearchNeedle = null;
+        _matches.Clear();
+        CurrentMatchIndex = -1;
+        Bump();
+    }
+
+    private TerminalCell[]? AbsoluteRow(int absRow, int sbCount)
+    {
+        if (absRow < sbCount)
+        {
+            int i = 0;
+            foreach (var r in _active.Scrollback)
+                if (i++ == absRow) return r;
+            return null;
+        }
+        int screen = absRow - sbCount;
+        return screen >= 0 && screen < Rows ? _active.GetRow(screen) : null;
+    }
+
+    private static void FindInRow(TerminalCell[] row, int absRow,
+        string needle, List<SearchMatch> into)
+    {
+        // Decode cells to a string so multi-cell wide glyphs and runs
+        // of blanks search naturally. Column indices map 1:1 with cell
+        // slots including wide-cell continuations.
+        var sb = new StringBuilder(row.Length);
+        for (int i = 0; i < row.Length; i++)
+        {
+            int rune = row[i].Rune;
+            sb.Append(rune == 0 ? ' ' : (char)Math.Min(rune, 0xFFFF));
+        }
+        var haystack = sb.ToString();
+        int from = 0;
+        while (from <= haystack.Length - needle.Length)
+        {
+            int idx = haystack.IndexOf(needle, from, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) break;
+            into.Add(new SearchMatch(absRow, idx, needle.Length));
+            from = idx + Math.Max(1, needle.Length);
+        }
+    }
+
+    private int NearestMatchIndex(int absRowNear)
+    {
+        int best = 0, bestDist = int.MaxValue;
+        for (int i = 0; i < _matches.Count; i++)
+        {
+            int d = Math.Abs(_matches[i].Row - absRowNear);
+            if (d < bestDist) { bestDist = d; best = i; }
+        }
+        return best;
+    }
+
+    private void ScrollCurrentMatchIntoView()
+    {
+        if (CurrentMatchIndex < 0 || CurrentMatchIndex >= _matches.Count) return;
+        int sbCount = _active.Scrollback.Count;
+        int absRow  = _matches[CurrentMatchIndex].Row;
+
+        // Desired scroll offset: want the match at absRow to be
+        // visible. Viewport shows absolute rows
+        //   [sbCount + Rows - 1 - ScrollOffset - Rows + 1,
+        //    sbCount + Rows - 1 - ScrollOffset]
+        // → keep absRow somewhere in the middle. Aim for middle of view.
+        int bottomAbs = sbCount + Rows - 1;
+        int desired   = bottomAbs - absRow - Rows / 2;
+        desired = Math.Clamp(desired, 0, sbCount);
+        SetScrollOffset(desired);
     }
 
     private static bool IsWordChar(TerminalCell c) =>

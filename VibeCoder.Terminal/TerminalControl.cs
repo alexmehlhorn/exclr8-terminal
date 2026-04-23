@@ -6,6 +6,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Media;
+using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using VibeCoder.Terminal.Buffer;
 using VibeCoder.Terminal.Input;
@@ -62,8 +63,10 @@ public class TerminalControl : Control
 
     public TerminalBuffer Buffer => _buffer;
 
-    /// <summary>Optional color overrides. Null = defaults.</summary>
-    public TerminalTheme? Theme
+    /// <summary>Optional color overrides. Null = defaults. `new`
+    /// deliberately hides <see cref="StyledElement.Theme"/> — we want a
+    /// strongly-typed palette here, not the Avalonia ControlTheme.</summary>
+    public new TerminalTheme? Theme
     {
         get => _theme;
         set { _theme = value; InvalidateVisual(); }
@@ -153,6 +156,27 @@ public class TerminalControl : Control
         InvalidateVisual();
     }
 
+    // ---- Font zoom ----
+
+    /// <summary>Step the terminal font size by whole points. Positive
+    /// direction enlarges (Cmd+=), negative shrinks (Cmd+-). Reflows
+    /// the grid so the cell count matches the new cell metrics.</summary>
+    public void AdjustFontSize(int direction)
+    {
+        _renderer.FontSize += direction;
+        RecomputeGrid();
+        InvalidateVisual();
+    }
+
+    /// <summary>Reset to the font size captured at construction
+    /// (Cmd+0).</summary>
+    public void ResetFontSize()
+    {
+        _renderer.FontSize = _renderer.DefaultFontSize;
+        RecomputeGrid();
+        InvalidateVisual();
+    }
+
     // ---- Keyboard ----
 
     protected override void OnKeyDown(KeyEventArgs e)
@@ -180,6 +204,23 @@ public class TerminalControl : Control
                 case Key.C: _ = CopySelectionAsync();      e.Handled = true; return;
                 case Key.A: _buffer.SelectAll();           e.Handled = true; return;
                 case Key.K: _buffer.ClearScrollback();     e.Handled = true; return;
+                case Key.F:
+                    FindRequested?.Invoke(this, EventArgs.Empty);
+                    e.Handled = true;
+                    return;
+
+                // Font zoom — +/= increase, -/_ decrease, 0 reset.
+                // Key.OemPlus is the `=` key (Shift+= is `+`), so we
+                // accept both the plain and shifted variants.
+                case Key.OemPlus:
+                case Key.Add:
+                    AdjustFontSize(+1);              e.Handled = true; return;
+                case Key.OemMinus:
+                case Key.Subtract:
+                    AdjustFontSize(-1);              e.Handled = true; return;
+                case Key.D0:
+                case Key.NumPad0:
+                    ResetFontSize();                 e.Handled = true; return;
             }
         }
 
@@ -413,21 +454,53 @@ public class TerminalControl : Control
     /// <summary>Public façade: select the current viewport.</summary>
     public void SelectAll() => _buffer.SelectAll();
 
+    // ---- Find ----
+
+    /// <summary>Raised when the user hits Cmd+F (Ctrl+Shift+F) so the
+    /// host can show a find bar. The host drives search/navigation via
+    /// <see cref="Find"/>, <see cref="FindNext"/>, <see cref="FindPrev"/>,
+    /// and <see cref="CloseFind"/>.</summary>
+    public event EventHandler? FindRequested;
+
+    /// <summary>Update the search needle and rebuild the match list.
+    /// Pass null or empty to clear.</summary>
+    public void Find(string? needle) => _buffer.Search(needle);
+
+    /// <summary>Jump to the next search match.</summary>
+    public void FindNext() => _buffer.NextMatch();
+
+    /// <summary>Jump to the previous search match.</summary>
+    public void FindPrev() => _buffer.PrevMatch();
+
+    /// <summary>Leave find mode — drops matches and hides highlights.</summary>
+    public void CloseFind() => _buffer.ClearSearch();
+
+    /// <summary>Number of matches for the current needle. Useful for a
+    /// host-rendered "N of M" counter in the find bar.</summary>
+    public int MatchCount => _buffer.SearchMatches.Count;
+
+    /// <summary>1-based index of the current match, or 0 if none.</summary>
+    public int CurrentMatch => _buffer.CurrentMatchIndex + 1;
+
     private async Task CopySelectionAsyncCore()
     {
         var t = _buffer.GetSelectedText();
         if (!string.IsNullOrEmpty(t)) await CopyToClipboardAsync(t);
     }
 
-    private async Task CopyToClipboardAsync(string text)
+    private Task CopyToClipboardAsync(string text)
     {
-        try { await (TopLevel.GetTopLevel(this)?.Clipboard?.SetTextAsync(text) ?? Task.CompletedTask); }
-        catch { }
+        var cb = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (cb == null) return Task.CompletedTask;
+        var transfer = new DataTransfer();
+        transfer.Add(DataTransferItem.Create(DataFormat.Text, text));
+        return cb.SetDataAsync(transfer);
     }
 
-    // Clipboard format names. macOS exposes UTI-style names; the others
-    // use MIME. We try all plausible spellings since Avalonia's clipboard
-    // surface varies by platform backend.
+    // macOS UTI / MIME identifiers for image bytes on the pasteboard.
+    // TryGetFileAsync already covers Finder copies (they become
+    // DataFormat.File items), so this list is only for "screenshot to
+    // clipboard" style captures that arrive as raw bytes.
     private static readonly string[] ImageFormats =
     {
         "public.png",  "image/png",  "PNG",
@@ -437,54 +510,57 @@ public class TerminalControl : Control
 
     private async Task PasteFromClipboardAsyncCore()
     {
-        try
+        var cb = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (cb == null) return;
+
+        using var transfer = await cb.TryGetDataAsync();
+        if (transfer == null) return;
+
+        // 1. File reference (Finder copy, drag source). Avalonia
+        // normalises cross-platform file formats into DataFormat.File.
+        var file = await transfer.TryGetFileAsync();
+        if (file != null)
         {
-            var cb = TopLevel.GetTopLevel(this)?.Clipboard;
-            if (cb == null) return;
-
-            // Prefer image → temp-file-path pastes (Claude Code workflow).
-            string[] formats;
-            try { formats = await cb.GetFormatsAsync(); }
-            catch { formats = Array.Empty<string>(); }
-
-            foreach (var fmt in ImageFormats)
-            {
-                if (Array.IndexOf(formats, fmt) < 0) continue;
-                var data = await cb.GetDataAsync(fmt) as byte[];
-                if (data is { Length: > 0 })
-                {
-                    var path = WriteClipboardImageToTemp(data, fmt);
-                    if (path != null) { Paste(path); return; }
-                }
-            }
-
-            var t = await cb.GetTextAsync();
-            if (!string.IsNullOrEmpty(t)) Paste(t);
+            var path = file.TryGetLocalPath();
+            if (!string.IsNullOrEmpty(path)) { Paste(path); return; }
         }
-        catch { }
+
+        // 2. Image bytes (screenshot-to-clipboard). Spill to a temp
+        // file and paste the path — matches the Claude Code workflow.
+        foreach (var ident in ImageFormats)
+        {
+            var fmt  = DataFormat.CreateBytesPlatformFormat(ident);
+            var data = await transfer.TryGetValueAsync(fmt);
+            if (data is { Length: > 0 })
+            {
+                var path = WriteClipboardImageToTemp(data, ident);
+                Paste(path);
+                return;
+            }
+        }
+
+        // 3. Plain text — the common case.
+        var t = await transfer.TryGetTextAsync();
+        if (!string.IsNullOrEmpty(t)) Paste(t);
     }
 
     /// <summary>Write clipboard image bytes to a temp file and return
     /// its path. Extension is derived from the clipboard format so
     /// consumers (Claude Code) can identify the format correctly.</summary>
-    private static string? WriteClipboardImageToTemp(byte[] data, string format)
+    private static string WriteClipboardImageToTemp(byte[] data, string format)
     {
-        try
+        string ext = format switch
         {
-            string ext = format switch
-            {
-                "public.png"  or "image/png"  or "PNG"  => ".png",
-                "public.tiff" or "image/tiff"           => ".tiff",
-                "public.jpeg" or "image/jpeg" or "JPEG" => ".jpg",
-                _                                       => ".bin",
-            };
-            var dir = Path.Combine(Path.GetTempPath(), "vibecoder-paste");
-            Directory.CreateDirectory(dir);
-            var path = Path.Combine(dir, $"paste-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}{ext}");
-            File.WriteAllBytes(path, data);
-            return path;
-        }
-        catch { return null; }
+            "public.png"  or "image/png"  or "PNG"  => ".png",
+            "public.tiff" or "image/tiff"           => ".tiff",
+            "public.jpeg" or "image/jpeg" or "JPEG" => ".jpg",
+            _                                       => ".bin",
+        };
+        var dir = Path.Combine(Path.GetTempPath(), "vibecoder-paste");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, $"paste-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}{ext}");
+        File.WriteAllBytes(path, data);
+        return path;
     }
 
     // ---- Focus ----

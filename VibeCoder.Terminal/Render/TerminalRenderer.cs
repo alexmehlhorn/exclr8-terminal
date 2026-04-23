@@ -17,10 +17,29 @@ namespace VibeCoder.Terminal.Render;
 public sealed class TerminalRenderer
 {
     private readonly Typeface _typeface;
-    private readonly double   _fontSize;
+    private double   _fontSize;
 
     public double CellWidth  { get; private set; }
     public double CellHeight { get; private set; }
+
+    /// <summary>Current font size (pt). Mutable so Cmd+= / Cmd+- /
+    /// Cmd+0 can zoom without tearing down the renderer. Changing it
+    /// re-measures the cell; callers should trigger a grid reflow.</summary>
+    public double FontSize
+    {
+        get => _fontSize;
+        set
+        {
+            var v = Math.Clamp(value, 6.0, 72.0);
+            if (Math.Abs(v - _fontSize) < 0.01) return;
+            _fontSize = v;
+            MeasureCell();
+        }
+    }
+
+    /// <summary>Default font size captured at construction — used by
+    /// Cmd+0 to reset zoom.</summary>
+    public double DefaultFontSize { get; }
 
     /// <summary>Width of the scrollbar strip on the right edge. Used by
     /// the hit-tester in <see cref="TerminalControl"/> so pointer
@@ -54,8 +73,9 @@ public sealed class TerminalRenderer
         string fontFamily = "JetBrainsMono, Menlo, monospace",
         double fontSize   = 13)
     {
-        _typeface = new Typeface(fontFamily);
-        _fontSize = fontSize;
+        _typeface       = new Typeface(fontFamily);
+        _fontSize       = fontSize;
+        DefaultFontSize = fontSize;
         MeasureCell();
     }
 
@@ -96,10 +116,42 @@ public sealed class TerminalRenderer
             if (row != null) DrawRow(ctx, buf, row, r, dy, defBg, theme);
         }
 
-        if (buf.Selection != null) DrawSelection(ctx, buf, dy);
+        if (buf.SearchMatches.Count > 0) DrawSearchMatches(ctx, buf, dy);
+        if (buf.Selection != null)       DrawSelection(ctx, buf, dy);
 
         DrawCursor(ctx, buf, dy, focused, theme);
         DrawScrollbar(ctx, buf, size);
+    }
+
+    /// <summary>
+    /// Paint a highlight behind every search match that falls inside
+    /// the visible viewport. The "current" match uses a brighter,
+    /// saturated fill so it's obvious which one Enter will navigate
+    /// from — every other match gets a softer wash.
+    /// </summary>
+    private void DrawSearchMatches(DrawingContext ctx, TerminalBuffer buf, double pixelShift)
+    {
+        var softBrush = new SolidColorBrush(Color.FromArgb(0x66, 0xE5, 0xC0, 0x7B));
+        var liveBrush = new SolidColorBrush(Color.FromArgb(0xCC, 0xFF, 0xAA, 0x00));
+
+        int sbCount     = buf.ScrollbackCount;
+        int viewTopAbs  = sbCount - buf.ScrollOffset;     // visual row 0 maps to this absolute row
+        int viewBotAbs  = viewTopAbs + buf.Rows - 1;
+        int fromAbs     = viewTopAbs - 1;                 // -1 for sub-line scroll bleed
+        int toAbs       = viewBotAbs;
+
+        for (int i = 0; i < buf.SearchMatches.Count; i++)
+        {
+            var m = buf.SearchMatches[i];
+            if (m.Row < fromAbs || m.Row > toAbs) continue;
+            int visualRow = m.Row - viewTopAbs;
+            var brush = i == buf.CurrentMatchIndex ? liveBrush : softBrush;
+            ctx.FillRectangle(brush,
+                new Rect(m.Col * CellWidth,
+                         visualRow * CellHeight + pixelShift,
+                         m.Length * CellWidth,
+                         CellHeight));
+        }
     }
 
     /// <summary>
