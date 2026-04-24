@@ -2,20 +2,31 @@
 
   <!-- Native Avalonia terminal renderer. Intentionally separate from
        VibeCoder.App so it can be extracted/distributed. Depends only on
-       Avalonia and Skia — no PTY, no process management, no app-shell
-       concerns. Consumers feed it bytes via Write() and handle Input +
-       Resized events to wire it to a PTY. -->
+       Avalonia, Skia, and OS-level process-watch primitives (WMI on
+       Windows, kqueue on macOS) — no PTY, no app-shell concerns.
+       Consumers feed it bytes via Write() and handle Input + Resized
+       events to wire it to a PTY. -->
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <!-- KQueueChildWatcher needs P/Invoke + unsafe pointer blocks
+         for the kevent / proc_name interop. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="11.3.12" />
     <PackageReference Include="Avalonia.Skia" Version="11.3.12" />
+    <!-- WMI for the WmiChildWatcher on Windows. System.Management
+         ships cross-platform but the WMI runtime only exists on
+         Windows — the Windows code path is guarded via
+         [SupportedOSPlatform("windows")] so non-Windows builds link
+         cleanly and the factory picks the kqueue / no-op backend
+         instead. -->
+    <PackageReference Include="System.Management" Version="9.0.0" />
   </ItemGroup>
 
 </Project>

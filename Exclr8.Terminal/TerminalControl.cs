@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading.Tasks;
@@ -10,6 +11,7 @@ using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Exclr8.Terminal.Buffer;
 using Exclr8.Terminal.Input;
+using Exclr8.Terminal.ProcessWatch;
 using Exclr8.Terminal.Render;
 
 namespace Exclr8.Terminal;
@@ -93,6 +95,177 @@ public class TerminalControl : Control
     {
         Input?.Invoke(this, payload);
         InputEvents.Feed(payload, origin);
+    }
+
+    // ------------------------------------------------------------------
+    // Process-tree watching.
+    //
+    // Exposes OS-level "something new spawned under the shell" events
+    // (Windows WMI, macOS kqueue, no-op elsewhere) so consumers don't
+    // have to poll the process table or know which platform they're
+    // on. Lazily activated: the underlying watcher is only constructed
+    // when the first subscriber attaches AND a root pid is set, and
+    // disposed when the last subscriber detaches. Sets with no
+    // subscribers pay nothing.
+    //
+    // Consumers typically set RootProcessId to the shell pid at spawn,
+    // subscribe to ProcessTreeChanged, and interpret the stream
+    // themselves (running-process badge, session state, etc.). The
+    // control chain-watches each new child automatically so grandchild
+    // forks (make → gcc, shell-in-shell) surface without any effort
+    // from the subscriber.
+    // ------------------------------------------------------------------
+
+    private readonly object _processWatchLock = new();
+    private readonly HashSet<int> _watchedPids = new();
+    private IProcessChildWatcher? _processWatcher;
+    private int _processTreeSubscribers;
+    private int _rootProcessId;
+    private Action<ProcessTreeChange>? _processTreeChangedInner;
+
+    /// <summary>The shell / session root pid the terminal's watcher
+    /// should hang off. VibeCoder sets this to the PTY's pid on spawn
+    /// and back to 0 on teardown. Changing it while subscribers are
+    /// attached re-targets the watcher live.</summary>
+    public int RootProcessId
+    {
+        get => _rootProcessId;
+        set
+        {
+            lock (_processWatchLock)
+            {
+                if (_rootProcessId == value) return;
+                // Drop everything from the previous root — grandchildren
+                // were chain-watched through it and are no longer
+                // meaningful.
+                if (_processWatcher != null) UnwatchAll_Locked();
+                _rootProcessId = value;
+                if (_processWatcher != null && _rootProcessId > 0)
+                    WatchLocked(_rootProcessId);
+            }
+        }
+    }
+
+    /// <summary>Something new has appeared (<see cref="ProcessTreeChangeKind.Created"/>)
+    /// or disappeared (<see cref="ProcessTreeChangeKind.Exited"/>) in
+    /// the process subtree rooted at <see cref="RootProcessId"/>.
+    /// Attaching the first handler starts the OS-level watcher;
+    /// detaching the last handler stops it.</summary>
+    public event Action<ProcessTreeChange>? ProcessTreeChanged
+    {
+        add
+        {
+            if (value == null) return;
+            lock (_processWatchLock)
+            {
+                _processTreeChangedInner += value;
+                _processTreeSubscribers++;
+                EnsureWatcherStarted_Locked();
+            }
+        }
+        remove
+        {
+            if (value == null) return;
+            lock (_processWatchLock)
+            {
+                _processTreeChangedInner -= value;
+                _processTreeSubscribers--;
+                if (_processTreeSubscribers <= 0) StopWatcher_Locked();
+            }
+        }
+    }
+
+    private void EnsureWatcherStarted_Locked()
+    {
+        if (_processWatcher != null) return;
+        if (_processTreeSubscribers <= 0) return;
+        try
+        {
+            var w = ProcessChildWatcherFactory.Create();
+            w.ChildCreated  += OnWatcherChildCreated;
+            w.ProcessExited += OnWatcherProcessExited;
+            _processWatcher = w;
+            if (_rootProcessId > 0) WatchLocked(_rootProcessId);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[TerminalControl] process-watcher start failed: {ex.Message}");
+        }
+    }
+
+    private void StopWatcher_Locked()
+    {
+        var w = _processWatcher;
+        _processWatcher = null;
+        _watchedPids.Clear();
+        _processTreeSubscribers = 0;
+        if (w == null) return;
+        w.ChildCreated  -= OnWatcherChildCreated;
+        w.ProcessExited -= OnWatcherProcessExited;
+        try { w.Dispose(); } catch { }
+    }
+
+    private void WatchLocked(int pid)
+    {
+        if (pid <= 0) return;
+        if (!_watchedPids.Add(pid)) return;
+        try { _processWatcher?.Watch(pid); } catch (Exception ex)
+        { Console.Error.WriteLine($"[TerminalControl] Watch({pid}) failed: {ex.Message}"); }
+    }
+
+    private void UnwatchAll_Locked()
+    {
+        var w = _processWatcher;
+        if (w != null)
+        {
+            foreach (var p in _watchedPids)
+            { try { w.Unwatch(p); } catch { } }
+        }
+        _watchedPids.Clear();
+    }
+
+    private void OnWatcherChildCreated(ProcessChildEvent e)
+    {
+        // Chain-watch so the next generation of forks surfaces too.
+        // Do this synchronously before dispatching so a grandchild
+        // spawned back-to-back with its parent isn't missed.
+        lock (_processWatchLock) WatchLocked(e.ChildPid);
+
+        var handler = _processTreeChangedInner;
+        if (handler == null) return;
+        try
+        {
+            handler.Invoke(new ProcessTreeChange(
+                Kind:        ProcessTreeChangeKind.Created,
+                Pid:         e.ChildPid,
+                ParentPid:   e.ParentPid,
+                Name:        e.Name,
+                CommandLine: e.CommandLine));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[TerminalControl] ProcessTreeChanged dispatch: {ex.Message}");
+        }
+    }
+
+    private void OnWatcherProcessExited(int pid)
+    {
+        lock (_processWatchLock) _watchedPids.Remove(pid);
+        var handler = _processTreeChangedInner;
+        if (handler == null) return;
+        try
+        {
+            handler.Invoke(new ProcessTreeChange(
+                Kind:        ProcessTreeChangeKind.Exited,
+                Pid:         pid,
+                ParentPid:   0,
+                Name:        null,
+                CommandLine: null));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[TerminalControl] ProcessTreeChanged exit dispatch: {ex.Message}");
+        }
     }
 
     /// <summary>Optional color overrides. Null = defaults. `new`
