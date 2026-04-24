@@ -16,7 +16,7 @@ dotnet build Exclr8.Terminal.slnx -c Debug
 dotnet test Exclr8.Terminal.Tests/Exclr8.Terminal.Tests.csproj
 ```
 
-Targets .NET 9+ / Avalonia 11.3.
+Targets .NET 10 / Avalonia 11.3.
 
 ## License
 

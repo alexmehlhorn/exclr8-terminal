@@ -22,13 +22,4 @@ public record TerminalSelection(
             return (StartRow, StartCol, EndRow, EndCol);
         return (EndRow, EndCol, StartRow, StartCol);
     }
-
-    public bool Contains(int row, int col)
-    {
-        var (r1, c1, r2, c2) = Normalized();
-        if (row < r1 || row > r2) return false;
-        if (row == r1 && col < c1) return false;
-        if (row == r2 && col > c2) return false;
-        return true;
-    }
 }

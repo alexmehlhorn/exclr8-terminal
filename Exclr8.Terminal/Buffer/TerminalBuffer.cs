@@ -22,8 +22,10 @@ public sealed class TerminalBuffer : IParserActions
     public bool CursorVisible { get; private set; } = true;
     public CursorStyle CursorStyle { get; private set; } = CursorStyle.BlockBlink;
 
-    /// <summary>SGR pen applied to every <see cref="Print"/>.</summary>
-    public TerminalCell PenTemplate = TerminalCell.Blank;
+    /// <summary>SGR pen applied to every <see cref="Print"/>. Read-only
+    /// from outside; mutated internally by the SGR handlers.</summary>
+    public TerminalCell PenTemplate => _pen;
+    private TerminalCell _pen = TerminalCell.Blank;
 
     private readonly ScreenBuffer _primary;
     private readonly ScreenBuffer _alternate;
@@ -139,7 +141,6 @@ public sealed class TerminalBuffer : IParserActions
     // sequence other than REP itself so REP after e.g. a newline is
     // a no-op, matching xterm.js's <c>precedingJoinState</c>.
     private int _lastPrintRune;
-    private int _lastPrintWidth;
 
     // Custom tab stops. When null, defaults to every 8 cols.
     // HTS (ESC H) adds a stop, TBC (CSI g) clears.
@@ -199,12 +200,6 @@ public sealed class TerminalBuffer : IParserActions
 
     public TerminalCell[] GetVisibleRow(int r) => _active.GetRow(r);
 
-    public IEnumerable<TerminalCell[]> AllRows()
-    {
-        foreach (var r in _active.Scrollback) yield return r;
-        for (int i = 0; i < Rows; i++) yield return _active.GetRow(i);
-    }
-
     public int ScrollbackCount => _active.Scrollback.Count;
 
     /// <summary>
@@ -224,15 +219,7 @@ public sealed class TerminalBuffer : IParserActions
         int absoluteRow = startInSb + visualRow;
 
         if (absoluteRow < 0) return null;
-        if (absoluteRow < sbCount)
-        {
-            int idx = 0;
-            foreach (var row in _active.Scrollback)
-            {
-                if (idx++ == absoluteRow) return row;
-            }
-            return null;
-        }
+        if (absoluteRow < sbCount) return _active.Scrollback[absoluteRow];
         int screenRow = absoluteRow - sbCount;
         return screenRow >= 0 && screenRow < Rows ? _active.GetRow(screenRow) : null;
     }
@@ -331,10 +318,6 @@ public sealed class TerminalBuffer : IParserActions
     public int VisualToAbsRow(int visualRow) =>
         _active.Scrollback.Count - ScrollOffset + visualRow;
 
-    /// <summary>Inverse of <see cref="VisualToAbsRow"/>.</summary>
-    public int AbsToVisualRow(int absRow) =>
-        absRow - (_active.Scrollback.Count - ScrollOffset);
-
     public void StartSelection(int row, int col)
     {
         int abs = VisualToAbsRow(row);
@@ -388,36 +371,75 @@ public sealed class TerminalBuffer : IParserActions
     // ---- Find / search ----
 
     /// <summary>
-    /// Populate <see cref="SearchMatches"/> with every case-insensitive
-    /// occurrence of <paramref name="needle"/> across scrollback + live
-    /// screen. Empty needle clears the match list.
-    /// <see cref="CurrentMatchIndex"/> is set to the match closest to
-    /// the current viewport so <see cref="NextMatch"/> feels natural.
+    /// Synchronous search — scans scrollback + live screen and sets
+    /// <see cref="SearchMatches"/> in one pass. Used by the built-in
+    /// test suite and by simple hosts that don't care about large
+    /// scrollbacks; for responsive find with 1000+ row buffers, host
+    /// code should use <see cref="SnapshotRows"/> + <see cref="ScanMatches"/>
+    /// off-thread and apply the result via <see cref="ApplySearchResults"/>.
     /// </summary>
     public void Search(string? needle)
     {
+        if (string.IsNullOrEmpty(needle))
+        {
+            ClearSearch();
+            return;
+        }
+        var snap = SnapshotRows();
+        var matches = ScanMatches(snap, needle, System.Threading.CancellationToken.None);
+        ApplySearchResults(needle, matches);
+    }
+
+    /// <summary>Capture a snapshot of the row references (scrollback +
+    /// live screen) so an off-thread scan can walk them without
+    /// racing further PTY writes. The cell arrays themselves are
+    /// shared — mutations to live-screen rows during the scan may
+    /// show up as stale matches, which is fine: the next keystroke
+    /// triggers a fresh search.</summary>
+    public TerminalCell[][] SnapshotRows()
+    {
+        int sb = _active.Scrollback.Count;
+        var snap = new TerminalCell[sb + Rows][];
+        for (int i = 0; i < sb;   i++) snap[i] = _active.Scrollback[i];
+        for (int i = 0; i < Rows; i++) snap[sb + i] = _active.GetRow(i);
+        return snap;
+    }
+
+    /// <summary>Walk a snapshot producing every case-insensitive match
+    /// of <paramref name="needle"/>. Safe to run off-thread against
+    /// a <see cref="SnapshotRows"/> result. Checks
+    /// <paramref name="ct"/> between rows so a superseded search
+    /// returns quickly.</summary>
+    public static List<SearchMatch> ScanMatches(
+        TerminalCell[][] rows, string needle, System.Threading.CancellationToken ct)
+    {
+        var matches = new List<SearchMatch>();
+        for (int r = 0; r < rows.Length; r++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var row = rows[r];
+            if (row != null) FindInRow(row, r, needle, matches);
+        }
+        return matches;
+    }
+
+    /// <summary>Replace the current search results and pick the match
+    /// nearest the viewport bottom so "next" moves forward from where
+    /// the user is looking. Call on the UI thread.</summary>
+    public void ApplySearchResults(string? needle, List<SearchMatch> matches)
+    {
         SearchNeedle = string.IsNullOrEmpty(needle) ? null : needle;
         _matches.Clear();
-        CurrentMatchIndex = -1;
-
-        if (SearchNeedle == null) { Bump(); return; }
-
-        int sbCount = _active.Scrollback.Count;
-        int totalRows = sbCount + Rows;
-        for (int absRow = 0; absRow < totalRows; absRow++)
-        {
-            TerminalCell[]? row = AbsoluteRow(absRow, sbCount);
-            if (row == null) continue;
-            FindInRow(row, absRow, SearchNeedle, _matches);
-        }
-
+        _matches.AddRange(matches);
         if (_matches.Count > 0)
         {
-            // Pick the match nearest the current viewport bottom so
-            // "next" moves forward from where the user is looking.
-            int viewBottom = sbCount + Rows - 1 - ScrollOffset;
+            int viewBottom = _active.Scrollback.Count + Rows - 1 - ScrollOffset;
             CurrentMatchIndex = NearestMatchIndex(viewBottom);
             ScrollCurrentMatchIntoView();
+        }
+        else
+        {
+            CurrentMatchIndex = -1;
         }
         Bump();
     }
@@ -452,13 +474,7 @@ public sealed class TerminalBuffer : IParserActions
 
     private TerminalCell[]? AbsoluteRow(int absRow, int sbCount)
     {
-        if (absRow < sbCount)
-        {
-            int i = 0;
-            foreach (var r in _active.Scrollback)
-                if (i++ == absRow) return r;
-            return null;
-        }
+        if (absRow < sbCount) return _active.Scrollback[absRow];
         int screen = absRow - sbCount;
         return screen >= 0 && screen < Rows ? _active.GetRow(screen) : null;
     }
@@ -467,13 +483,32 @@ public sealed class TerminalBuffer : IParserActions
         string needle, List<SearchMatch> into)
     {
         // Decode cells to a string so multi-cell wide glyphs and runs
-        // of blanks search naturally. Column indices map 1:1 with cell
-        // slots including wide-cell continuations.
+        // of blanks search naturally. Astral-plane runes (most emoji,
+        // CJK Ext B+) encode as a surrogate pair — two chars in the
+        // haystack but one cell — so we keep a parallel column map to
+        // translate match offsets back to cell coordinates.
         var sb = new StringBuilder(row.Length);
+        var colMap = new int[row.Length * 2];
+        int mapLen = 0;
         for (int i = 0; i < row.Length; i++)
         {
             int rune = row[i].Rune;
-            sb.Append(rune == 0 ? ' ' : (char)Math.Min(rune, 0xFFFF));
+            if (rune == 0)
+            {
+                sb.Append(' ');
+                colMap[mapLen++] = i;
+            }
+            else if (rune <= 0xFFFF)
+            {
+                sb.Append((char)rune);
+                colMap[mapLen++] = i;
+            }
+            else
+            {
+                sb.Append(char.ConvertFromUtf32(rune));
+                colMap[mapLen++] = i;
+                colMap[mapLen++] = i;
+            }
         }
         var haystack = sb.ToString();
         int from = 0;
@@ -481,7 +516,9 @@ public sealed class TerminalBuffer : IParserActions
         {
             int idx = haystack.IndexOf(needle, from, StringComparison.OrdinalIgnoreCase);
             if (idx < 0) break;
-            into.Add(new SearchMatch(absRow, idx, needle.Length));
+            int startCell = colMap[idx];
+            int endCell   = colMap[idx + needle.Length - 1];
+            into.Add(new SearchMatch(absRow, startCell, endCell - startCell + 1));
             from = idx + Math.Max(1, needle.Length);
         }
     }
@@ -575,7 +612,7 @@ public sealed class TerminalBuffer : IParserActions
         }
 
         var row  = _active.GetRow(CursorRow);
-        var cell = PenTemplate;
+        var cell = _pen;
         cell.Rune        = rune;
         cell.HyperlinkId = _activeLinkId;
 
@@ -606,7 +643,7 @@ public sealed class TerminalBuffer : IParserActions
         // its continuation at CursorCol+2 is now orphaned — still
         // flagged IsContinuation but with no wide-left partner. Clear
         // it so the renderer doesn't treat it as an unselectable
-        // phantom cell. Tracked as BUGS-FOUND.md #1.
+        // phantom cell.
         if (width == 2
             && CursorCol + 1 < Cols
             && (row[CursorCol + 1].Flags2 & CellFlags2.IsWide) != 0
@@ -619,14 +656,14 @@ public sealed class TerminalBuffer : IParserActions
         // Preserve SGR-driven Flags2 bits (Blink) from the pen, but
         // override the cell-shape flags (IsWide / IsContinuation) we
         // set based on the rune width.
-        var penExtras = PenTemplate.Flags2 & CellFlags2.Blink;
+        var penExtras = _pen.Flags2 & CellFlags2.Blink;
         if (width == 2)
         {
             cell.Flags2 = CellFlags2.IsWide | penExtras;
             row[CursorCol] = cell;
             if (CursorCol + 1 < Cols)
             {
-                var cont = PenTemplate;
+                var cont = _pen;
                 cont.Rune        = 0;
                 cont.Flags2      = CellFlags2.IsContinuation | penExtras;
                 cont.HyperlinkId = _activeLinkId;
@@ -641,8 +678,7 @@ public sealed class TerminalBuffer : IParserActions
             CursorCol++;
         }
 
-        _lastPrintRune  = rune;
-        _lastPrintWidth = width;
+        _lastPrintRune = rune;
     }
 
     /// <summary>Shift cells at and after <paramref name="from"/> right
@@ -676,7 +712,7 @@ public sealed class TerminalBuffer : IParserActions
         }
     }
 
-    public void CsiDispatch(char final, int[] p, string intermediates, char prefix)
+    public void CsiDispatch(char final, ReadOnlySpan<int> p, string intermediates, char prefix)
     {
         int p0 = p.Length > 0 ? p[0] : 0;
         int p1 = p.Length > 1 ? p[1] : 0;
@@ -827,7 +863,7 @@ public sealed class TerminalBuffer : IParserActions
 
     // ---- ANSI mode (CSI h/l without `?`): IRM, LNM ----
 
-    private void SetAnsiMode(int[] p, bool on)
+    private void SetAnsiMode(ReadOnlySpan<int> p, bool on)
     {
         foreach (var m in p)
         {
@@ -907,7 +943,7 @@ public sealed class TerminalBuffer : IParserActions
         ScrollBottom  = Rows - 1;
         InsertMode    = false;
         OriginMode    = false;
-        PenTemplate   = TerminalCell.Blank;
+        _pen   = TerminalCell.Blank;
         _savedRow = _savedCol = 0; _savedPen = TerminalCell.Blank;
         _altSavedRow = _altSavedCol = 0; _altSavedPen = TerminalCell.Blank;
         _gSlots[0] = Charset.Ascii; _gSlots[1] = Charset.Ascii;
@@ -916,7 +952,7 @@ public sealed class TerminalBuffer : IParserActions
 
     // ---- Window manipulation CSI t — safe subset ----
 
-    private void HandleWindowManip(int[] p)
+    private void HandleWindowManip(ReadOnlySpan<int> p)
     {
         // We implement only the reporting operations; anything that
         // would change the host window (resize, raise, iconify) is
@@ -951,28 +987,16 @@ public sealed class TerminalBuffer : IParserActions
     private uint[] EnsurePalette256()
     {
         if (_palette256 != null) return _palette256;
+        // Mirror the renderer's palette so OSC 4 queries report exactly
+        // what's on screen. OSC 4 *set* writes to this local copy; it
+        // does not currently propagate into the renderer's static
+        // palette (a single mutable per-instance render palette is
+        // tracked as follow-up work).
         _palette256 = new uint[256];
-        // Standard xterm 256 palette. Same numbers we reference in
-        // the renderer (see Render/TerminalPalette.cs) so queries are
-        // consistent with what's on screen.
-        uint[] basic =
+        for (int i = 0; i < 256; i++)
         {
-            0x000000, 0x800000, 0x008000, 0x808000,
-            0x000080, 0x800080, 0x008080, 0xC0C0C0,
-            0x808080, 0xFF0000, 0x00FF00, 0xFFFF00,
-            0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
-        };
-        for (int i = 0; i < 16; i++) _palette256[i] = basic[i];
-        int idx = 16;
-        int[] levels = { 0, 95, 135, 175, 215, 255 };
-        for (int r = 0; r < 6; r++)
-        for (int g = 0; g < 6; g++)
-        for (int b = 0; b < 6; b++)
-            _palette256[idx++] = (uint)((levels[r] << 16) | (levels[g] << 8) | levels[b]);
-        for (int i = 0; i < 24; i++)
-        {
-            int v = 8 + i * 10;
-            _palette256[idx++] = (uint)((v << 16) | (v << 8) | v);
+            var c = TerminalPalette.Indexed[i];
+            _palette256[i] = (uint)((c.R << 16) | (c.G << 8) | c.B);
         }
         return _palette256;
     }
@@ -1092,7 +1116,7 @@ public sealed class TerminalBuffer : IParserActions
 
     private void ReplyAscii(string s) => ReplyToPty(Encoding.ASCII.GetBytes(s));
 
-    private void SetDecMode(int[] p, bool on)
+    private void SetDecMode(ReadOnlySpan<int> p, bool on)
     {
         foreach (var m in p)
         {
@@ -1167,7 +1191,7 @@ public sealed class TerminalBuffer : IParserActions
         {
             _altSavedRow = CursorRow;
             _altSavedCol = CursorCol;
-            _altSavedPen = PenTemplate;
+            _altSavedPen = _pen;
         }
         if (_active == _alternate) return;
         _active = _alternate;
@@ -1184,7 +1208,7 @@ public sealed class TerminalBuffer : IParserActions
         {
             CursorRow   = Clamp(_altSavedRow, 0, Rows - 1);
             CursorCol   = Clamp(_altSavedCol, 0, Cols - 1);
-            PenTemplate = _altSavedPen;
+            _pen = _altSavedPen;
         }
     }
 
@@ -1275,9 +1299,9 @@ public sealed class TerminalBuffer : IParserActions
     private void SaveCursor()
     {
         if (_active == _alternate)
-        { _altSavedRow = CursorRow; _altSavedCol = CursorCol; _altSavedPen = PenTemplate; }
+        { _altSavedRow = CursorRow; _altSavedCol = CursorCol; _altSavedPen = _pen; }
         else
-        { _savedRow    = CursorRow; _savedCol    = CursorCol; _savedPen    = PenTemplate; }
+        { _savedRow    = CursorRow; _savedCol    = CursorCol; _savedPen    = _pen; }
     }
 
     private void RestoreCursor()
@@ -1286,13 +1310,13 @@ public sealed class TerminalBuffer : IParserActions
         {
             CursorRow   = Clamp(_altSavedRow, 0, Rows - 1);
             CursorCol   = Clamp(_altSavedCol, 0, Cols - 1);
-            PenTemplate = _altSavedPen;
+            _pen = _altSavedPen;
         }
         else
         {
             CursorRow   = Clamp(_savedRow, 0, Rows - 1);
             CursorCol   = Clamp(_savedCol, 0, Cols - 1);
-            PenTemplate = _savedPen;
+            _pen = _savedPen;
         }
     }
 
@@ -1302,7 +1326,7 @@ public sealed class TerminalBuffer : IParserActions
         _primary.Clear();
         _alternate.Clear();
         CursorRow = CursorCol = 0;
-        PenTemplate = TerminalCell.Blank;
+        _pen = TerminalCell.Blank;
         CursorVisible = true;
         CursorStyle = CursorStyle.BlockBlink;
         ScrollTop = 0; ScrollBottom = Rows - 1;
@@ -1316,34 +1340,35 @@ public sealed class TerminalBuffer : IParserActions
         _tabStops = null; // will rebuild with defaults on next access
         _lastPrintRune = 0;
         _windowTitle = string.Empty;
+        _parser.Reset();
     }
 
     // ---- SGR ----
 
-    private void ApplySgr(int[] p)
+    private void ApplySgr(ReadOnlySpan<int> p)
     {
-        if (p.Length == 0) { PenTemplate = TerminalCell.Blank; return; }
+        if (p.Length == 0) { _pen = TerminalCell.Blank; return; }
 
         int i = 0;
         while (i < p.Length)
         {
             switch (p[i])
             {
-                case 0:   PenTemplate = TerminalCell.Blank; break;
-                case 1:   PenTemplate.Flags  |=  CellFlags.Bold;          break;
-                case 2:   PenTemplate.Flags  |=  CellFlags.Dim;           break;
-                case 3:   PenTemplate.Flags  |=  CellFlags.Italic;        break;
-                case 4:   PenTemplate.Flags  |=  CellFlags.Underline;     break;
+                case 0:   _pen = TerminalCell.Blank; break;
+                case 1:   _pen.Flags  |=  CellFlags.Bold;          break;
+                case 2:   _pen.Flags  |=  CellFlags.Dim;           break;
+                case 3:   _pen.Flags  |=  CellFlags.Italic;        break;
+                case 4:   _pen.Flags  |=  CellFlags.Underline;     break;
                 case 5:
-                case 6:   PenTemplate.Flags2 |=  CellFlags2.Blink;        break;
-                case 7:   PenTemplate.Flags  |=  CellFlags.Inverse;       break;
-                case 9:   PenTemplate.Flags  |=  CellFlags.Strikethrough; break;
-                case 22:  PenTemplate.Flags  &= ~(CellFlags.Bold | CellFlags.Dim); break;
-                case 23:  PenTemplate.Flags  &= ~CellFlags.Italic;        break;
-                case 24:  PenTemplate.Flags  &= ~CellFlags.Underline;     break;
-                case 25:  PenTemplate.Flags2 &= ~CellFlags2.Blink;        break;
-                case 27:  PenTemplate.Flags  &= ~CellFlags.Inverse;       break;
-                case 29:  PenTemplate.Flags  &= ~CellFlags.Strikethrough; break;
+                case 6:   _pen.Flags2 |=  CellFlags2.Blink;        break;
+                case 7:   _pen.Flags  |=  CellFlags.Inverse;       break;
+                case 9:   _pen.Flags  |=  CellFlags.Strikethrough; break;
+                case 22:  _pen.Flags  &= ~(CellFlags.Bold | CellFlags.Dim); break;
+                case 23:  _pen.Flags  &= ~CellFlags.Italic;        break;
+                case 24:  _pen.Flags  &= ~CellFlags.Underline;     break;
+                case 25:  _pen.Flags2 &= ~CellFlags2.Blink;        break;
+                case 27:  _pen.Flags  &= ~CellFlags.Inverse;       break;
+                case 29:  _pen.Flags  &= ~CellFlags.Strikethrough; break;
 
                 case 30: case 31: case 32: case 33:
                 case 34: case 35: case 36: case 37:
@@ -1371,7 +1396,7 @@ public sealed class TerminalBuffer : IParserActions
 
     /// <summary>Returns the number of params beyond <paramref name="i"/>
     /// the caller should skip (0 / 2 / 4 depending on 256 vs RGB).</summary>
-    private int ApplyExtColor(int[] p, int i, bool fg)
+    private int ApplyExtColor(ReadOnlySpan<int> p, int i, bool fg)
     {
         if (i + 1 >= p.Length) return 0;
         int kind = p[i + 1];
@@ -1384,26 +1409,26 @@ public sealed class TerminalBuffer : IParserActions
         if (kind == 2 && i + 4 < p.Length)
         {
             uint packed = (uint)((p[i + 2] << 16) | (p[i + 3] << 8) | p[i + 4]);
-            if (fg) { PenTemplate.FgRgb = packed; PenTemplate.Flags |= CellFlags.FgRgb; }
-            else    { PenTemplate.BgRgb = packed; PenTemplate.Flags |= CellFlags.BgRgb; }
+            if (fg) { _pen.FgRgb = packed; _pen.Flags |= CellFlags.FgRgb; }
+            else    { _pen.BgRgb = packed; _pen.Flags |= CellFlags.BgRgb; }
             return 4;
         }
         return 0;
     }
 
-    private void SetFgIdx(byte i) { PenTemplate.FgIndex = i; PenTemplate.FgRgb = 0; PenTemplate.Flags &= ~CellFlags.FgRgb; }
-    private void SetBgIdx(byte i) { PenTemplate.BgIndex = i; PenTemplate.BgRgb = 0; PenTemplate.Flags &= ~CellFlags.BgRgb; }
-    private void ClearFg() { PenTemplate.FgIndex = 0; PenTemplate.FgRgb = 0; PenTemplate.Flags &= ~CellFlags.FgRgb; }
-    private void ClearBg() { PenTemplate.BgIndex = 0; PenTemplate.BgRgb = 0; PenTemplate.Flags &= ~CellFlags.BgRgb; }
+    private void SetFgIdx(byte i) { _pen.FgIndex = i; _pen.FgRgb = 0; _pen.Flags &= ~CellFlags.FgRgb; }
+    private void SetBgIdx(byte i) { _pen.BgIndex = i; _pen.BgRgb = 0; _pen.Flags &= ~CellFlags.BgRgb; }
+    private void ClearFg() { _pen.FgIndex = 0; _pen.FgRgb = 0; _pen.Flags &= ~CellFlags.FgRgb; }
+    private void ClearBg() { _pen.BgIndex = 0; _pen.BgRgb = 0; _pen.Flags &= ~CellFlags.BgRgb; }
 
     private TerminalCell BlankPenCell()
     {
         // Blank cells carry the current background so EL/ED with the
         // current pen paints a swath of the current bg colour.
         var c = TerminalCell.Blank;
-        c.BgIndex = PenTemplate.BgIndex;
-        c.BgRgb   = PenTemplate.BgRgb;
-        c.Flags   = PenTemplate.Flags & CellFlags.BgRgb;
+        c.BgIndex = _pen.BgIndex;
+        c.BgRgb   = _pen.BgRgb;
+        c.Flags   = _pen.Flags & CellFlags.BgRgb;
         return c;
     }
 

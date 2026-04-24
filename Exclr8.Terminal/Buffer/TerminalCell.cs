@@ -1,7 +1,7 @@
 namespace Exclr8.Terminal.Buffer;
 
 /// <summary>
-/// One character cell in the terminal grid. Packed into 8 bytes.
+/// One character cell in the terminal grid.
 ///
 /// <para>Colors can be either 256-palette indices (<see cref="FgIndex"/> /
 /// <see cref="BgIndex"/>) or 24-bit RGB (when <see cref="CellFlags.FgRgb"/> /
@@ -40,8 +40,6 @@ public struct TerminalCell
     public uint BgRgb;
 
     public static readonly TerminalCell Blank = default;
-
-    public bool IsBlank => Rune == 0;
 }
 
 [System.Flags]
@@ -55,14 +53,6 @@ public enum CellFlags2 : byte
     /// <summary>SGR 5 (slow blink) / SGR 6 (rapid). The renderer toggles
     /// visibility on the shared blink timer; SGR 25 clears this flag.</summary>
     Blink          = 1 << 2,
-    /// <summary>DECDWL/DECDHL line attribute — tracked but not
-    /// fully rendered (see the feature matrix note). Used so we can
-    /// surface the "not implemented" state if the app layer inspects.</summary>
-    DoubleWidth    = 1 << 3,
-    /// <summary>DECDHL top half.</summary>
-    DoubleHeightTop    = 1 << 4,
-    /// <summary>DECDHL bottom half.</summary>
-    DoubleHeightBottom = 1 << 5,
 }
 
 [System.Flags]

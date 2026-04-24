@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using Avalonia;
 using Avalonia.Media;
+using Avalonia.Media.Immutable;
 using Exclr8.Terminal.Buffer;
 
 namespace Exclr8.Terminal.Render;
@@ -34,6 +36,7 @@ public sealed class TerminalRenderer
             var v = Math.Clamp(value, 6.0, 72.0);
             if (Math.Abs(v - _fontSize) < 0.01) return;
             _fontSize = v;
+            InvalidateFontCaches();
             MeasureCell();
         }
     }
@@ -52,6 +55,7 @@ public sealed class TerminalRenderer
             if (v == _fontFamily) return;
             _fontFamily = v;
             _typeface   = new Typeface(_fontFamily);
+            InvalidateFontCaches();
             MeasureCell();
         }
     }
@@ -99,6 +103,92 @@ public sealed class TerminalRenderer
     /// cursor style is a "blink" variant, the cursor is hidden for one
     /// blink cycle.</summary>
     public bool BlinkVisible { get; set; } = true;
+
+    // ---- Allocation caches ----
+    // Per-frame content changes character-by-character but the set of
+    // distinct colours is small (default fg/bg, palette indices, a
+    // handful of 24-bit RGB values in typical output). Rebuilding
+    // SolidColorBrush + Typeface + FormattedText from scratch on every
+    // run chews CPU and GC; these caches collapse repeats.
+    private readonly Dictionary<uint, ImmutableSolidColorBrush> _brushCache = new();
+    // Immutable pens keyed on (colour, thickness * 10). Pens wrap a
+    // brush + thickness; a few thicknesses show up repeatedly (1px for
+    // underline/strikethrough/hyperlink/unfocused-cursor, 2px for focused
+    // cursor), so caching collapses them all.
+    private readonly Dictionary<(uint Color, int Thickness10), ImmutablePen> _penCache = new();
+    // Typeface variants for the current typeface: index = (bold?1:0) | (italic?2:0).
+    private readonly Typeface[] _typefaceVariants = new Typeface[4];
+    // FormattedText layout is expensive to build; keep a bounded cache
+    // keyed on (text, typeface variant, size, fg). Flushed when it gets
+    // too big rather than running a full LRU.
+    private readonly Dictionary<TextKey, FormattedText> _textCache = new();
+    private const int TextCacheMax = 512;
+    // Reused across glyph runs so we don't allocate a fresh StringBuilder
+    // per run. Cleared at the start of each DrawGlyphs call.
+    private readonly StringBuilder _glyphSb = new();
+
+    private readonly record struct TextKey(string Text, int Variant, int SizeTenths, uint Fg);
+
+    private static uint ColorKey(Color c) =>
+        ((uint)c.A << 24) | ((uint)c.R << 16) | ((uint)c.G << 8) | c.B;
+
+    private ImmutableSolidColorBrush BrushFor(Color c)
+    {
+        uint key = ColorKey(c);
+        if (_brushCache.TryGetValue(key, out var brush)) return brush;
+        brush = new ImmutableSolidColorBrush(c);
+        _brushCache[key] = brush;
+        return brush;
+    }
+
+    private ImmutablePen PenFor(Color c, double thickness)
+    {
+        var key = (ColorKey(c), (int)(thickness * 10));
+        if (_penCache.TryGetValue(key, out var pen)) return pen;
+        pen = new ImmutablePen(BrushFor(c), thickness);
+        _penCache[key] = pen;
+        return pen;
+    }
+
+    private Typeface TypefaceFor(bool bold, bool italic)
+    {
+        int idx = (bold ? 1 : 0) | (italic ? 2 : 0);
+        var tf = _typefaceVariants[idx];
+        if (tf.FontFamily == _typeface.FontFamily
+            && tf.Weight   == (bold   ? FontWeight.Bold   : FontWeight.Normal)
+            && tf.Style    == (italic ? FontStyle.Italic  : FontStyle.Normal))
+        {
+            return tf;
+        }
+        tf = new Typeface(_typeface.FontFamily,
+            italic ? FontStyle.Italic : FontStyle.Normal,
+            bold   ? FontWeight.Bold  : FontWeight.Normal);
+        _typefaceVariants[idx] = tf;
+        return tf;
+    }
+
+    private FormattedText FormattedTextFor(string text, Typeface tf, double size, Color fg)
+    {
+        int variantIdx = 0;
+        for (int i = 0; i < _typefaceVariants.Length; i++)
+        {
+            if (_typefaceVariants[i].Equals(tf)) { variantIdx = i; break; }
+        }
+        var key = new TextKey(text, variantIdx, (int)(size * 10),
+            ((uint)fg.A << 24) | ((uint)fg.R << 16) | ((uint)fg.G << 8) | fg.B);
+        if (_textCache.TryGetValue(key, out var ft)) return ft;
+        if (_textCache.Count >= TextCacheMax) _textCache.Clear();
+        ft = new FormattedText(text, CultureInfo.InvariantCulture,
+            FlowDirection.LeftToRight, tf, size, BrushFor(fg));
+        _textCache[key] = ft;
+        return ft;
+    }
+
+    private void InvalidateFontCaches()
+    {
+        for (int i = 0; i < _typefaceVariants.Length; i++) _typefaceVariants[i] = default;
+        _textCache.Clear();
+    }
 
     public TerminalRenderer(
         string fontFamily = "JetBrainsMono, Menlo, monospace",
@@ -151,6 +241,7 @@ public sealed class TerminalRenderer
             (CellWidth, CellHeight) = Measure(_typeface);
             UsingMonospaceFallback  = true;
             EffectiveFontFamily     = fallback;
+            InvalidateFontCaches();
         }
     }
 
@@ -186,7 +277,7 @@ public sealed class TerminalRenderer
         Size size, bool focused, TerminalTheme? theme = null)
     {
         var defBg = theme?.Background ?? TerminalPalette.DefaultBackground;
-        ctx.FillRectangle(new SolidColorBrush(defBg), new Rect(size));
+        ctx.FillRectangle(BrushFor(defBg), new Rect(size));
 
         // Smooth scroll: when PixelScrollOffset > 0 we're partway
         // between two rows. The whole display shifts DOWN by that
@@ -219,8 +310,8 @@ public sealed class TerminalRenderer
     /// </summary>
     private void DrawSearchMatches(DrawingContext ctx, TerminalBuffer buf, double pixelShift)
     {
-        var softBrush = new SolidColorBrush(Color.FromArgb(0x66, 0xE5, 0xC0, 0x7B));
-        var liveBrush = new SolidColorBrush(Color.FromArgb(0xCC, 0xFF, 0xAA, 0x00));
+        var softBrush = BrushFor(Color.FromArgb(0x66, 0xE5, 0xC0, 0x7B));
+        var liveBrush = BrushFor(Color.FromArgb(0xCC, 0xFF, 0xAA, 0x00));
 
         int sbCount     = buf.ScrollbackCount;
         int viewTopAbs  = sbCount - buf.ScrollOffset;     // visual row 0 maps to this absolute row
@@ -263,7 +354,7 @@ public sealed class TerminalRenderer
         // the terminal's usual content. Alpha is multiplied by
         // ScrollbarOpacity so the whole bar fades together.
         byte trackA = (byte)(0x28 * opacity);
-        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(trackA, 0x8a, 0x92, 0x9c)),
+        ctx.FillRectangle(BrushFor(Color.FromArgb(trackA, 0x8a, 0x92, 0x9c)),
             new Rect(x, 0, width, h));
 
         // Thumb. Total "virtual rows" = buf.Rows (visible) + sb
@@ -283,7 +374,7 @@ public sealed class TerminalRenderer
         double thumbY = topInverted * (h - thumbHeight);
 
         byte thumbA = (byte)(0xb0 * opacity);
-        ctx.FillRectangle(new SolidColorBrush(Color.FromArgb(thumbA, 0xc9, 0xd1, 0xd9)),
+        ctx.FillRectangle(BrushFor(Color.FromArgb(thumbA, 0xc9, 0xd1, 0xd9)),
             new Rect(x + 1, thumbY, width - 2, thumbHeight));
     }
 
@@ -334,7 +425,7 @@ public sealed class TerminalRenderer
             Color bg  = inv ? ResolveFg(cell, theme)        : ResolveBg(cell, defBg, theme);
 
             if (bg != defBg)
-                ctx.FillRectangle(new SolidColorBrush(bg), runRect);
+                ctx.FillRectangle(BrushFor(bg), runRect);
 
             // Blinking text: when the cell carries the Blink flag and
             // the shared blink timer has flipped to "off", drop the
@@ -352,7 +443,7 @@ public sealed class TerminalRenderer
             if (cell.HyperlinkId != 0)
             {
                 double ly = y + CellHeight - 1;
-                ctx.DrawLine(new Pen(new SolidColorBrush(fg), 1),
+                ctx.DrawLine(PenFor(fg, 1),
                     new Point(x, ly), new Point(x + runW, ly));
             }
         }
@@ -361,23 +452,21 @@ public sealed class TerminalRenderer
     private void DrawGlyphs(DrawingContext ctx, TerminalCell[] row,
         int start, int len, double x, double y, Color fg, CellFlags flags)
     {
-        var sb = new StringBuilder(len);
+        _glyphSb.Clear();
+        _glyphSb.EnsureCapacity(len);
         for (int i = 0; i < len; i++)
         {
             int rune = row[start + i].Rune;
-            if (rune == 0)           sb.Append(' ');
-            else if (rune <= 0xFFFF) sb.Append((char)rune);
-            else                     sb.Append(char.ConvertFromUtf32(rune));
+            if (rune == 0)           _glyphSb.Append(' ');
+            else if (rune <= 0xFFFF) _glyphSb.Append((char)rune);
+            else                     _glyphSb.Append(char.ConvertFromUtf32(rune));
         }
 
         bool bold   = (flags & CellFlags.Bold)   != 0;
         bool italic = (flags & CellFlags.Italic) != 0;
-        var tf = new Typeface(_typeface.FontFamily,
-            italic ? FontStyle.Italic : FontStyle.Normal,
-            bold   ? FontWeight.Bold  : FontWeight.Normal);
+        var tf = TypefaceFor(bold, italic);
 
-        var ft = new FormattedText(sb.ToString(), CultureInfo.InvariantCulture,
-            FlowDirection.LeftToRight, tf, _fontSize, new SolidColorBrush(fg));
+        var ft = FormattedTextFor(_glyphSb.ToString(), tf, _fontSize, fg);
         ctx.DrawText(ft, new Point(x, y));
 
         double w = ft.WidthIncludingTrailingWhitespace;
@@ -385,13 +474,13 @@ public sealed class TerminalRenderer
         if ((flags & CellFlags.Underline) != 0)
         {
             double ly = y + CellHeight - 2;
-            ctx.DrawLine(new Pen(new SolidColorBrush(fg), 1),
+            ctx.DrawLine(PenFor(fg, 1),
                 new Point(x, ly), new Point(x + w, ly));
         }
         if ((flags & CellFlags.Strikethrough) != 0)
         {
             double ly = y + CellHeight * 0.5;
-            ctx.DrawLine(new Pen(new SolidColorBrush(fg), 1),
+            ctx.DrawLine(PenFor(fg, 1),
                 new Point(x, ly), new Point(x + w, ly));
         }
     }
@@ -411,7 +500,7 @@ public sealed class TerminalRenderer
         int toAbs   = Math.Min(r2Abs, viewBotAbs);
         if (fromAbs > toAbs) return;
 
-        var brush = new SolidColorBrush(Color.FromArgb(0x60, 0x58, 0x9A, 0xF8));
+        var brush = BrushFor(Color.FromArgb(0x60, 0x58, 0x9A, 0xF8));
         for (int rAbs = fromAbs; rAbs <= toAbs; rAbs++)
         {
             int visualRow = rAbs - viewTopAbs;
@@ -435,7 +524,7 @@ public sealed class TerminalRenderer
         double x = buf.CursorCol * CellWidth;
         double y = buf.CursorRow * CellHeight + pixelShift;
         var color = theme?.Cursor ?? TerminalPalette.DefaultCursor;
-        var brush = new SolidColorBrush(color);
+        var brush = BrushFor(color);
 
         bool blinks = buf.CursorStyle is
             CursorStyle.BlockBlink or CursorStyle.UnderlineBlink or CursorStyle.BarBlink;
@@ -455,12 +544,10 @@ public sealed class TerminalRenderer
                         var cell = buf.GetVisibleRow(buf.CursorRow)[buf.CursorCol];
                         if (cell.Rune != 0)
                         {
-                            var inv = new SolidColorBrush(
-                                theme?.Background ?? TerminalPalette.DefaultBackground);
-                            var ft = new FormattedText(
+                            var bgColor = theme?.Background ?? TerminalPalette.DefaultBackground;
+                            var ft = FormattedTextFor(
                                 char.ConvertFromUtf32(cell.Rune),
-                                CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-                                _typeface, _fontSize, inv);
+                                _typeface, _fontSize, bgColor);
                             ctx.DrawText(ft, new Point(x, y));
                         }
                     }
@@ -468,20 +555,20 @@ public sealed class TerminalRenderer
                 }
                 case CursorStyle.UnderlineBlink:
                 case CursorStyle.Underline:
-                    ctx.DrawLine(new Pen(brush, 2),
+                    ctx.DrawLine(PenFor(color, 2),
                         new Point(x, y + CellHeight - 2),
                         new Point(x + CellWidth, y + CellHeight - 2));
                     break;
                 case CursorStyle.BarBlink:
                 case CursorStyle.Bar:
-                    ctx.DrawLine(new Pen(brush, 2),
+                    ctx.DrawLine(PenFor(color, 2),
                         new Point(x, y), new Point(x, y + CellHeight));
                     break;
             }
         }
         else
         {
-            ctx.DrawRectangle(null, new Pen(brush, 1),
+            ctx.DrawRectangle(null, PenFor(color, 1),
                 new Rect(x, y, CellWidth, CellHeight));
         }
     }

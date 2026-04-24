@@ -20,9 +20,11 @@ public interface IParserActions
     /// <summary>
     /// A CSI dispatch — <c>ESC [ params final</c>. <paramref name="intermediates"/>
     /// is any intermediate bytes (0x20-0x2F) between params and final
-    /// (rare for most of what we care about).
+    /// (rare for most of what we care about). The parameter span points
+    /// into the parser's internal buffer and is valid only for the
+    /// duration of the call — implementations must not store it.
     /// </summary>
-    void CsiDispatch(char final, int[] parameters, string intermediates, char privatePrefix);
+    void CsiDispatch(char final, ReadOnlySpan<int> parameters, string intermediates, char privatePrefix);
 
     /// <summary>An ESC dispatch — <c>ESC final</c> with possible intermediates.</summary>
     void EscDispatch(char final, string intermediates);

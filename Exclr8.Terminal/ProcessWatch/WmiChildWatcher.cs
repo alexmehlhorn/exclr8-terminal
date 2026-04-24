@@ -57,7 +57,7 @@ internal sealed class WmiChildWatcher : IProcessChildWatcher
                 // WMI can be flaky (service disabled, quota issues).
                 // Stop cleanly and leave the pid unwatched — caller
                 // can fall back to triggered scans.
-                Console.Error.WriteLine($"[WmiChildWatcher] Watch({parentPid}) failed: {ex.Message}");
+                TerminalLog.Error($"[WmiChildWatcher] Watch({parentPid}) failed: {ex.Message}");
                 entry.Dispose();
             }
         }
@@ -97,7 +97,7 @@ internal sealed class WmiChildWatcher : IProcessChildWatcher
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[WmiChildWatcher] creation-event dispatch: {ex.Message}");
+                TerminalLog.Error($"[WmiChildWatcher] creation-event dispatch: {ex.Message}");
             }
         };
         return w;
@@ -125,7 +125,7 @@ internal sealed class WmiChildWatcher : IProcessChildWatcher
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[WmiChildWatcher] deletion-event dispatch: {ex.Message}");
+                TerminalLog.Error($"[WmiChildWatcher] deletion-event dispatch: {ex.Message}");
             }
         };
         return w;

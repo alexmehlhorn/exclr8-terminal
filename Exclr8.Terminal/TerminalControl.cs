@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
@@ -23,7 +24,7 @@ namespace Exclr8.Terminal;
 /// requested we forward to the PTY), <see cref="Resized"/> (new cell
 /// grid), and optionally <see cref="HyperlinkClicked"/>.
 /// </summary>
-public class TerminalControl : Control
+public class TerminalControl : Control, IDisposable
 {
     private readonly TerminalRenderer _renderer;
     private readonly TerminalBuffer   _buffer;
@@ -63,7 +64,7 @@ public class TerminalControl : Control
     private static readonly TimeSpan ScrollbarFadeDuration = TimeSpan.FromMilliseconds(250);
 
     private bool _altHeld;
-    private TerminalTheme? _theme;
+    private TerminalTheme? _colorScheme;
 
     /// <summary>User typed — payload is the byte sequence ready for the
     /// PTY writer.</summary>
@@ -141,7 +142,7 @@ public class TerminalControl : Control
                 if (_processWatcher != null) UnwatchAll_Locked();
                 _rootProcessId = value;
                 if (_processWatcher != null && _rootProcessId > 0)
-                    WatchLocked(_rootProcessId);
+                    Watch_Locked(_rootProcessId);
             }
         }
     }
@@ -185,11 +186,11 @@ public class TerminalControl : Control
             w.ChildCreated  += OnWatcherChildCreated;
             w.ProcessExited += OnWatcherProcessExited;
             _processWatcher = w;
-            if (_rootProcessId > 0) WatchLocked(_rootProcessId);
+            if (_rootProcessId > 0) Watch_Locked(_rootProcessId);
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[TerminalControl] process-watcher start failed: {ex.Message}");
+            TerminalLog.Error($"[TerminalControl] process-watcher start failed: {ex.Message}");
         }
     }
 
@@ -198,19 +199,21 @@ public class TerminalControl : Control
         var w = _processWatcher;
         _processWatcher = null;
         _watchedPids.Clear();
-        _processTreeSubscribers = 0;
+        // Note: _processTreeSubscribers is not reset here — the
+        // subscriber count is maintained by the event add/remove
+        // accessors, not by us.
         if (w == null) return;
         w.ChildCreated  -= OnWatcherChildCreated;
         w.ProcessExited -= OnWatcherProcessExited;
         try { w.Dispose(); } catch { }
     }
 
-    private void WatchLocked(int pid)
+    private void Watch_Locked(int pid)
     {
         if (pid <= 0) return;
         if (!_watchedPids.Add(pid)) return;
         try { _processWatcher?.Watch(pid); } catch (Exception ex)
-        { Console.Error.WriteLine($"[TerminalControl] Watch({pid}) failed: {ex.Message}"); }
+        { TerminalLog.Error($"[TerminalControl] Watch({pid}) failed: {ex.Message}"); }
     }
 
     private void UnwatchAll_Locked()
@@ -227,54 +230,60 @@ public class TerminalControl : Control
     private void OnWatcherChildCreated(ProcessChildEvent e)
     {
         // Chain-watch so the next generation of forks surfaces too.
-        // Do this synchronously before dispatching so a grandchild
-        // spawned back-to-back with its parent isn't missed.
-        lock (_processWatchLock) WatchLocked(e.ChildPid);
+        // Do this synchronously on the pump thread (backed by the
+        // lock) so a grandchild spawned back-to-back with its parent
+        // isn't missed.
+        lock (_processWatchLock) Watch_Locked(e.ChildPid);
 
-        var handler = _processTreeChangedInner;
-        if (handler == null) return;
-        try
-        {
-            handler.Invoke(new ProcessTreeChange(
-                Kind:        ProcessTreeChangeKind.Created,
-                Pid:         e.ChildPid,
-                ParentPid:   e.ParentPid,
-                Name:        e.Name,
-                CommandLine: e.CommandLine));
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[TerminalControl] ProcessTreeChanged dispatch: {ex.Message}");
-        }
+        if (_processTreeChangedInner == null) return;
+        var change = new ProcessTreeChange(
+            Kind:        ProcessTreeChangeKind.Created,
+            Pid:         e.ChildPid,
+            ParentPid:   e.ParentPid,
+            Name:        e.Name,
+            CommandLine: e.CommandLine);
+        DispatchToUi(change, "created");
     }
 
     private void OnWatcherProcessExited(int pid)
     {
         lock (_processWatchLock) _watchedPids.Remove(pid);
-        var handler = _processTreeChangedInner;
-        if (handler == null) return;
-        try
-        {
-            handler.Invoke(new ProcessTreeChange(
-                Kind:        ProcessTreeChangeKind.Exited,
-                Pid:         pid,
-                ParentPid:   0,
-                Name:        null,
-                CommandLine: null));
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[TerminalControl] ProcessTreeChanged exit dispatch: {ex.Message}");
-        }
+        if (_processTreeChangedInner == null) return;
+        var change = new ProcessTreeChange(
+            Kind:        ProcessTreeChangeKind.Exited,
+            Pid:         pid,
+            ParentPid:   0,
+            Name:        null,
+            CommandLine: null);
+        DispatchToUi(change, "exited");
     }
 
-    /// <summary>Optional color overrides. Null = defaults. `new`
-    /// deliberately hides <see cref="StyledElement.Theme"/> — we want a
-    /// strongly-typed palette here, not the Avalonia ControlTheme.</summary>
-    public new TerminalTheme? Theme
+    /// <summary>Subscribers to <see cref="ProcessTreeChanged"/> almost
+    /// certainly touch UI state (badges, labels, menu items). The
+    /// underlying watchers fire on non-UI threads (kqueue pump on
+    /// macOS, WMI callback pool on Windows), so we marshal onto the
+    /// Avalonia dispatcher before raising the event.</summary>
+    private void DispatchToUi(ProcessTreeChange change, string kind)
     {
-        get => _theme;
-        set { _theme = value; InvalidateVisual(); }
+        Dispatcher.UIThread.Post(() =>
+        {
+            try { _processTreeChangedInner?.Invoke(change); }
+            catch (Exception ex)
+            {
+                TerminalLog.Error(
+                    $"[TerminalControl] ProcessTreeChanged {kind} dispatch: {ex.Message}");
+            }
+        });
+    }
+
+    /// <summary>Optional color overrides. Null = defaults. Deliberately
+    /// not named <c>Theme</c> so it doesn't collide with Avalonia's
+    /// <see cref="StyledElement.Theme"/> (which expects a
+    /// <c>ControlTheme</c>, not a colour palette).</summary>
+    public TerminalTheme? ColorScheme
+    {
+        get => _colorScheme;
+        set { _colorScheme = value; InvalidateVisual(); }
     }
 
     public TerminalControl()
@@ -298,19 +307,13 @@ public class TerminalControl : Control
         _blinkTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         _blinkTimer.Tick += (_, _) =>
         {
-            _blinkVisible           = !_blinkVisible;
-            _renderer.BlinkVisible  = _blinkVisible;
-            var s = _buffer.CursorStyle;
-            bool blinkingCursor = _buffer.CursorVisible &&
-                s is CursorStyle.BlockBlink or CursorStyle.UnderlineBlink or CursorStyle.BarBlink;
-            // Repaint when EITHER a blinking cursor is active OR the
-            // buffer has any cells carrying SGR 5 (Blink) — we don't
-            // walk the grid every tick to check; the buffer bumps its
-            // Revision only when SGR changes, so the renderer just
-            // always repaints on tick as long as the control is
-            // visible. Cheap enough at 2 Hz.
-            if (blinkingCursor) InvalidateVisual();
-            else                InvalidateVisual(); // covers SGR 5 content
+            _blinkVisible          = !_blinkVisible;
+            _renderer.BlinkVisible = _blinkVisible;
+            // Unconditional repaint every tick. We don't walk the grid
+            // to check whether any cell carries SGR 5 (Blink); cheap
+            // enough at 2 Hz, and covers both blinking-cursor and
+            // blinking-content cases without extra state tracking.
+            InvalidateVisual();
         };
         _blinkTimer.Start();
 
@@ -413,7 +416,7 @@ public class TerminalControl : Control
     public override void Render(DrawingContext ctx)
     {
         base.Render(ctx);
-        _renderer.Render(ctx, _buffer, Bounds.Size, IsFocused, _theme);
+        _renderer.Render(ctx, _buffer, Bounds.Size, IsFocused, _colorScheme);
         _lastRevision = _buffer.Revision;
     }
 
@@ -590,7 +593,7 @@ public class TerminalControl : Control
         // that case and just clear the highlight.
         if ((e.Key == Key.Back || e.Key == Key.Delete) && _buffer.Selection != null)
         {
-            int sent = TryDeleteSelection();
+            int sent = SendBackspacesForSelection();
             if (sent > 0)
             {
                 _buffer.ClearSelection();
@@ -613,12 +616,12 @@ public class TerminalControl : Control
         }
     }
 
-    /// <summary>Try to delete a live-screen selection that sits on
-    /// the cursor's row at or behind the cursor. Sends one DEL byte
-    /// per character we can safely erase and returns the count, or 0
-    /// when the selection isn't in a delete-safe position (different
-    /// row, starts past cursor, etc.).</summary>
-    private int TryDeleteSelection()
+    /// <summary>If the live-screen selection sits on the cursor's row
+    /// at or behind the cursor, send one DEL (0x7F) per character so
+    /// the shell's line editor erases them. Returns the number of DEL
+    /// bytes sent, or 0 when the selection isn't in a delete-safe
+    /// position (different row, starts past the cursor, etc.).</summary>
+    private int SendBackspacesForSelection()
     {
         var sel = _buffer.Selection;
         if (sel == null) return 0;
@@ -920,9 +923,64 @@ public class TerminalControl : Control
     /// and <see cref="CloseFind"/>.</summary>
     public event EventHandler? FindRequested;
 
+    // Search runs off the UI thread because a 5000-row scrollback takes
+    // non-trivial time to scan. Each Find() call cancels any in-flight
+    // scan and debounces briefly so rapid typing into the find bar
+    // doesn't launch a scan per keystroke.
+    private CancellationTokenSource? _searchCts;
+    private int _searchGeneration;
+    private const int SearchDebounceMs = 120;
+
     /// <summary>Update the search needle and rebuild the match list.
-    /// Pass null or empty to clear.</summary>
-    public void Find(string? needle) => _buffer.Search(needle);
+    /// Pass null or empty to clear. Scans happen on a background thread;
+    /// results are applied on the UI thread when ready. Subsequent
+    /// calls cancel the previous scan.</summary>
+    public void Find(string? needle)
+    {
+        _searchCts?.Cancel();
+        _searchCts?.Dispose();
+        _searchCts = null;
+
+        if (string.IsNullOrEmpty(needle))
+        {
+            _buffer.ClearSearch();
+            return;
+        }
+
+        var cts = new CancellationTokenSource();
+        _searchCts = cts;
+        int gen = ++_searchGeneration;
+        _ = RunFindAsync(needle, gen, cts.Token);
+    }
+
+    private async Task RunFindAsync(string needle, int gen, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(SearchDebounceMs, ct).ConfigureAwait(true);
+            if (gen != _searchGeneration) return;
+
+            // Snapshot has to run on the UI thread — it reads the
+            // Scrollback ring and live-screen rows which are mutated
+            // by PTY writes on the same thread.
+            var snapshot = _buffer.SnapshotRows();
+
+            var matches = await Task.Run(
+                () => TerminalBuffer.ScanMatches(snapshot, needle, ct),
+                ct).ConfigureAwait(true);
+
+            if (ct.IsCancellationRequested || gen != _searchGeneration) return;
+            _buffer.ApplySearchResults(needle, matches);
+        }
+        catch (OperationCanceledException)
+        {
+            // superseded by a later Find call — nothing to do
+        }
+        catch (Exception ex)
+        {
+            TerminalLog.Error($"[TerminalControl] Find failed: {ex.Message}");
+        }
+    }
 
     /// <summary>Jump to the next search match.</summary>
     public void FindNext() => _buffer.NextMatch();
@@ -946,24 +1004,28 @@ public class TerminalControl : Control
         if (!string.IsNullOrEmpty(t)) await CopyToClipboardAsync(t);
     }
 
-    private Task CopyToClipboardAsync(string text)
+    private async Task CopyToClipboardAsync(string text)
     {
         var cb = TopLevel.GetTopLevel(this)?.Clipboard;
-        if (cb == null) return Task.CompletedTask;
-        var transfer = new DataTransfer();
+        if (cb == null) return;
+        // DataTransfer is IDisposable — returning the SetDataAsync
+        // task directly would let the using/dispose race the set.
+        using var transfer = new DataTransfer();
         transfer.Add(DataTransferItem.Create(DataFormat.Text, text));
-        return cb.SetDataAsync(transfer);
+        await cb.SetDataAsync(transfer);
     }
 
-    // macOS UTI / MIME identifiers for image bytes on the pasteboard.
-    // TryGetFileAsync already covers Finder copies (they become
-    // DataFormat.File items), so this list is only for "screenshot to
-    // clipboard" style captures that arrive as raw bytes.
+    // Image-bytes clipboard identifiers for "screenshot to clipboard"
+    // captures. TryGetFileAsync already covers Finder / Explorer file
+    // copies, so this list is only the raw-bytes variants — macOS UTIs
+    // and MIME types, plus the Windows CF_DIB / PNG format names
+    // Avalonia surfaces on win32 clipboard.
     private static readonly string[] ImageFormats =
     {
         "public.png",  "image/png",  "PNG",
         "public.tiff", "image/tiff",
         "public.jpeg", "image/jpeg", "JPEG",
+        "DeviceIndependentBitmap", "image/bmp", "BMP",
     };
 
     private async Task PasteFromClipboardAsyncCore()
@@ -984,14 +1046,16 @@ public class TerminalControl : Control
         }
 
         // 2. Image bytes (screenshot-to-clipboard). Spill to a temp
-        // file and paste the path — matches the Claude Code workflow.
+        // file and paste the path — CLIs that accept image file
+        // arguments can then pick them up just as they would a
+        // dragged-in file.
         foreach (var ident in ImageFormats)
         {
             var fmt  = DataFormat.CreateBytesPlatformFormat(ident);
             var data = await transfer.TryGetValueAsync(fmt);
             if (data is { Length: > 0 })
             {
-                var path = WriteClipboardImageToTemp(data, ident);
+                var path = await WriteClipboardImageToTempAsync(data, ident);
                 Paste(path);
                 return;
             }
@@ -1002,22 +1066,30 @@ public class TerminalControl : Control
         if (!string.IsNullOrEmpty(t)) Paste(t);
     }
 
+    /// <summary>Directory name under the OS temp dir where pasted
+    /// images are spilled. Hosts can override to segregate or brand
+    /// the path (e.g. an IDE might use its own prefix).</summary>
+    public static string PasteImageDirectoryName { get; set; } = "exclr8-terminal-paste";
+
     /// <summary>Write clipboard image bytes to a temp file and return
-    /// its path. Extension is derived from the clipboard format so
-    /// consumers (Claude Code) can identify the format correctly.</summary>
-    private static string WriteClipboardImageToTemp(byte[] data, string format)
+    /// its path. The file extension is derived from the clipboard
+    /// format so downstream tools can identify the image type
+    /// without sniffing. Async so a multi-MB screenshot doesn't stall
+    /// the UI thread while the file is written.</summary>
+    private static async Task<string> WriteClipboardImageToTempAsync(byte[] data, string format)
     {
         string ext = format switch
         {
-            "public.png"  or "image/png"  or "PNG"  => ".png",
-            "public.tiff" or "image/tiff"           => ".tiff",
-            "public.jpeg" or "image/jpeg" or "JPEG" => ".jpg",
-            _                                       => ".bin",
+            "public.png"  or "image/png"  or "PNG"                         => ".png",
+            "public.tiff" or "image/tiff"                                  => ".tiff",
+            "public.jpeg" or "image/jpeg" or "JPEG"                        => ".jpg",
+            "DeviceIndependentBitmap" or "image/bmp" or "BMP"              => ".bmp",
+            _                                                              => ".bin",
         };
-        var dir = Path.Combine(Path.GetTempPath(), "vibecoder-paste");
+        var dir = Path.Combine(Path.GetTempPath(), PasteImageDirectoryName);
         Directory.CreateDirectory(dir);
         var path = Path.Combine(dir, $"paste-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}{ext}");
-        File.WriteAllBytes(path, data);
+        await File.WriteAllBytesAsync(path, data);
         return path;
     }
 
@@ -1053,5 +1125,31 @@ public class TerminalControl : Control
         public void OnCompleted() { }
         public void OnError(Exception e) { }
         public void OnNext(T v) { _f(v); }
+    }
+
+    // ---- Disposal ----
+
+    private bool _disposed;
+
+    /// <summary>Stop timers, cancel in-flight search, tear down the
+    /// process-tree watcher (kqueue fd / WMI subscription), and detach
+    /// from the buffer. Call when a host removes this control from its
+    /// layout for good. Idempotent. Re-using a disposed instance is not
+    /// supported.</summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        _blinkTimer.Stop();
+        _scrollbarTimer.Stop();
+
+        _searchCts?.Cancel();
+        _searchCts?.Dispose();
+        _searchCts = null;
+
+        lock (_processWatchLock) StopWatcher_Locked();
+
+        GC.SuppressFinalize(this);
     }
 }

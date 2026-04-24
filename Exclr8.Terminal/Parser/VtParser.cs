@@ -84,6 +84,11 @@ public sealed class VtParser
             // SUB / 0x18 / 0x1A / 0x1B short-circuit almost every state
             // back to escape or ground. We check these first, except in
             // OSC/DCS which accumulate until their own terminators.
+            // C1 control bytes (0x90 DCS, 0x98/0x9E/0x9F SOS/PM/APC,
+            // 0x9B CSI, 0x9D OSC) act the same way — they're the 8-bit
+            // form of the ESC <x> sequence starts. Guarded by _utf8State
+            // because those byte values are valid UTF-8 continuation
+            // bytes mid-rune and must not hijack them.
             if (_state != State.OscString && _state != State.DcsPassthrough
                 && _state != State.DcsIgnore && _state != State.SosPmApcString)
             {
@@ -97,6 +102,17 @@ public sealed class VtParser
                 {
                     EnterEscape();
                     continue;
+                }
+                if (_utf8State == 0)
+                {
+                    if (b == 0x90) { EnterDcsEntry(); continue; }
+                    if (b == 0x9B) { EnterCsiEntry(); continue; }
+                    if (b == 0x9D) { EnterOsc();      continue; }
+                    if (b == 0x98 || b == 0x9E || b == 0x9F)
+                    {
+                        _state = State.SosPmApcString;
+                        continue;
+                    }
                 }
             }
 
@@ -333,9 +349,10 @@ public sealed class VtParser
     {
         // Ensure there's at least one param recorded (handles bare `ESC [ H`).
         if (_paramCount == 0) _params[_paramCount++] = _currentParam;
-        var copy = new int[_paramCount];
-        Array.Copy(_params, copy, _paramCount);
-        _actions.CsiDispatch(final, copy, _intermediates.ToString(), _privatePrefix);
+        _actions.CsiDispatch(final,
+            new ReadOnlySpan<int>(_params, 0, _paramCount),
+            _intermediates.ToString(),
+            _privatePrefix);
         _state = State.Ground;
     }
 

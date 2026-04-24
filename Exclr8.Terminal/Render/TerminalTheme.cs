@@ -5,7 +5,7 @@ namespace Exclr8.Terminal.Render;
 /// <summary>
 /// Optional color overrides. Null fields fall back to
 /// <see cref="TerminalPalette"/> defaults. Passed to
-/// <c>TerminalControl.Theme</c> to re-skin without subclassing.
+/// <c>TerminalControl.ColorScheme</c> to re-skin without subclassing.
 /// </summary>
 public sealed class TerminalTheme
 {

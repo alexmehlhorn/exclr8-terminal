@@ -35,32 +35,40 @@ public static class KeyMapper
         // Cmd/Meta alone is an app shortcut, not a terminal sequence.
         if (meta && !ctrl && !alt) return Array.Empty<byte>();
 
-        // DECCKM: arrows flip between CSI and SS3. Home/End too.
-        string ar = appCursorKeys ? "O" : "[";
+        // xterm modifier-parameter encoding. mod=1 is "no modifier";
+        // anything else switches special keys from their base form
+        // (CSI A, SS3 P, CSI 5 ~) to the modifier-carrying form
+        // (CSI 1 ; mod A, CSI 1 ; mod P, CSI 5 ; mod ~) so vim / tmux
+        // / readline can tell Ctrl+Up from Up.
+        int mod = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (meta ? 8 : 0);
+        bool hasMod = mod > 1;
+
         switch (e.Key)
         {
-            case Key.Up:       return Esc(ar + "A");
-            case Key.Down:     return Esc(ar + "B");
-            case Key.Right:    return Esc(ar + "C");
-            case Key.Left:     return Esc(ar + "D");
-            case Key.Home:     return appCursorKeys ? Esc("OH") : Esc("[H");
-            case Key.End:      return appCursorKeys ? Esc("OF") : Esc("[F");
-            case Key.PageUp:   return Esc("[5~");
-            case Key.PageDown: return Esc("[6~");
-            case Key.Insert:   return Esc("[2~");
-            case Key.Delete:   return Esc("[3~");
-            case Key.F1:       return Esc("OP");
-            case Key.F2:       return Esc("OQ");
-            case Key.F3:       return Esc("OR");
-            case Key.F4:       return Esc("OS");
-            case Key.F5:       return Esc("[15~");
-            case Key.F6:       return Esc("[17~");
-            case Key.F7:       return Esc("[18~");
-            case Key.F8:       return Esc("[19~");
-            case Key.F9:       return Esc("[20~");
-            case Key.F10:      return Esc("[21~");
-            case Key.F11:      return Esc("[23~");
-            case Key.F12:      return Esc("[24~");
+            case Key.Up:       return LetterKey('A', appCursorKeys, hasMod, mod);
+            case Key.Down:     return LetterKey('B', appCursorKeys, hasMod, mod);
+            case Key.Right:    return LetterKey('C', appCursorKeys, hasMod, mod);
+            case Key.Left:     return LetterKey('D', appCursorKeys, hasMod, mod);
+            case Key.Home:     return LetterKey('H', appCursorKeys, hasMod, mod);
+            case Key.End:      return LetterKey('F', appCursorKeys, hasMod, mod);
+            case Key.PageUp:   return TildeKey(5,  hasMod, mod);
+            case Key.PageDown: return TildeKey(6,  hasMod, mod);
+            case Key.Insert:   return TildeKey(2,  hasMod, mod);
+            case Key.Delete:   return TildeKey(3,  hasMod, mod);
+            // F1-F4 use SS3 in the unmodified form, CSI-letter with modifier.
+            case Key.F1:       return Ss3OrModCsi('P', hasMod, mod);
+            case Key.F2:       return Ss3OrModCsi('Q', hasMod, mod);
+            case Key.F3:       return Ss3OrModCsi('R', hasMod, mod);
+            case Key.F4:       return Ss3OrModCsi('S', hasMod, mod);
+            // F5-F12 use the CSI tilde form; modifiers extend it.
+            case Key.F5:       return TildeKey(15, hasMod, mod);
+            case Key.F6:       return TildeKey(17, hasMod, mod);
+            case Key.F7:       return TildeKey(18, hasMod, mod);
+            case Key.F8:       return TildeKey(19, hasMod, mod);
+            case Key.F9:       return TildeKey(20, hasMod, mod);
+            case Key.F10:      return TildeKey(21, hasMod, mod);
+            case Key.F11:      return TildeKey(23, hasMod, mod);
+            case Key.F12:      return TildeKey(24, hasMod, mod);
             case Key.Enter:    return new byte[] { 0x0D };
             case Key.Tab:      return shift ? Esc("[Z") : new byte[] { 0x09 };
             // Backspace: DEL (0x7F) on every platform. Windows
@@ -103,9 +111,30 @@ public static class KeyMapper
         return Array.Empty<byte>();
     }
 
-    /// <summary>Legacy overload for call sites that don't (yet) know
-    /// about the app-mode flags.</summary>
-    public static byte[] Map(KeyEventArgs e) => Map(e, false, false);
+    // Arrows / Home / End. Unmodified respects DECCKM (SS3 when app-
+    // cursor mode is on). Any non-trivial modifier forces CSI with
+    // the modifier parameter, since SS3 has no encoding for it.
+    private static byte[] LetterKey(char final, bool appCursor, bool hasMod, int mod)
+    {
+        if (hasMod) return Esc($"[1;{mod}{final}");
+        return appCursor ? Esc($"O{final}") : Esc($"[{final}");
+    }
+
+    // Editing / function keys that use the CSI code~ form.
+    private static byte[] TildeKey(int code, bool hasMod, int mod)
+    {
+        if (hasMod) return Esc($"[{code};{mod}~");
+        return Esc($"[{code}~");
+    }
+
+    // F1-F4: SS3 when unmodified (the xterm classic), CSI letter with
+    // modifier parameter otherwise. Apps that care — vim, tmux keybinds —
+    // read both forms.
+    private static byte[] Ss3OrModCsi(char final, bool hasMod, int mod)
+    {
+        if (hasMod) return Esc($"[1;{mod}{final}");
+        return Esc($"O{final}");
+    }
 
     private static byte[]? MapNumpad(Key key) => key switch
     {

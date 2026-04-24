@@ -17,16 +17,28 @@ public sealed class ScreenBuffer
 {
     public int Cols { get; private set; }
     public int Rows { get; private set; }
-    public int ScrollbackLimit { get; set; }
 
-    public LinkedList<TerminalCell[]> Scrollback { get; } = new();
+    private int _scrollbackLimit;
+    public int ScrollbackLimit
+    {
+        get => _scrollbackLimit;
+        set
+        {
+            _scrollbackLimit = value;
+            if (value > 0) Scrollback.Capacity = value;
+            else           Scrollback.Clear();
+        }
+    }
+
+    public ScrollbackRing Scrollback { get; }
     private readonly List<TerminalCell[]> _rows = new();
 
     public ScreenBuffer(int cols, int rows, int scrollbackLimit)
     {
         Cols = cols;
         Rows = rows;
-        ScrollbackLimit = scrollbackLimit;
+        _scrollbackLimit = scrollbackLimit;
+        Scrollback = new ScrollbackRing(Math.Max(1, scrollbackLimit));
         for (int i = 0; i < rows; i++) _rows.Add(new TerminalCell[cols]);
     }
 
@@ -43,14 +55,12 @@ public sealed class ScreenBuffer
                 Array.Copy(old, next, Math.Min(old.Length, cols));
                 _rows[r] = next;
             }
-            var node = Scrollback.First;
-            while (node != null)
+            for (int i = 0; i < Scrollback.Count; i++)
             {
-                var old = node.Value;
+                var old = Scrollback[i];
                 var next = new TerminalCell[cols];
                 Array.Copy(old, next, Math.Min(old.Length, cols));
-                node.Value = next;
-                node = node.Next;
+                Scrollback[i] = next;
             }
             Cols = cols;
         }
@@ -75,26 +85,6 @@ public sealed class ScreenBuffer
         Rows = rows;
     }
 
-    // ---- Full-screen primitives (used when region == whole screen) ----
-
-    /// <summary>Scroll the whole screen up by 1. Topmost row goes to
-    /// scrollback; a blank row is appended at the bottom.</summary>
-    public void ScrollUp()
-    {
-        PushScrollback(_rows[0]);
-        _rows.RemoveAt(0);
-        _rows.Add(new TerminalCell[Cols]);
-    }
-
-    /// <summary>Scroll the whole screen down by 1. Blank row inserted
-    /// at the top; bottom row dropped (not scrollback — this is an RI /
-    /// DECSET 6 behaviour, not an output scroll).</summary>
-    public void ScrollDown()
-    {
-        _rows.Insert(0, new TerminalCell[Cols]);
-        _rows.RemoveAt(_rows.Count - 1);
-    }
-
     // ---- Region-aware scroll operations ----
 
     /// <summary>
@@ -112,9 +102,11 @@ public sealed class ScreenBuffer
         for (int i = 0; i < n; i++)
         {
             var evicted = _rows[top];
-            if (fullScreen) PushScrollback(evicted);
+            TerminalCell[]? recycled = null;
+            if (fullScreen) recycled = PushScrollback(evicted);
+            else            recycled = evicted; // region-local; discarded row is reusable
             _rows.RemoveAt(top);
-            _rows.Insert(bottom, new TerminalCell[Cols]);
+            _rows.Insert(bottom, TakeOrAllocBlank(recycled));
         }
     }
 
@@ -131,8 +123,9 @@ public sealed class ScreenBuffer
         n = Math.Min(n, bottom - top + 1);
         for (int i = 0; i < n; i++)
         {
+            var evicted = _rows[bottom];
             _rows.RemoveAt(bottom);
-            _rows.Insert(top, new TerminalCell[Cols]);
+            _rows.Insert(top, TakeOrAllocBlank(evicted));
         }
     }
 
@@ -149,8 +142,9 @@ public sealed class ScreenBuffer
         n = Math.Min(n, scrollBottom - at + 1);
         for (int i = 0; i < n; i++)
         {
+            var evicted = _rows[scrollBottom];
             _rows.RemoveAt(scrollBottom);
-            _rows.Insert(at, new TerminalCell[Cols]);
+            _rows.Insert(at, TakeOrAllocBlank(evicted));
         }
     }
 
@@ -165,14 +159,11 @@ public sealed class ScreenBuffer
         n = Math.Min(n, scrollBottom - at + 1);
         for (int i = 0; i < n; i++)
         {
+            var evicted = _rows[at];
             _rows.RemoveAt(at);
-            _rows.Insert(scrollBottom, new TerminalCell[Cols]);
+            _rows.Insert(scrollBottom, TakeOrAllocBlank(evicted));
         }
     }
-
-    // Legacy overloads (full screen) for existing callers.
-    public void InsertLines(int at, int n) => InsertLines(at, n, Rows - 1);
-    public void DeleteLines(int at, int n) => DeleteLines(at, n, Rows - 1);
 
     public void Clear()
     {
@@ -181,18 +172,36 @@ public sealed class ScreenBuffer
 
     public void ClearScrollback() => Scrollback.Clear();
 
-    private void PushScrollback(TerminalCell[] row)
+    /// <summary>Push a row into scrollback. Returns the array that was
+    /// evicted from the ring (if the ring was at capacity) so callers
+    /// can reuse it as the new blank row, skipping an allocation on
+    /// steady-state scroll.</summary>
+    private TerminalCell[]? PushScrollback(TerminalCell[] row)
     {
-        if (ScrollbackLimit <= 0) return;
+        if (ScrollbackLimit <= 0) return null;
         // Skip fully-blank rows: on initial layout the buffer starts at
         // its default 24 rows and then shrinks to whatever the cell
         // height accommodates. The top rows evicted by that shrink are
         // always empty (no output yet) and shouldn't count as
         // scrollback the user can navigate into — it'd give them a
         // phantom screen of nothing above the first prompt.
-        if (IsBlankRow(row)) return;
-        Scrollback.AddLast(row);
-        while (Scrollback.Count > ScrollbackLimit) Scrollback.RemoveFirst();
+        if (IsBlankRow(row)) return null;
+        if (Scrollback.Capacity != ScrollbackLimit) Scrollback.Capacity = ScrollbackLimit;
+        return Scrollback.Add(row);
+    }
+
+    /// <summary>Return either <paramref name="recycled"/> (cleared in
+    /// place) or a freshly-allocated blank row of the current width.
+    /// Used anywhere we need a blank-row slot — ScrollUp/Down,
+    /// InsertLines, DeleteLines, region scrolls.</summary>
+    private TerminalCell[] TakeOrAllocBlank(TerminalCell[]? recycled)
+    {
+        if (recycled != null && recycled.Length == Cols)
+        {
+            Array.Clear(recycled, 0, Cols);
+            return recycled;
+        }
+        return new TerminalCell[Cols];
     }
 
     private static bool IsBlankRow(TerminalCell[] row)

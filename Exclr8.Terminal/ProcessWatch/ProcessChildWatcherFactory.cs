@@ -21,7 +21,7 @@ internal static class ProcessChildWatcherFactory
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[ProcessChildWatcherFactory] native backend unavailable: {ex.Message}");
+            TerminalLog.Error($"[ProcessChildWatcherFactory] native backend unavailable: {ex.Message}");
         }
         return new NoopChildWatcher();
     }

@@ -105,10 +105,14 @@ public sealed class InputEventStream
             {
                 if (_line.Length > 0) _line.Length--;
             }
-            else if (b == 0x03 || b == 0x18)
+            else if (b == 0x03 || b == 0x18 || b == 0x04)
             {
-                // Ctrl+C / Ctrl+X abort the line the same way a
-                // shell would — drop what we have so far.
+                // Ctrl+C / Ctrl+X / Ctrl+D all abort the in-progress
+                // line from our perspective. Ctrl+D at an empty line
+                // sends EOF to the shell; at a partial line, shells
+                // differ (some forward-delete, some no-op) — either
+                // way the line as we'd reconstruct it is invalidated,
+                // so clear the buffer.
                 _line.Clear();
             }
             else if (b == 0x1B)
