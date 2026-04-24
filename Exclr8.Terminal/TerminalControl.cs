@@ -390,6 +390,29 @@ public class TerminalControl : Control
             return;
         }
 
+        // Selection-aware delete. When the user has a mouse selection
+        // that ends right at the cursor position (i.e. they just
+        // selected characters they typed and pressed Delete or
+        // Backspace), translate it into N backspaces sent to the
+        // shell so readline actually deletes those characters. If the
+        // selection is anywhere else on the line, the shell's line-
+        // editor cursor isn't over it and backspaces would delete the
+        // wrong text — fall through to the normal key handling in
+        // that case and just clear the highlight.
+        if ((e.Key == Key.Back || e.Key == Key.Delete) && _buffer.Selection != null)
+        {
+            int sent = TryDeleteSelection();
+            if (sent > 0)
+            {
+                _buffer.ClearSelection();
+                _buffer.ResetScrollOffset();
+                e.Handled = true;
+                return;
+            }
+            _buffer.ClearSelection();
+            // fall through to send the key normally
+        }
+
         var bytes = KeyMapper.Map(e, _buffer.ApplicationCursorKeys, _buffer.ApplicationKeypad);
         if (bytes.Length > 0)
         {
@@ -399,6 +422,33 @@ public class TerminalControl : Control
             Input?.Invoke(this, bytes);
             e.Handled = true;
         }
+    }
+
+    /// <summary>Try to delete a live-screen selection that sits
+    /// immediately before the shell's cursor. Sends one backspace
+    /// byte per selected character and returns the byte count sent,
+    /// or 0 when the selection isn't in a delete-safe position.</summary>
+    private int TryDeleteSelection()
+    {
+        var sel = _buffer.Selection;
+        if (sel == null) return 0;
+        var (r1, c1, r2, c2) = sel.Normalized();
+
+        // Only handle single-row selections that end at (or
+        // immediately before) the cursor on the current line. This
+        // covers the "I just typed this, delete it" case without
+        // pretending we can unambiguously delete text elsewhere.
+        int cursorAbs = _buffer.VisualToAbsRow(_buffer.CursorRow);
+        if (r1 != cursorAbs || r2 != cursorAbs) return 0;
+        if (c2 + 1 != _buffer.CursorCol) return 0;
+
+        int n = c2 - c1 + 1;
+        if (n <= 0) return 0;
+
+        var payload = new byte[n];
+        for (int i = 0; i < n; i++) payload[i] = 0x7F; // DEL = shell erase-char
+        Input?.Invoke(this, payload);
+        return n;
     }
 
     protected override void OnKeyUp(KeyEventArgs e)
