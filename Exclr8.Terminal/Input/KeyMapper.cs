@@ -25,8 +25,14 @@ namespace Exclr8.Terminal.Input;
 public static class KeyMapper
 {
     public static byte[] Map(KeyEventArgs e, bool appCursorKeys = false, bool appKeypad = false)
+        => Map(e.Key, e.KeyModifiers, appCursorKeys, appKeypad);
+
+    /// <summary>Pure logical form of <see cref="Map(KeyEventArgs, bool, bool)"/> —
+    /// same mapping, but takes the key and modifiers directly so it
+    /// can be unit-tested without constructing an Avalonia
+    /// <see cref="KeyEventArgs"/>.</summary>
+    public static byte[] Map(Key key, KeyModifiers mods, bool appCursorKeys = false, bool appKeypad = false)
     {
-        var mods  = e.KeyModifiers;
         bool ctrl  = (mods & KeyModifiers.Control) != 0;
         bool alt   = (mods & KeyModifiers.Alt)     != 0;
         bool shift = (mods & KeyModifiers.Shift)   != 0;
@@ -43,7 +49,7 @@ public static class KeyMapper
         int mod = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (meta ? 8 : 0);
         bool hasMod = mod > 1;
 
-        switch (e.Key)
+        switch (key)
         {
             case Key.Up:       return LetterKey('A', appCursorKeys, hasMod, mod);
             case Key.Down:     return LetterKey('B', appCursorKeys, hasMod, mod);
@@ -83,24 +89,30 @@ public static class KeyMapper
             // editing, not a real Backspace-doesn't-work bug.
             case Key.Back:     return new byte[] { 0x7F };
             case Key.Escape:   return new byte[] { 0x1B };
-            case Key.Space:    return new byte[] { 0x20 };
+            // Ctrl+Space is the standard "send NUL (0x00)" binding —
+            // emacs uses it for set-mark, readline for
+            // mark-or-nothing. Plain / Shift / Alt-only Space stays
+            // as SP.
+            case Key.Space:    return (ctrl && !alt)
+                                   ? new byte[] { 0x00 }
+                                   : new byte[] { 0x20 };
         }
 
         // DECKPAM: unmodified numpad keys send SS3 sequences.
         if (appKeypad && !ctrl && !alt && !shift)
         {
-            var kp = MapNumpad(e.Key);
+            var kp = MapNumpad(key);
             if (kp != null) return kp;
         }
 
         // Ctrl+A..Z → 0x01..0x1A.
-        if (ctrl && !alt && e.Key >= Key.A && e.Key <= Key.Z)
-            return new byte[] { (byte)(e.Key - Key.A + 1) };
+        if (ctrl && !alt && key >= Key.A && key <= Key.Z)
+            return new byte[] { (byte)(key - Key.A + 1) };
 
         // Ctrl+symbol mappings.
         if (ctrl && !alt)
         {
-            switch (e.Key)
+            switch (key)
             {
                 case Key.D2:       return new byte[] { 0x00 }; // Ctrl+@
                 case Key.D6:       return new byte[] { 0x1E }; // Ctrl+^

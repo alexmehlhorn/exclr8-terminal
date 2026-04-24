@@ -72,6 +72,37 @@ public class ParserTests
     }
 
     [Fact]
+    public void Print_Utf8EncodingOfSurrogate_ReplacedWithFFFD()
+    {
+        // 0xED 0xA0 0x80 is the UTF-8 encoding of U+D800 (high
+        // surrogate). Unicode prohibits surrogates in UTF-8 and
+        // char.ConvertFromUtf32 throws on them — so the parser
+        // must replace with U+FFFD before dispatching to Print.
+        var r = ParseBytes(0xED, 0xA0, 0x80);
+        Assert.Equal("�", r.Printed.ToString());
+    }
+
+    [Fact]
+    public void Print_Utf8EncodingAboveMaxCodepoint_ReplacedWithFFFD()
+    {
+        // 0xF5 0x80 0x80 0x80 would decode to U+140000, past the
+        // Unicode max (U+10FFFF). The parser's 4-byte-lead check
+        // accepts 0xF0-0xF7 for lenience, so the post-assembly
+        // range check is what protects downstream code.
+        var r = ParseBytes(0xF5, 0x80, 0x80, 0x80);
+        Assert.Equal("�", r.Printed.ToString());
+    }
+
+    [Fact]
+    public void Print_ValidAstralCodepointNotReplaced()
+    {
+        // Sanity: a legitimate astral rune (U+1F600 😀) passes
+        // through untouched.
+        var r = ParseBytes(0xF0, 0x9F, 0x98, 0x80);
+        Assert.Equal("\U0001F600", r.Printed.ToString());
+    }
+
+    [Fact]
     public void Execute_C0BytesDispatchedSeparately()
     {
         var r = ParseBytes((byte)'A', 0x08, (byte)'B', 0x0A);

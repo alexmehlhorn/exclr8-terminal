@@ -163,8 +163,17 @@ public sealed class VtParser
                 _utf8State--;
                 if (_utf8State == 0)
                 {
-                    _actions.Print(_utf8Accum);
+                    int rune = _utf8Accum;
                     _utf8Accum = 0;
+                    // Reject surrogates (U+D800..U+DFFF) and runes
+                    // above the Unicode range (> U+10FFFF). Both crash
+                    // char.ConvertFromUtf32 downstream in the
+                    // renderer / search, and are never valid UTF-8
+                    // output anyway — replace with U+FFFD so a
+                    // hostile or buggy byte source can't take us down.
+                    if ((uint)rune > 0x10FFFF || (rune >= 0xD800 && rune <= 0xDFFF))
+                        rune = 0xFFFD;
+                    _actions.Print(rune);
                 }
                 return;
             }

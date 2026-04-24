@@ -99,6 +99,58 @@ public class BufferModeTests
     }
 
     [Fact]
+    public void AltScreen_1049_RestoresPrimaryCursorEvenAfterDECSCInsideAlt()
+    {
+        // Regression: DECSET 1049 must save the primary cursor to the
+        // PRIMARY screen's DECSC slot (xterm semantics). If it saves
+        // to the alt slot, DECSC/DECRC inside the alt screen would
+        // overwrite the 1049 anchor and DECRESET 1049 would restore
+        // the wrong cursor onto primary.
+        var buf = NewBuffer(20, 8);
+
+        // Park the primary cursor at (row 3, col 5). CUP is 1-based.
+        buf.Feed(CSI + "4;6H");
+        Assert.Equal(3, buf.CursorRow);
+        Assert.Equal(5, buf.CursorCol);
+
+        // Enter alt via 1049 — saves primary cursor.
+        buf.Feed(CSI + "?1049h");
+        Assert.True(buf.IsAltScreen);
+
+        // Move somewhere on alt and do a DECSC/DECRC dance that writes
+        // to the alt screen's DECSC slot.
+        buf.Feed(CSI + "1;1H");   // (0,0)
+        buf.FeedBytes(0x1B, (byte)'7'); // DECSC in alt
+        buf.Feed(CSI + "5;10H");  // move away (4,9)
+        buf.FeedBytes(0x1B, (byte)'8'); // DECRC — back to (0,0) via alt slot
+        Assert.Equal(0, buf.CursorRow);
+        Assert.Equal(0, buf.CursorCol);
+
+        // Leave alt — must restore primary cursor to (3,5), not the
+        // (0,0) that DECSC-inside-alt saved.
+        buf.Feed(CSI + "?1049l");
+        Assert.False(buf.IsAltScreen);
+        Assert.Equal(3, buf.CursorRow);
+        Assert.Equal(5, buf.CursorCol);
+    }
+
+    [Fact]
+    public void AltScreen_1049_ReEntryWhileAlreadyOnAltIsNoOp()
+    {
+        // DECSET 1049 while already on alt shouldn't re-save (would
+        // capture the alt cursor and corrupt the primary-restore).
+        var buf = NewBuffer(20, 8);
+        buf.Feed(CSI + "3;3H");           // primary cursor (2,2)
+        buf.Feed(CSI + "?1049h");         // save primary, enter alt
+        buf.Feed(CSI + "5;5H");           // alt cursor (4,4)
+        buf.Feed(CSI + "?1049h");         // redundant — must not re-save
+        buf.Feed(CSI + "?1049l");         // leave alt
+        // Original primary cursor should be restored.
+        Assert.Equal(2, buf.CursorRow);
+        Assert.Equal(2, buf.CursorCol);
+    }
+
+    [Fact]
     public void DECKPAM_EnablesAppKeypad()
     {
         var buf = NewBuffer();

@@ -120,6 +120,17 @@ public class TerminalControl : Control, IDisposable
 
     private readonly object _processWatchLock = new();
     private readonly HashSet<int> _watchedPids = new();
+    // Recently-emitted exit pids, used to suppress duplicate
+    // ProcessTreeChangeKind.Exited events. Both Windows (WMI's
+    // deletion filter matching either ParentProcessId or ProcessId)
+    // and the kqueue chain-watch pattern can surface a process's
+    // death from two angles — its own watcher and its parent's.
+    // Bounded at ExitPidMemory to keep the set from growing
+    // unbounded on long-running sessions; on overflow we drop the
+    // whole set (worst case: the next dup would slip through, which
+    // is acceptable).
+    private readonly HashSet<int> _recentlyExitedPids = new();
+    private const int ExitPidMemory = 1024;
     private IProcessChildWatcher? _processWatcher;
     private int _processTreeSubscribers;
     private int _rootProcessId;
@@ -199,6 +210,10 @@ public class TerminalControl : Control, IDisposable
         var w = _processWatcher;
         _processWatcher = null;
         _watchedPids.Clear();
+        // Drop the recent-exit memory too — the watcher is gone, and
+        // a future session shouldn't inherit stale suppression for
+        // pids the OS might reuse.
+        _recentlyExitedPids.Clear();
         // Note: _processTreeSubscribers is not reset here — the
         // subscriber count is maintained by the event add/remove
         // accessors, not by us.
@@ -210,6 +225,13 @@ public class TerminalControl : Control, IDisposable
     private void Watch_Locked(int pid)
     {
         if (pid <= 0) return;
+        // Whenever we start tracking a pid — root-pid set, chain-watch
+        // of a Created child, re-targeting after RootProcessId
+        // change — purge any stale "recently exited" memory for that
+        // pid. Without this, a reused root pid could have its next
+        // exit suppressed as a dup (root pids never come through the
+        // Created-event path that normally clears the entry).
+        _recentlyExitedPids.Remove(pid);
         if (!_watchedPids.Add(pid)) return;
         try { _processWatcher?.Watch(pid); } catch (Exception ex)
         { TerminalLog.Error($"[TerminalControl] Watch({pid}) failed: {ex.Message}"); }
@@ -224,6 +246,10 @@ public class TerminalControl : Control, IDisposable
             { try { w.Unwatch(p); } catch { } }
         }
         _watchedPids.Clear();
+        // Re-targeting to a new root — start the dup-suppression
+        // memory fresh so a pid from the previous session can't
+        // silently mask an exit in the new one.
+    _recentlyExitedPids.Clear();
     }
 
     /// <summary>Watcher callback. Fires on a backend thread (kqueue
@@ -237,11 +263,22 @@ public class TerminalControl : Control, IDisposable
     {
         if (change.Kind == ProcessTreeChangeKind.Created)
         {
+            // Watch_Locked clears the "recently exited" entry for
+            // this pid as part of its normal setup, so a pid reused
+            // after an earlier exit isn't silently suppressed here.
             lock (_processWatchLock) Watch_Locked(change.Pid);
         }
         else // Exited
         {
-            lock (_processWatchLock) _watchedPids.Remove(change.Pid);
+            bool duplicate;
+            lock (_processWatchLock)
+            {
+                _watchedPids.Remove(change.Pid);
+                if (_recentlyExitedPids.Count >= ExitPidMemory)
+                    _recentlyExitedPids.Clear();
+                duplicate = !_recentlyExitedPids.Add(change.Pid);
+            }
+            if (duplicate) return;
         }
 
         if (_processTreeChangedInner == null) return;
@@ -343,15 +380,35 @@ public class TerminalControl : Control, IDisposable
 
     // ---- PTY I/O ----
 
+    /// <summary>Feed bytes from your byte source (PTY, SSH channel,
+    /// replay stream, …) into the terminal. Safe to call from any
+    /// thread: when invoked from a non-UI thread the payload is copied
+    /// and dispatched onto the Avalonia UI thread. Calling from the UI
+    /// thread is zero-copy.</summary>
     public void Write(ReadOnlySpan<byte> bytes)
+    {
+        if (Dispatcher.UIThread.CheckAccess())
+        {
+            WriteOnUi(bytes);
+        }
+        else
+        {
+            // ReadOnlySpan<byte> can't be captured in a closure, so
+            // snapshot the bytes into an owned array for the dispatch.
+            var copy = bytes.ToArray();
+            Dispatcher.UIThread.Post(() => WriteOnUi(copy));
+        }
+    }
+
+    public void Write(byte[] bytes) => Write(bytes.AsSpan());
+
+    private void WriteOnUi(ReadOnlySpan<byte> bytes)
     {
         _buffer.Write(bytes);
         var replies = _buffer.TakeReplies();
         if (replies != null) Output?.Invoke(this, replies);
         if (_buffer.Revision != _lastRevision) InvalidateVisual();
     }
-
-    public void Write(byte[] bytes) => Write(bytes.AsSpan());
 
     /// <summary>Hard cap on paste payload size. Past this the paste
     /// is silently dropped — shells don't handle a 100 MiB paste

@@ -947,8 +947,17 @@ public sealed class TerminalBuffer : IParserActions
 
     private void EnterAlt(bool saveCursor)
     {
-        if (saveCursor) _alternateSaved = SnapshotCursor();
+        // DECSET 1049 only has effect when we're actually switching
+        // screens — if we're already on alt, don't overwrite the
+        // saved-cursor slot with the alt screen's cursor.
         if (_active == _alternate) return;
+        // 1049 semantics: "save cursor as in DECSC" — i.e. into the
+        // primary screen's DECSC slot, the one we'll restore from on
+        // 1049-reset. Saving to the *alt* slot (as an earlier version
+        // did) was racy because DECSC inside the alt screen also
+        // writes there, overwriting the 1049 anchor before the app
+        // ever leaves alt mode.
+        if (saveCursor) _primarySaved = SnapshotCursor();
         _active = _alternate;
         _active.Clear();
         ScrollTop = 0; ScrollBottom = Rows - 1;
@@ -959,7 +968,7 @@ public sealed class TerminalBuffer : IParserActions
         if (_active != _alternate) return;
         _active = _primary;
         ScrollTop = 0; ScrollBottom = Rows - 1;
-        if (restoreCursor) ApplyCursor(_alternateSaved);
+        if (restoreCursor) ApplyCursor(_primarySaved);
     }
 
     private void CarriageReturn() => CursorCol = 0;
