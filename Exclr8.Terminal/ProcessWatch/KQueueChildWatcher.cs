@@ -51,8 +51,7 @@ internal sealed class KQueueChildWatcher : IProcessChildWatcher
     private readonly object _childrenLock = new();
     private bool _disposed;
 
-    public event Action<ProcessChildEvent>? ChildCreated;
-    public event Action<int>? ProcessExited;
+    public event Action<ProcessTreeChange>? TreeChanged;
 
     public bool IsEventDriven => true;
 
@@ -160,7 +159,15 @@ internal sealed class KQueueChildWatcher : IProcessChildWatcher
 
                 if ((f & NOTE_EXIT) != 0)
                 {
-                    try { ProcessExited?.Invoke(pid); }
+                    try
+                    {
+                        TreeChanged?.Invoke(new ProcessTreeChange(
+                            Kind:        ProcessTreeChangeKind.Exited,
+                            Pid:         pid,
+                            ParentPid:   0,
+                            Name:        null,
+                            CommandLine: null));
+                    }
                     catch (Exception ex) { TerminalLog.Error($"[KQueueChildWatcher] exit dispatch: {ex.Message}"); }
                     _watched.TryRemove(pid, out _);
                     lock (_childrenLock) _lastChildren.Remove(pid);
@@ -181,8 +188,9 @@ internal sealed class KQueueChildWatcher : IProcessChildWatcher
                         string? name = LookupProcessName(child);
                         try
                         {
-                            ChildCreated?.Invoke(new ProcessChildEvent(
-                                ChildPid:    child,
+                            TreeChanged?.Invoke(new ProcessTreeChange(
+                                Kind:        ProcessTreeChangeKind.Created,
+                                Pid:         child,
                                 ParentPid:   pid,
                                 Name:        name,
                                 CommandLine: null));

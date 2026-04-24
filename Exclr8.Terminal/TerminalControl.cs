@@ -9,6 +9,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Platform.Storage;
+using Avalonia.Reactive;
 using Avalonia.Threading;
 using Exclr8.Terminal.Buffer;
 using Exclr8.Terminal.Input;
@@ -183,8 +184,7 @@ public class TerminalControl : Control, IDisposable
         try
         {
             var w = ProcessChildWatcherFactory.Create();
-            w.ChildCreated  += OnWatcherChildCreated;
-            w.ProcessExited += OnWatcherProcessExited;
+            w.TreeChanged += OnWatcherTreeChanged;
             _processWatcher = w;
             if (_rootProcessId > 0) Watch_Locked(_rootProcessId);
         }
@@ -203,8 +203,7 @@ public class TerminalControl : Control, IDisposable
         // subscriber count is maintained by the event add/remove
         // accessors, not by us.
         if (w == null) return;
-        w.ChildCreated  -= OnWatcherChildCreated;
-        w.ProcessExited -= OnWatcherProcessExited;
+        w.TreeChanged -= OnWatcherTreeChanged;
         try { w.Dispose(); } catch { }
     }
 
@@ -227,51 +226,32 @@ public class TerminalControl : Control, IDisposable
         _watchedPids.Clear();
     }
 
-    private void OnWatcherChildCreated(ProcessChildEvent e)
+    /// <summary>Watcher callback. Fires on a backend thread (kqueue
+    /// pump on macOS, WMI callback pool on Windows). We do the
+    /// watch-bookkeeping synchronously here (chain-watch new children,
+    /// forget exited ones) so fast fork/exit races don't slip through,
+    /// then marshal the public event onto the Avalonia dispatcher —
+    /// subscribers almost certainly touch UI state (badges, menus,
+    /// session tags).</summary>
+    private void OnWatcherTreeChanged(ProcessTreeChange change)
     {
-        // Chain-watch so the next generation of forks surfaces too.
-        // Do this synchronously on the pump thread (backed by the
-        // lock) so a grandchild spawned back-to-back with its parent
-        // isn't missed.
-        lock (_processWatchLock) Watch_Locked(e.ChildPid);
+        if (change.Kind == ProcessTreeChangeKind.Created)
+        {
+            lock (_processWatchLock) Watch_Locked(change.Pid);
+        }
+        else // Exited
+        {
+            lock (_processWatchLock) _watchedPids.Remove(change.Pid);
+        }
 
         if (_processTreeChangedInner == null) return;
-        var change = new ProcessTreeChange(
-            Kind:        ProcessTreeChangeKind.Created,
-            Pid:         e.ChildPid,
-            ParentPid:   e.ParentPid,
-            Name:        e.Name,
-            CommandLine: e.CommandLine);
-        DispatchToUi(change, "created");
-    }
-
-    private void OnWatcherProcessExited(int pid)
-    {
-        lock (_processWatchLock) _watchedPids.Remove(pid);
-        if (_processTreeChangedInner == null) return;
-        var change = new ProcessTreeChange(
-            Kind:        ProcessTreeChangeKind.Exited,
-            Pid:         pid,
-            ParentPid:   0,
-            Name:        null,
-            CommandLine: null);
-        DispatchToUi(change, "exited");
-    }
-
-    /// <summary>Subscribers to <see cref="ProcessTreeChanged"/> almost
-    /// certainly touch UI state (badges, labels, menu items). The
-    /// underlying watchers fire on non-UI threads (kqueue pump on
-    /// macOS, WMI callback pool on Windows), so we marshal onto the
-    /// Avalonia dispatcher before raising the event.</summary>
-    private void DispatchToUi(ProcessTreeChange change, string kind)
-    {
         Dispatcher.UIThread.Post(() =>
         {
             try { _processTreeChangedInner?.Invoke(change); }
             catch (Exception ex)
             {
                 TerminalLog.Error(
-                    $"[TerminalControl] ProcessTreeChanged {kind} dispatch: {ex.Message}");
+                    $"[TerminalControl] ProcessTreeChanged {change.Kind} dispatch: {ex.Message}");
             }
         });
     }
@@ -302,7 +282,7 @@ public class TerminalControl : Control, IDisposable
         _buffer.Changed += (_, _) => InvalidateVisual();
 
         this.GetObservable(BoundsProperty)
-            .Subscribe(new ActionObserver<Rect>(_ => RecomputeGrid()));
+            .Subscribe(new AnonymousObserver<Rect>(_ => RecomputeGrid()));
 
         _blinkTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         _blinkTimer.Tick += (_, _) =>
@@ -1114,17 +1094,6 @@ public class TerminalControl : Control, IDisposable
         var replies = _buffer.TakeReplies();
         if (replies != null) Output?.Invoke(this, replies);
         InvalidateVisual();
-    }
-
-    // ---- Helpers ----
-
-    private sealed class ActionObserver<T> : IObserver<T>
-    {
-        private readonly Action<T> _f;
-        public ActionObserver(Action<T> f) { _f = f; }
-        public void OnCompleted() { }
-        public void OnError(Exception e) { }
-        public void OnNext(T v) { _f(v); }
     }
 
     // ---- Disposal ----

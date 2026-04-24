@@ -10,8 +10,7 @@ namespace Exclr8.Terminal.ProcessWatch;
 /// care can fall back to their own triggered scans.</summary>
 internal sealed class NoopChildWatcher : IProcessChildWatcher
 {
-    public event Action<ProcessChildEvent>? ChildCreated { add { } remove { } }
-    public event Action<int>? ProcessExited { add { } remove { } }
+    public event Action<ProcessTreeChange>? TreeChanged { add { } remove { } }
     public bool IsEventDriven => false;
     public void Watch(int parentPid) { }
     public void Unwatch(int parentPid) { }

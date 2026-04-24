@@ -43,13 +43,28 @@ public sealed class TerminalBuffer : IParserActions
 
     private readonly VtParser _parser;
 
-    // Saved cursor state — primary and alternate buffers each keep
+    // Saved cursor state — primary and alternate screens each keep
     // their own snapshot so DECSC/DECRC while toggling alt screens
-    // doesn't clobber the other buffer's saved position.
-    private int _savedRow, _savedCol;
-    private TerminalCell _savedPen;
-    private int _altSavedRow, _altSavedCol;
-    private TerminalCell _altSavedPen;
+    // doesn't clobber the other screen's saved position.
+    private readonly struct SavedCursor
+    {
+        public int Row { get; init; }
+        public int Col { get; init; }
+        public TerminalCell Pen { get; init; }
+    }
+
+    private SavedCursor _primarySaved;
+    private SavedCursor _alternateSaved;
+
+    private SavedCursor SnapshotCursor() =>
+        new() { Row = CursorRow, Col = CursorCol, Pen = _pen };
+
+    private void ApplyCursor(SavedCursor s)
+    {
+        CursorRow = Clamp(s.Row, 0, Rows - 1);
+        CursorCol = Clamp(s.Col, 0, Cols - 1);
+        _pen      = s.Pen;
+    }
 
     // Scroll region (DECSTBM). 0-indexed, inclusive. Defaults to full screen.
     public int ScrollTop    { get; private set; }
@@ -85,52 +100,57 @@ public sealed class TerminalBuffer : IParserActions
     /// <summary>OSC 52 clipboard routing. Gated off by default because
     /// it lets remote processes silently scrape the host clipboard.
     /// The host opts in explicitly when it has user consent.</summary>
-    public bool AllowClipboardAccess  { get; set; }
+    public bool AllowClipboardAccess
+    {
+        get => _osc.AllowClipboardAccess;
+        set => _osc.AllowClipboardAccess = value;
+    }
 
     /// <summary>Default foreground reported to OSC 10 queries. Packed
-    /// as 0xRRGGBB. Host layers that theme the terminal (e.g. the
-    /// VibeCoder app) update this when the theme changes.</summary>
-    public uint DefaultForegroundRgb { get; set; } = 0xD0D0D0;
+    /// as 0xRRGGBB. Host layers that theme the terminal update this
+    /// when the colour scheme changes.</summary>
+    public uint DefaultForegroundRgb
+    {
+        get => _osc.DefaultForegroundRgb;
+        set => _osc.DefaultForegroundRgb = value;
+    }
 
     /// <summary>Default background for OSC 11 queries.</summary>
-    public uint DefaultBackgroundRgb { get; set; } = 0x1E1E1E;
+    public uint DefaultBackgroundRgb
+    {
+        get => _osc.DefaultBackgroundRgb;
+        set => _osc.DefaultBackgroundRgb = value;
+    }
 
     /// <summary>Cursor colour for OSC 12 queries.</summary>
-    public uint DefaultCursorRgb     { get; set; } = 0xD0D0D0;
-
-    /// <summary>Current 256-palette colours for OSC 4 queries. Array
-    /// is lazily populated on first read to avoid a static table
-    /// that would couple this layer to the renderer's theme.</summary>
-    private uint[]? _palette256;
+    public uint DefaultCursorRgb
+    {
+        get => _osc.DefaultCursorRgb;
+        set => _osc.DefaultCursorRgb = value;
+    }
 
     // Scrollback viewport. 0 = at bottom; positive = scrolled up into
     // scrollback. TerminalControl resets this to 0 on any keystroke.
-    // <see cref="PixelScrollOffset"/> carries the sub-line pixel
-    // remainder so the renderer can slide content smoothly — wheel
-    // events accumulate in pixel space and turn over into whole-line
-    // <see cref="ScrollOffset"/> bumps as they cross a line height.
-    public int ScrollOffset { get; private set; }
-    public double PixelScrollOffset { get; private set; }
+    // PixelScrollOffset carries the sub-line pixel remainder so the
+    // renderer can slide content smoothly — wheel events accumulate in
+    // pixel space and turn over into whole-line Offset bumps as they
+    // cross a line height.
+    private readonly ScrollViewport _viewport = new();
+    public int ScrollOffset => _viewport.Offset;
+    public double PixelScrollOffset => _viewport.PixelOffset;
 
     public TerminalSelection? Selection { get; private set; }
 
-    // ---- Find / search state ----
-    // Matches are stored in ABSOLUTE row coordinates: row 0 is the
-    // oldest scrollback row, row (ScrollbackCount + Rows - 1) is the
-    // bottom visible row. Rendering and navigation map these into
-    // whatever visual rows the current ScrollOffset is showing — stable
-    // even as the user scrolls.
-    public readonly record struct SearchMatch(int Row, int Col, int Length);
+    // Search state lives in its own type (snapshot-on-UI / scan-off-thread
+    // / apply-on-UI). Matches are in ABSOLUTE row coordinates (0 = oldest
+    // scrollback row) so they stay glued to content as the user scrolls.
+    private readonly SearchIndex _search = new();
+    public string? SearchNeedle => _search.Needle;
+    public IReadOnlyList<SearchMatch> SearchMatches => _search.Matches;
+    public int CurrentMatchIndex => _search.CurrentIndex;
 
-    public string? SearchNeedle { get; private set; }
-    private readonly List<SearchMatch> _matches = new();
-    public IReadOnlyList<SearchMatch> SearchMatches => _matches;
-    public int CurrentMatchIndex { get; private set; } = -1;
-
-    // OSC 8 hyperlinks.
-    private readonly Dictionary<ushort, string> _hyperlinks = new();
-    private ushort _nextHyperlinkId = 1;
-    private ushort _activeLinkId;
+    // OSC handling (title, palette, hyperlinks, clipboard, queries).
+    private readonly OscDispatcher _osc;
 
     // UTF-8 partial state for split chunks (unused now that the parser
     // handles it, but kept for future external Write(byte) callers).
@@ -146,10 +166,6 @@ public sealed class TerminalBuffer : IParserActions
     // HTS (ESC H) adds a stop, TBC (CSI g) clears.
     private bool[]? _tabStops;
 
-    // Window title buffer. Most recent OSC 0/1/2 payload — used to
-    // reply to CSI 21 t (report title).
-    private string _windowTitle = string.Empty;
-
     public byte[]? TakeReplies()
     {
         if (_pendingReplies.Count == 0) return null;
@@ -159,21 +175,27 @@ public sealed class TerminalBuffer : IParserActions
     }
 
     /// <summary>Fired when an OSC 0 or OSC 2 sets the window title.</summary>
-    public event EventHandler<string>? TitleChanged;
+    public event EventHandler<string>? TitleChanged
+    {
+        add    => _osc.TitleChanged += value;
+        remove => _osc.TitleChanged -= value;
+    }
 
     /// <summary>Fired when OSC 0 or OSC 1 sets the icon name. Most
     /// shells emit OSC 0 which sets both title and icon name.</summary>
-    public event EventHandler<string>? IconNameChanged;
+    public event EventHandler<string>? IconNameChanged
+    {
+        add    => _osc.IconNameChanged += value;
+        remove => _osc.IconNameChanged -= value;
+    }
 
     /// <summary>Fired when an OSC 52 ; c ; &lt;base64&gt; request
     /// arrives AND <see cref="AllowClipboardAccess"/> is true. The
     /// host decides whether to honour (copy to clipboard) or ignore.</summary>
-    public event EventHandler<ClipboardRequestEventArgs>? ClipboardRequested;
-
-    public sealed class ClipboardRequestEventArgs : EventArgs
+    public event EventHandler<ClipboardRequestEventArgs>? ClipboardRequested
     {
-        public string Text { get; }
-        public ClipboardRequestEventArgs(string text) { Text = text; }
+        add    => _osc.ClipboardRequested += value;
+        remove => _osc.ClipboardRequested -= value;
     }
 
     /// <summary>Host focus change. When DECSET 1004 (focus events) is
@@ -195,6 +217,7 @@ public sealed class TerminalBuffer : IParserActions
         _alternate = new ScreenBuffer(cols, rows, scrollbackLimit: 0);
         _active    = _primary;
         _parser    = new VtParser(this);
+        _osc       = new OscDispatcher(bytes => ReplyToPty(bytes));
         ScrollBottom = rows - 1;
     }
 
@@ -234,8 +257,7 @@ public sealed class TerminalBuffer : IParserActions
         CursorRow    = Math.Min(CursorRow, rows - 1);
         ScrollTop    = 0;
         ScrollBottom = rows - 1;
-        ScrollOffset = 0; // viewport must follow new bottom
-        PixelScrollOffset = 0;
+        _viewport.Reset(); // viewport must follow new bottom
         _tabStops = null; // rebuild with new column count
         Bump();
     }
@@ -250,50 +272,25 @@ public sealed class TerminalBuffer : IParserActions
 
     public void SetScrollOffset(int offset)
     {
-        int clamped = Math.Clamp(offset, 0, _active.Scrollback.Count);
-        if (clamped != ScrollOffset || PixelScrollOffset != 0)
-        {
-            ScrollOffset = clamped;
-            PixelScrollOffset = 0;
-            Bump();
-        }
+        if (_viewport.SetOffset(offset, _active.Scrollback.Count)) Bump();
     }
 
-    public void ScrollViewUp(int n)   => SetScrollOffset(ScrollOffset + n);
-    public void ScrollViewDown(int n) => SetScrollOffset(ScrollOffset - n);
+    public void ScrollViewUp(int n)   => SetScrollOffset(_viewport.Offset + n);
+    public void ScrollViewDown(int n) => SetScrollOffset(_viewport.Offset - n);
 
-    /// <summary>
-    /// Add <paramref name="pixels"/> to the scroll position (positive =
-    /// scroll up into scrollback, negative = scroll toward bottom).
-    /// Crosses into whole-line <see cref="ScrollOffset"/> bumps as the
-    /// accumulated pixel distance reaches <paramref name="lineHeight"/>.
-    /// Clamps to the scrollback bounds.
-    /// </summary>
+    /// <summary>Add <paramref name="pixels"/> to the scroll position
+    /// (positive = scroll up into scrollback, negative = scroll toward
+    /// the bottom). Crosses into whole-line bumps as the accumulated
+    /// pixel distance reaches <paramref name="lineHeight"/>. Clamps to
+    /// the scrollback bounds.</summary>
     public void ScrollByPixels(double pixels, double lineHeight)
     {
-        if (lineHeight <= 0) return;
-        double total  = ScrollOffset * lineHeight + PixelScrollOffset + pixels;
-        double maxTot = _active.Scrollback.Count * lineHeight;
-        total = Math.Clamp(total, 0.0, maxTot);
-
-        int   newOffset = (int)(total / lineHeight);
-        double newPixel = total - newOffset * lineHeight;
-        if (newOffset != ScrollOffset || Math.Abs(newPixel - PixelScrollOffset) > 0.01)
-        {
-            ScrollOffset      = newOffset;
-            PixelScrollOffset = newPixel;
-            Bump();
-        }
+        if (_viewport.AddPixels(pixels, lineHeight, _active.Scrollback.Count)) Bump();
     }
 
     public void ResetScrollOffset()
     {
-        if (ScrollOffset != 0 || PixelScrollOffset != 0)
-        {
-            ScrollOffset = 0;
-            PixelScrollOffset = 0;
-            Bump();
-        }
+        if (_viewport.Reset()) Bump();
     }
 
     /// <summary>Discard the scrollback buffer entirely (Cmd+K on macOS,
@@ -302,8 +299,7 @@ public sealed class TerminalBuffer : IParserActions
     public void ClearScrollback()
     {
         _active.ClearScrollback();
-        ScrollOffset = 0;
-        PixelScrollOffset = 0;
+        _viewport.Reset();
         Bump();
     }
 
@@ -316,7 +312,7 @@ public sealed class TerminalBuffer : IParserActions
     /// <summary>Convert a visual row (0 = top of current viewport) to
     /// the corresponding absolute row (0 = oldest scrollback).</summary>
     public int VisualToAbsRow(int visualRow) =>
-        _active.Scrollback.Count - ScrollOffset + visualRow;
+        _viewport.VisualToAbsRow(visualRow, _active.Scrollback.Count);
 
     public void StartSelection(int row, int col)
     {
@@ -386,7 +382,7 @@ public sealed class TerminalBuffer : IParserActions
             return;
         }
         var snap = SnapshotRows();
-        var matches = ScanMatches(snap, needle, System.Threading.CancellationToken.None);
+        var matches = SearchIndex.Scan(snap, needle, System.Threading.CancellationToken.None);
         ApplySearchResults(needle, matches);
     }
 
@@ -412,43 +408,24 @@ public sealed class TerminalBuffer : IParserActions
     /// returns quickly.</summary>
     public static List<SearchMatch> ScanMatches(
         TerminalCell[][] rows, string needle, System.Threading.CancellationToken ct)
-    {
-        var matches = new List<SearchMatch>();
-        for (int r = 0; r < rows.Length; r++)
-        {
-            ct.ThrowIfCancellationRequested();
-            var row = rows[r];
-            if (row != null) FindInRow(row, r, needle, matches);
-        }
-        return matches;
-    }
+        => SearchIndex.Scan(rows, needle, ct);
 
     /// <summary>Replace the current search results and pick the match
     /// nearest the viewport bottom so "next" moves forward from where
     /// the user is looking. Call on the UI thread.</summary>
     public void ApplySearchResults(string? needle, List<SearchMatch> matches)
     {
-        SearchNeedle = string.IsNullOrEmpty(needle) ? null : needle;
-        _matches.Clear();
-        _matches.AddRange(matches);
-        if (_matches.Count > 0)
-        {
-            int viewBottom = _active.Scrollback.Count + Rows - 1 - ScrollOffset;
-            CurrentMatchIndex = NearestMatchIndex(viewBottom);
-            ScrollCurrentMatchIntoView();
-        }
-        else
-        {
-            CurrentMatchIndex = -1;
-        }
+        int viewBottom = _active.Scrollback.Count + Rows - 1 - ScrollOffset;
+        _search.Set(needle, matches, viewBottom);
+        if (_search.Matches.Count > 0) ScrollCurrentMatchIntoView();
         Bump();
     }
 
     /// <summary>Advance to the next match, wrapping at the end.</summary>
     public void NextMatch()
     {
-        if (_matches.Count == 0) return;
-        CurrentMatchIndex = (CurrentMatchIndex + 1) % _matches.Count;
+        if (_search.Matches.Count == 0) return;
+        _search.Next();
         ScrollCurrentMatchIntoView();
         Bump();
     }
@@ -456,8 +433,8 @@ public sealed class TerminalBuffer : IParserActions
     /// <summary>Go to the previous match, wrapping at the start.</summary>
     public void PrevMatch()
     {
-        if (_matches.Count == 0) return;
-        CurrentMatchIndex = (CurrentMatchIndex - 1 + _matches.Count) % _matches.Count;
+        if (_search.Matches.Count == 0) return;
+        _search.Prev();
         ScrollCurrentMatchIntoView();
         Bump();
     }
@@ -465,10 +442,8 @@ public sealed class TerminalBuffer : IParserActions
     /// <summary>Drop the search state and hide match highlights.</summary>
     public void ClearSearch()
     {
-        if (SearchNeedle == null && _matches.Count == 0) return;
-        SearchNeedle = null;
-        _matches.Clear();
-        CurrentMatchIndex = -1;
+        if (_search.Needle == null && _search.Matches.Count == 0) return;
+        _search.Clear();
         Bump();
     }
 
@@ -479,74 +454,17 @@ public sealed class TerminalBuffer : IParserActions
         return screen >= 0 && screen < Rows ? _active.GetRow(screen) : null;
     }
 
-    private static void FindInRow(TerminalCell[] row, int absRow,
-        string needle, List<SearchMatch> into)
-    {
-        // Decode cells to a string so multi-cell wide glyphs and runs
-        // of blanks search naturally. Astral-plane runes (most emoji,
-        // CJK Ext B+) encode as a surrogate pair — two chars in the
-        // haystack but one cell — so we keep a parallel column map to
-        // translate match offsets back to cell coordinates.
-        var sb = new StringBuilder(row.Length);
-        var colMap = new int[row.Length * 2];
-        int mapLen = 0;
-        for (int i = 0; i < row.Length; i++)
-        {
-            int rune = row[i].Rune;
-            if (rune == 0)
-            {
-                sb.Append(' ');
-                colMap[mapLen++] = i;
-            }
-            else if (rune <= 0xFFFF)
-            {
-                sb.Append((char)rune);
-                colMap[mapLen++] = i;
-            }
-            else
-            {
-                sb.Append(char.ConvertFromUtf32(rune));
-                colMap[mapLen++] = i;
-                colMap[mapLen++] = i;
-            }
-        }
-        var haystack = sb.ToString();
-        int from = 0;
-        while (from <= haystack.Length - needle.Length)
-        {
-            int idx = haystack.IndexOf(needle, from, StringComparison.OrdinalIgnoreCase);
-            if (idx < 0) break;
-            int startCell = colMap[idx];
-            int endCell   = colMap[idx + needle.Length - 1];
-            into.Add(new SearchMatch(absRow, startCell, endCell - startCell + 1));
-            from = idx + Math.Max(1, needle.Length);
-        }
-    }
-
-    private int NearestMatchIndex(int absRowNear)
-    {
-        int best = 0, bestDist = int.MaxValue;
-        for (int i = 0; i < _matches.Count; i++)
-        {
-            int d = Math.Abs(_matches[i].Row - absRowNear);
-            if (d < bestDist) { bestDist = d; best = i; }
-        }
-        return best;
-    }
-
     private void ScrollCurrentMatchIntoView()
     {
-        if (CurrentMatchIndex < 0 || CurrentMatchIndex >= _matches.Count) return;
+        int? absRow = _search.CurrentRow;
+        if (absRow == null) return;
         int sbCount = _active.Scrollback.Count;
-        int absRow  = _matches[CurrentMatchIndex].Row;
-
-        // Desired scroll offset: want the match at absRow to be
-        // visible. Viewport shows absolute rows
+        // Viewport shows absolute rows
         //   [sbCount + Rows - 1 - ScrollOffset - Rows + 1,
         //    sbCount + Rows - 1 - ScrollOffset]
-        // → keep absRow somewhere in the middle. Aim for middle of view.
+        // → keep absRow near the middle so there's context above + below.
         int bottomAbs = sbCount + Rows - 1;
-        int desired   = bottomAbs - absRow - Rows / 2;
+        int desired   = bottomAbs - absRow.Value - Rows / 2;
         desired = Math.Clamp(desired, 0, sbCount);
         SetScrollOffset(desired);
     }
@@ -581,7 +499,7 @@ public sealed class TerminalBuffer : IParserActions
     }
 
     public bool TryGetHyperlink(ushort id, out string url) =>
-        _hyperlinks.TryGetValue(id, out url!);
+        _osc.TryGetHyperlink(id, out url);
 
     // ---- IParserActions ----
 
@@ -614,7 +532,7 @@ public sealed class TerminalBuffer : IParserActions
         var row  = _active.GetRow(CursorRow);
         var cell = _pen;
         cell.Rune        = rune;
-        cell.HyperlinkId = _activeLinkId;
+        cell.HyperlinkId = _osc.ActiveLinkId;
 
         // IRM (insert mode): shift the row right by `width` before
         // writing. Cells pushed past the right margin are discarded.
@@ -666,7 +584,7 @@ public sealed class TerminalBuffer : IParserActions
                 var cont = _pen;
                 cont.Rune        = 0;
                 cont.Flags2      = CellFlags2.IsContinuation | penExtras;
-                cont.HyperlinkId = _activeLinkId;
+                cont.HyperlinkId = _osc.ActiveLinkId;
                 row[CursorCol + 1] = cont;
             }
             CursorCol += 2;
@@ -812,35 +730,7 @@ public sealed class TerminalBuffer : IParserActions
         }
     }
 
-    public void OscDispatch(string payload)
-    {
-        int semi = payload.IndexOf(';');
-        if (semi < 0) return;
-        if (!int.TryParse(payload.AsSpan(0, semi), out int cmd)) return;
-        var data = payload.Substring(semi + 1);
-        switch (cmd)
-        {
-            case 0:
-                // OSC 0 sets both window title and icon name.
-                _windowTitle = data;
-                TitleChanged?.Invoke(this, data);
-                IconNameChanged?.Invoke(this, data);
-                return;
-            case 1:
-                IconNameChanged?.Invoke(this, data);
-                return;
-            case 2:
-                _windowTitle = data;
-                TitleChanged?.Invoke(this, data);
-                return;
-            case 4:  HandleOsc4 (data); return;
-            case 8:  HandleOsc8 (data); return;
-            case 10: HandleOscSpecialColor(10, () => DefaultForegroundRgb, v => DefaultForegroundRgb = v, data); return;
-            case 11: HandleOscSpecialColor(11, () => DefaultBackgroundRgb, v => DefaultBackgroundRgb = v, data); return;
-            case 12: HandleOscSpecialColor(12, () => DefaultCursorRgb,     v => DefaultCursorRgb     = v, data); return;
-            case 52: HandleOsc52(data); return;
-        }
-    }
+    public void OscDispatch(string payload) => _osc.Dispatch(payload);
 
     public void ReplyToPty(ReadOnlySpan<byte> bytes)
     {
@@ -943,9 +833,9 @@ public sealed class TerminalBuffer : IParserActions
         ScrollBottom  = Rows - 1;
         InsertMode    = false;
         OriginMode    = false;
-        _pen   = TerminalCell.Blank;
-        _savedRow = _savedCol = 0; _savedPen = TerminalCell.Blank;
-        _altSavedRow = _altSavedCol = 0; _altSavedPen = TerminalCell.Blank;
+        _pen = TerminalCell.Blank;
+        _primarySaved   = default;
+        _alternateSaved = default;
         _gSlots[0] = Charset.Ascii; _gSlots[1] = Charset.Ascii;
         _activeG = 0;
     }
@@ -973,146 +863,16 @@ public sealed class TerminalBuffer : IParserActions
                 ReplyAscii($"\x1b[9;{Rows};{Cols}t");
                 return;
             case 20: // report icon name via OSC L
-                ReplyAscii("\x1b]L" + _windowTitle + "\x1b\\");
+                ReplyAscii("\x1b]L" + _osc.WindowTitle + "\x1b\\");
                 return;
             case 21: // report window title via OSC l
-                ReplyAscii("\x1b]l" + _windowTitle + "\x1b\\");
+                ReplyAscii("\x1b]l" + _osc.WindowTitle + "\x1b\\");
                 return;
             // All other ops (resize, move, raise, etc.) are no-ops.
         }
     }
 
     // ---- OSC 4: palette entry query/set. OSC 10/11/12: fg/bg/cursor ----
-
-    private uint[] EnsurePalette256()
-    {
-        if (_palette256 != null) return _palette256;
-        // Mirror the renderer's palette so OSC 4 queries report exactly
-        // what's on screen. OSC 4 *set* writes to this local copy; it
-        // does not currently propagate into the renderer's static
-        // palette (a single mutable per-instance render palette is
-        // tracked as follow-up work).
-        _palette256 = new uint[256];
-        for (int i = 0; i < 256; i++)
-        {
-            var c = TerminalPalette.Indexed[i];
-            _palette256[i] = (uint)((c.R << 16) | (c.G << 8) | c.B);
-        }
-        return _palette256;
-    }
-
-    private void HandleOsc4(string data)
-    {
-        // Payload is "idx;spec[;idx;spec...]". If spec == "?" we reply
-        // with the current rgb: form; otherwise parse + set.
-        var parts = data.Split(';');
-        for (int i = 0; i + 1 < parts.Length; i += 2)
-        {
-            if (!int.TryParse(parts[i], out int idx) || idx < 0 || idx > 255) continue;
-            var spec = parts[i + 1];
-            if (spec == "?")
-            {
-                var pal = EnsurePalette256();
-                ReplyAscii($"\x1b]4;{idx};{RgbSpec(pal[idx])}\x1b\\");
-            }
-            else if (TryParseRgbSpec(spec, out var rgb))
-            {
-                EnsurePalette256()[idx] = rgb;
-            }
-        }
-    }
-
-    private void HandleOscSpecialColor(int cmd, Func<uint> getter, Action<uint> setter, string data)
-    {
-        // Data is either "?" (query) or an rgb:RRRR/GGGG/BBBB (or
-        // #RRGGBB) spec to set.
-        if (data == "?")
-        {
-            ReplyAscii($"\x1b]{cmd};{RgbSpec(getter())}\x1b\\");
-        }
-        else if (TryParseRgbSpec(data, out var rgb))
-        {
-            setter(rgb);
-        }
-    }
-
-    private void HandleOsc52(string data)
-    {
-        // Syntax: "clipboards;payload". Payload is base64 for set or
-        // "?" for get. We gate both behind AllowClipboardAccess; get
-        // isn't wired (the host decides whether to leak data back).
-        if (!AllowClipboardAccess) return;
-        int semi = data.IndexOf(';');
-        if (semi < 0) return;
-        var body = data.Substring(semi + 1);
-        if (body == "?") return; // get-from-clipboard requests are ignored
-        string decoded;
-        try
-        {
-            var bytes = Convert.FromBase64String(body);
-            decoded = Encoding.UTF8.GetString(bytes);
-        }
-        catch (FormatException)
-        {
-            return;
-        }
-        ClipboardRequested?.Invoke(this, new ClipboardRequestEventArgs(decoded));
-    }
-
-    private static string RgbSpec(uint rgb)
-    {
-        int r = (int)((rgb >> 16) & 0xFF);
-        int g = (int)((rgb >>  8) & 0xFF);
-        int b = (int)( rgb        & 0xFF);
-        // xterm replies with 16-bit components so most consumers work
-        // even when they expect the VT5xx format. Repeat the 8-bit
-        // value in both halves (e.g. 0xAB → 0xABAB).
-        return $"rgb:{r:x2}{r:x2}/{g:x2}{g:x2}/{b:x2}{b:x2}";
-    }
-
-    private static bool TryParseRgbSpec(string spec, out uint rgb)
-    {
-        rgb = 0;
-        if (spec.StartsWith('#') && (spec.Length == 7 || spec.Length == 13))
-        {
-            // #RRGGBB or #RRRRGGGGBBBB — take the high byte of each.
-            int step = spec.Length == 7 ? 2 : 4;
-            if (!int.TryParse(spec.AsSpan(1,         2), System.Globalization.NumberStyles.HexNumber, null, out int r)) return false;
-            if (!int.TryParse(spec.AsSpan(1+step,    2), System.Globalization.NumberStyles.HexNumber, null, out int g)) return false;
-            if (!int.TryParse(spec.AsSpan(1+step*2,  2), System.Globalization.NumberStyles.HexNumber, null, out int b)) return false;
-            rgb = (uint)((r << 16) | (g << 8) | b);
-            return true;
-        }
-        if (spec.StartsWith("rgb:", StringComparison.Ordinal))
-        {
-            var parts = spec.Substring(4).Split('/');
-            if (parts.Length != 3) return false;
-            if (!TryTopByte(parts[0], out int r)) return false;
-            if (!TryTopByte(parts[1], out int g)) return false;
-            if (!TryTopByte(parts[2], out int b)) return false;
-            rgb = (uint)((r << 16) | (g << 8) | b);
-            return true;
-        }
-        return false;
-    }
-
-    private static bool TryTopByte(string hex, out int value)
-    {
-        value = 0;
-        if (hex.Length == 0 || hex.Length > 4) return false;
-        if (!int.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out int raw)) return false;
-        // Scale to 8-bit by taking the top byte of the hex length.
-        int scaled = hex.Length switch
-        {
-            1 => raw * 0x11,
-            2 => raw,
-            3 => (raw >> 4),
-            4 => (raw >> 8),
-            _ => raw,
-        };
-        value = scaled & 0xFF;
-        return true;
-    }
 
     private void ReplyAscii(string s) => ReplyToPty(Encoding.ASCII.GetBytes(s));
 
@@ -1167,32 +927,9 @@ public sealed class TerminalBuffer : IParserActions
         }
     }
 
-    private void HandleOsc8(string data)
-    {
-        // OSC 8 payload is "params;URL". Empty URL closes the active link.
-        int semi = data.IndexOf(';');
-        if (semi < 0) { _activeLinkId = 0; return; }
-        string url = data.Substring(semi + 1);
-        if (string.IsNullOrEmpty(url))
-        {
-            _activeLinkId = 0;
-        }
-        else
-        {
-            _activeLinkId = _nextHyperlinkId++;
-            if (_nextHyperlinkId == 0) _nextHyperlinkId = 1;
-            _hyperlinks[_activeLinkId] = url;
-        }
-    }
-
     private void EnterAlt(bool saveCursor)
     {
-        if (saveCursor)
-        {
-            _altSavedRow = CursorRow;
-            _altSavedCol = CursorCol;
-            _altSavedPen = _pen;
-        }
+        if (saveCursor) _alternateSaved = SnapshotCursor();
         if (_active == _alternate) return;
         _active = _alternate;
         _active.Clear();
@@ -1204,12 +941,7 @@ public sealed class TerminalBuffer : IParserActions
         if (_active != _alternate) return;
         _active = _primary;
         ScrollTop = 0; ScrollBottom = Rows - 1;
-        if (restoreCursor)
-        {
-            CursorRow   = Clamp(_altSavedRow, 0, Rows - 1);
-            CursorCol   = Clamp(_altSavedCol, 0, Cols - 1);
-            _pen = _altSavedPen;
-        }
+        if (restoreCursor) ApplyCursor(_alternateSaved);
     }
 
     private void CarriageReturn() => CursorCol = 0;
@@ -1298,27 +1030,12 @@ public sealed class TerminalBuffer : IParserActions
 
     private void SaveCursor()
     {
-        if (_active == _alternate)
-        { _altSavedRow = CursorRow; _altSavedCol = CursorCol; _altSavedPen = _pen; }
-        else
-        { _savedRow    = CursorRow; _savedCol    = CursorCol; _savedPen    = _pen; }
+        if (_active == _alternate) _alternateSaved = SnapshotCursor();
+        else                        _primarySaved   = SnapshotCursor();
     }
 
-    private void RestoreCursor()
-    {
-        if (_active == _alternate)
-        {
-            CursorRow   = Clamp(_altSavedRow, 0, Rows - 1);
-            CursorCol   = Clamp(_altSavedCol, 0, Cols - 1);
-            _pen = _altSavedPen;
-        }
-        else
-        {
-            CursorRow   = Clamp(_savedRow, 0, Rows - 1);
-            CursorCol   = Clamp(_savedCol, 0, Cols - 1);
-            _pen = _savedPen;
-        }
-    }
+    private void RestoreCursor() =>
+        ApplyCursor(_active == _alternate ? _alternateSaved : _primarySaved);
 
     private void FullReset()
     {
@@ -1335,11 +1052,10 @@ public sealed class TerminalBuffer : IParserActions
         ApplicationCursorKeys = false; ApplicationKeypad = false;
         AutoWrap = true; OriginMode = false; ReverseVideo = false;
         InsertMode = false; LineFeedNewLine = false;
-        ScrollOffset = 0; Selection = null;
-        _activeLinkId = 0; _hyperlinks.Clear();
+        _viewport.Reset(); Selection = null;
+        _osc.Reset();
         _tabStops = null; // will rebuild with defaults on next access
         _lastPrintRune = 0;
-        _windowTitle = string.Empty;
         _parser.Reset();
     }
 

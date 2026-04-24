@@ -30,8 +30,7 @@ internal sealed class WmiChildWatcher : IProcessChildWatcher
     private readonly Dictionary<int, Entry> _watchers = new();
     private bool _disposed;
 
-    public event Action<ProcessChildEvent>? ChildCreated;
-    public event Action<int>? ProcessExited;
+    public event Action<ProcessTreeChange>? TreeChanged;
 
     public bool IsEventDriven => true;
 
@@ -92,7 +91,12 @@ internal sealed class WmiChildWatcher : IProcessChildWatcher
                 string? cmd   = target["CommandLine"] as string;
                 if (childPid > 0)
                 {
-                    ChildCreated?.Invoke(new ProcessChildEvent(childPid, parent, name, cmd));
+                    TreeChanged?.Invoke(new ProcessTreeChange(
+                        Kind:        ProcessTreeChangeKind.Created,
+                        Pid:         childPid,
+                        ParentPid:   parent,
+                        Name:        name,
+                        CommandLine: cmd));
                 }
             }
             catch (Exception ex)
@@ -121,7 +125,15 @@ internal sealed class WmiChildWatcher : IProcessChildWatcher
                 using var target = (ManagementBaseObject)e.NewEvent["TargetInstance"];
                 if (target == null) return;
                 int pid = unchecked((int)Convert.ToUInt32(target["ProcessId"] ?? 0u));
-                if (pid > 0) ProcessExited?.Invoke(pid);
+                if (pid > 0)
+                {
+                    TreeChanged?.Invoke(new ProcessTreeChange(
+                        Kind:        ProcessTreeChangeKind.Exited,
+                        Pid:         pid,
+                        ParentPid:   0,
+                        Name:        null,
+                        CommandLine: null));
+                }
             }
             catch (Exception ex)
             {
