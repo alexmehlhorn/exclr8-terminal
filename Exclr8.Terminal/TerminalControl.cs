@@ -289,11 +289,15 @@ public class TerminalControl : Control, IDisposable
         {
             _blinkVisible          = !_blinkVisible;
             _renderer.BlinkVisible = _blinkVisible;
-            // Unconditional repaint every tick. We don't walk the grid
-            // to check whether any cell carries SGR 5 (Blink); cheap
-            // enough at 2 Hz, and covers both blinking-cursor and
-            // blinking-content cases without extra state tracking.
-            InvalidateVisual();
+            // Only repaint when something actually blinks: a blink-style
+            // cursor, or a cell laid down under SGR 5/6 (tracked via
+            // TerminalBuffer.HasBlinkContent — sticky-set in Print,
+            // cleared on RIS/DECSTR). Lets an idle terminal that never
+            // uses blink skip the 2 Hz full-render entirely.
+            var s = _buffer.CursorStyle;
+            bool cursorBlinks = _buffer.CursorVisible &&
+                s is CursorStyle.BlockBlink or CursorStyle.UnderlineBlink or CursorStyle.BarBlink;
+            if (cursorBlinks || _buffer.HasBlinkContent) InvalidateVisual();
         };
         _blinkTimer.Start();
 
@@ -365,30 +369,33 @@ public class TerminalControl : Control, IDisposable
     {
         if (string.IsNullOrEmpty(text)) return;
         if (text.IndexOf('\0') >= 0) return; // binary payload — refuse
-        var inner = Encoding.UTF8.GetBytes(text);
-        if (inner.Length > PasteMaxBytes) return;
 
         // Paste is about to push PTY bytes that will move the cursor
         // and almost certainly paint over wherever the selection was.
         // Drop the selection now so the stale highlight doesn't linger.
         _buffer.ClearSelection();
 
+        int innerBytes = Encoding.UTF8.GetByteCount(text);
+        if (innerBytes > PasteMaxBytes) return;
+
         byte[] payload;
         if (_buffer.BracketedPaste)
         {
-            // ESC[200~ text ESC[201~. Note: do NOT translate CR
-            // inside the brackets — bracketed paste intentionally
-            // lets the shell see the raw newlines so it can decide
-            // how to handle them (often, interpret them as input
-            // separators).
-            payload = new byte[inner.Length + 12];
+            // ESC[200~ text ESC[201~. Encode UTF-8 directly into the
+            // payload slice between the start/end markers — one byte[]
+            // allocation instead of two (intermediate GetBytes + a
+            // wrap-copy). Do NOT translate CR inside the brackets —
+            // bracketed paste intentionally lets the shell see raw
+            // newlines so it can decide how to handle them (often, as
+            // input separators).
+            payload = new byte[innerBytes + 12];
             "\x1b[200~"u8.CopyTo(payload);
-            inner.CopyTo(payload, 6);
-            "\x1b[201~"u8.CopyTo(payload.AsSpan(6 + inner.Length));
+            Encoding.UTF8.GetBytes(text, payload.AsSpan(6, innerBytes));
+            "\x1b[201~"u8.CopyTo(payload.AsSpan(6 + innerBytes));
         }
         else
         {
-            payload = inner;
+            payload = Encoding.UTF8.GetBytes(text);
         }
         RaiseInput(payload, InputLineOrigin.Pasted);
     }

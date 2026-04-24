@@ -563,10 +563,10 @@ public class WorkloadTortureTests
     }
 
     // ------------------------------------------------------------------
-    // Regression pinned from fuzz — currently a real bug in the buffer.
-    // Kept here [Fact(Skip=…)] so that when the fix lands we can drop
-    // the Skip and this test acts as the sentinel.
-    // See: /BUGS-FOUND.md #1.
+    // Regression sentinel: earlier fuzz found a case where a wide glyph
+    // overwriting the right half of an older wide glyph left an
+    // orphan IsContinuation cell two slots over. The fix lives in
+    // Print's wide-over-wide branch; this test locks it in.
     // ------------------------------------------------------------------
 
     [Fact]

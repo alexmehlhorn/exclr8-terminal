@@ -53,7 +53,13 @@ public sealed class VtParser
     private bool _inExtColorRun;
     private char _privatePrefix;
     private readonly StringBuilder _intermediates = new();
-    private readonly StringBuilder _oscBuffer = new();
+    // OSC payload accumulator — plain char[] + length instead of a
+    // StringBuilder so we can hand the payload to OscDispatch as a
+    // ReadOnlySpan<char>, avoiding a per-OSC string allocation.
+    // Grows up to OscMaxLength; consumers that need to retain the
+    // payload (title/URL storage) materialise a string themselves.
+    private char[] _oscBuffer = new char[256];
+    private int _oscLen;
 
     // UTF-8 accumulator — printable codepoints that span multiple bytes
     // are assembled here before dispatch to Print().
@@ -69,7 +75,7 @@ public sealed class VtParser
         _currentParam = 0;
         _privatePrefix = (char)0;
         _intermediates.Clear();
-        _oscBuffer.Clear();
+        _oscLen = 0;
         _utf8State = 0;
         _utf8Accum = 0;
     }
@@ -363,10 +369,10 @@ public sealed class VtParser
     private void EnterOsc()
     {
         _state = State.OscString;
-        _oscBuffer.Clear();
+        _oscLen = 0;
     }
 
-    /// <summary>Hard cap on accumulated OSC payload length (bytes).
+    /// <summary>Hard cap on accumulated OSC payload length (chars).
     /// Anything past this is silently dropped until the sequence
     /// terminator arrives — prevents a runaway emitter from blowing
     /// memory.</summary>
@@ -374,16 +380,26 @@ public sealed class VtParser
 
     private void OscString(byte b)
     {
-        if (b == 0x07) { _actions.OscDispatch(_oscBuffer.ToString()); _state = State.Ground; return; }
+        if (b == 0x07) { DispatchOsc(); _state = State.Ground; return; }
         if (b == 0x1B) { /* will be followed by \ for ST — we just end here for simplicity */
-            _actions.OscDispatch(_oscBuffer.ToString());
+            DispatchOsc();
             _state = State.Escape;
             _intermediates.Clear();
             return;
         }
         if (b < 0x20) return; // ignore other C0 in OSC
-        if (_oscBuffer.Length >= OscMaxLength) return;
-        _oscBuffer.Append((char)b);
+        if (_oscLen >= OscMaxLength) return;
+        if (_oscLen >= _oscBuffer.Length)
+        {
+            int next = Math.Min(_oscBuffer.Length * 2, OscMaxLength);
+            Array.Resize(ref _oscBuffer, next);
+        }
+        _oscBuffer[_oscLen++] = (char)b;
+    }
+
+    private void DispatchOsc()
+    {
+        _actions.OscDispatch(_oscBuffer.AsSpan(0, _oscLen));
     }
 
     // ------------------------------------------------------------------

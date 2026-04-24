@@ -29,9 +29,12 @@ public interface IParserActions
     /// <summary>An ESC dispatch — <c>ESC final</c> with possible intermediates.</summary>
     void EscDispatch(char final, string intermediates);
 
-    /// <summary>An OSC dispatch — <c>ESC ] ... BEL</c>. The bytes
-    /// between <c>]</c> and terminator are delivered as a string.</summary>
-    void OscDispatch(string payload);
+    /// <summary>An OSC dispatch — <c>ESC ] ... BEL</c>. The payload
+    /// span points into the parser's internal buffer and is valid
+    /// only for the duration of the call. Implementations that need
+    /// to retain the payload (window title, OSC 8 URL, clipboard
+    /// text) must materialise their own string.</summary>
+    void OscDispatch(ReadOnlySpan<char> payload);
 
     /// <summary>
     /// Request the terminal write bytes back to the PTY. Used for DSR

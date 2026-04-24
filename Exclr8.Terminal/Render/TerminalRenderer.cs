@@ -119,15 +119,20 @@ public sealed class TerminalRenderer
     // Typeface variants for the current typeface: index = (bold?1:0) | (italic?2:0).
     private readonly Typeface[] _typefaceVariants = new Typeface[4];
     // FormattedText layout is expensive to build; keep a bounded cache
-    // keyed on (text, typeface variant, size, fg). Flushed when it gets
-    // too big rather than running a full LRU.
-    private readonly Dictionary<TextKey, FormattedText> _textCache = new();
+    // keyed on a hash of (StringBuilder contents, variant, size, fg).
+    // Hashing the StringBuilder directly means a cache hit doesn't need
+    // to materialise a key string — we verify via char-by-char compare
+    // against the stored entry's text. Only a cache miss pays the
+    // ToString allocation. Flushed when full rather than running a
+    // full LRU.
+    private readonly Dictionary<int, TextCacheEntry> _textCache = new();
     private const int TextCacheMax = 512;
     // Reused across glyph runs so we don't allocate a fresh StringBuilder
     // per run. Cleared at the start of each DrawGlyphs call.
     private readonly StringBuilder _glyphSb = new();
 
-    private readonly record struct TextKey(string Text, int Variant, int SizeTenths, uint Fg);
+    private readonly record struct TextCacheEntry(
+        string Text, int Variant, int SizeTenths, uint Fg, FormattedText Ft);
 
     private static uint ColorKey(Color c) =>
         ((uint)c.A << 24) | ((uint)c.R << 16) | ((uint)c.G << 8) | c.B;
@@ -167,21 +172,61 @@ public sealed class TerminalRenderer
         return tf;
     }
 
-    private FormattedText FormattedTextFor(string text, Typeface tf, double size, Color fg)
+    /// <summary>Glyph-run cache lookup keyed directly on a StringBuilder
+    /// + style. On a cache hit we compare the StringBuilder against the
+    /// stored entry's text char-by-char — no string allocation needed.
+    /// Only a cache miss allocates via <c>sb.ToString()</c>. Used by
+    /// <see cref="DrawGlyphs"/>, which is the dominant per-frame call
+    /// site; <see cref="DrawCursor"/> has its own small one-off path
+    /// since it renders at most one FormattedText per frame.</summary>
+    private FormattedText FormattedTextForRun(StringBuilder sb, Typeface tf, double size, Color fg)
     {
         int variantIdx = 0;
         for (int i = 0; i < _typefaceVariants.Length; i++)
         {
             if (_typefaceVariants[i].Equals(tf)) { variantIdx = i; break; }
         }
-        var key = new TextKey(text, variantIdx, (int)(size * 10),
-            ((uint)fg.A << 24) | ((uint)fg.R << 16) | ((uint)fg.G << 8) | fg.B);
-        if (_textCache.TryGetValue(key, out var ft)) return ft;
+        int size10 = (int)(size * 10);
+        uint fgKey = ColorKey(fg);
+        int hash = ComputeRunHash(sb, variantIdx, size10, fgKey);
+
+        if (_textCache.TryGetValue(hash, out var entry)
+            && entry.Variant == variantIdx
+            && entry.SizeTenths == size10
+            && entry.Fg == fgKey
+            && SbEqualsString(sb, entry.Text))
+        {
+            return entry.Ft;
+        }
+
         if (_textCache.Count >= TextCacheMax) _textCache.Clear();
-        ft = new FormattedText(text, CultureInfo.InvariantCulture,
+        string text = sb.ToString();
+        var ft = new FormattedText(text, CultureInfo.InvariantCulture,
             FlowDirection.LeftToRight, tf, size, BrushFor(fg));
-        _textCache[key] = ft;
+        // Hash collisions on a 512-entry dict in a 32-bit hash space are
+        // astronomically rare; single-slot overwrite is acceptable —
+        // the evicted entry just gets rebuilt next frame.
+        _textCache[hash] = new TextCacheEntry(text, variantIdx, size10, fgKey, ft);
         return ft;
+    }
+
+    private static int ComputeRunHash(StringBuilder sb, int variant, int size10, uint fg)
+    {
+        var hc = new HashCode();
+        hc.Add(variant);
+        hc.Add(size10);
+        hc.Add(fg);
+        int len = sb.Length;
+        for (int i = 0; i < len; i++) hc.Add(sb[i]);
+        return hc.ToHashCode();
+    }
+
+    private static bool SbEqualsString(StringBuilder sb, string s)
+    {
+        if (sb.Length != s.Length) return false;
+        for (int i = 0; i < sb.Length; i++)
+            if (sb[i] != s[i]) return false;
+        return true;
     }
 
     private void InvalidateFontCaches()
@@ -466,7 +511,7 @@ public sealed class TerminalRenderer
         bool italic = (flags & CellFlags.Italic) != 0;
         var tf = TypefaceFor(bold, italic);
 
-        var ft = FormattedTextFor(_glyphSb.ToString(), tf, _fontSize, fg);
+        var ft = FormattedTextForRun(_glyphSb, tf, _fontSize, fg);
         ctx.DrawText(ft, new Point(x, y));
 
         double w = ft.WidthIncludingTrailingWhitespace;
@@ -544,10 +589,15 @@ public sealed class TerminalRenderer
                         var cell = buf.GetVisibleRow(buf.CursorRow)[buf.CursorCol];
                         if (cell.Rune != 0)
                         {
+                            // Cursor inversion fires at most once per
+                            // frame, and the rune changes every cursor
+                            // move — caching isn't worth the churn.
+                            // Allocate directly.
                             var bgColor = theme?.Background ?? TerminalPalette.DefaultBackground;
-                            var ft = FormattedTextFor(
+                            var ft = new FormattedText(
                                 char.ConvertFromUtf32(cell.Rune),
-                                _typeface, _fontSize, bgColor);
+                                CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
+                                _typeface, _fontSize, BrushFor(bgColor));
                             ctx.DrawText(ft, new Point(x, y));
                         }
                     }

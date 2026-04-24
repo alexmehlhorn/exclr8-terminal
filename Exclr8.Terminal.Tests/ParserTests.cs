@@ -27,7 +27,7 @@ public class ParserTests
         public void Execute(byte c) => Executes.Add(c);
         public void CsiDispatch(char f, ReadOnlySpan<int> p, string i, char pr) => Csi.Add((f, p.ToArray(), i, pr));
         public void EscDispatch(char f, string i) => Esc.Add((f, i));
-        public void OscDispatch(string s) => Osc.Add(s);
+        public void OscDispatch(ReadOnlySpan<char> s) => Osc.Add(new string(s));
         public void ReplyToPty(ReadOnlySpan<byte> b) { foreach (var x in b) Replies.Add(x); }
     }
 

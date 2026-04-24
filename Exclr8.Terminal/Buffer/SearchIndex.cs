@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Text;
 using System.Threading;
@@ -26,7 +27,7 @@ public readonly record struct SearchMatch(int Row, int Col, int Length);
 /// </summary>
 internal sealed class SearchIndex
 {
-    private readonly List<SearchMatch> _matches = new();
+    private List<SearchMatch> _matches = new();
 
     public string? Needle { get; private set; }
     public IReadOnlyList<SearchMatch> Matches => _matches;
@@ -34,12 +35,19 @@ internal sealed class SearchIndex
 
     /// <summary>Replace match state atomically. <paramref name="viewBottomAbs"/>
     /// is used to pick the match closest to the current viewport so
-    /// "next" naturally moves forward from where the user is looking.</summary>
+    /// "next" naturally moves forward from where the user is looking.
+    ///
+    /// <para><b>Ownership:</b> this method takes ownership of
+    /// <paramref name="matches"/> — callers must not mutate or hold
+    /// references to the passed list after the call. Every current
+    /// caller passes a freshly-built List from <see cref="Scan"/>,
+    /// so swapping the reference beats an O(N) copy for big result
+    /// sets (a 5000-line scrollback with many hits can easily produce
+    /// tens of thousands of matches).</para></summary>
     public void Set(string? needle, List<SearchMatch> matches, int viewBottomAbs)
     {
         Needle = string.IsNullOrEmpty(needle) ? null : needle;
-        _matches.Clear();
-        _matches.AddRange(matches);
+        _matches = matches;
         CurrentIndex = _matches.Count > 0 ? NearestIndex(viewBottomAbs) : -1;
     }
 
@@ -103,39 +111,51 @@ internal sealed class SearchIndex
         // CJK Ext B+) encode as a surrogate pair — two chars in the
         // haystack but one cell — so we keep a parallel column map to
         // translate match offsets back to cell coordinates.
+        //
+        // colMap is rented from the shared pool: Scan runs row-by-row
+        // on a single thread, so one rent/return per row avoids per-
+        // search GC pressure (a 5000-row scrollback at 80 cols was
+        // ~3.2 MB of int[] per search before this change).
         var sb = new StringBuilder(row.Length);
-        var colMap = new int[row.Length * 2];
-        int mapLen = 0;
-        for (int i = 0; i < row.Length; i++)
+        int[] colMap = ArrayPool<int>.Shared.Rent(row.Length * 2);
+        try
         {
-            int rune = row[i].Rune;
-            if (rune == 0)
+            int mapLen = 0;
+            for (int i = 0; i < row.Length; i++)
             {
-                sb.Append(' ');
-                colMap[mapLen++] = i;
+                int rune = row[i].Rune;
+                if (rune == 0)
+                {
+                    sb.Append(' ');
+                    colMap[mapLen++] = i;
+                }
+                else if (rune <= 0xFFFF)
+                {
+                    sb.Append((char)rune);
+                    colMap[mapLen++] = i;
+                }
+                else
+                {
+                    sb.Append(char.ConvertFromUtf32(rune));
+                    colMap[mapLen++] = i;
+                    colMap[mapLen++] = i;
+                }
             }
-            else if (rune <= 0xFFFF)
+            var haystack = sb.ToString();
+            int from = 0;
+            while (from <= haystack.Length - needle.Length)
             {
-                sb.Append((char)rune);
-                colMap[mapLen++] = i;
-            }
-            else
-            {
-                sb.Append(char.ConvertFromUtf32(rune));
-                colMap[mapLen++] = i;
-                colMap[mapLen++] = i;
+                int idx = haystack.IndexOf(needle, from, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0) break;
+                int startCell = colMap[idx];
+                int endCell   = colMap[idx + needle.Length - 1];
+                into.Add(new SearchMatch(absRow, startCell, endCell - startCell + 1));
+                from = idx + Math.Max(1, needle.Length);
             }
         }
-        var haystack = sb.ToString();
-        int from = 0;
-        while (from <= haystack.Length - needle.Length)
+        finally
         {
-            int idx = haystack.IndexOf(needle, from, StringComparison.OrdinalIgnoreCase);
-            if (idx < 0) break;
-            int startCell = colMap[idx];
-            int endCell   = colMap[idx + needle.Length - 1];
-            into.Add(new SearchMatch(absRow, startCell, endCell - startCell + 1));
-            from = idx + Math.Max(1, needle.Length);
+            ArrayPool<int>.Shared.Return(colMap);
         }
     }
 }

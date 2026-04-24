@@ -12,6 +12,17 @@ namespace Exclr8.Terminal.Buffer;
 /// Content scrolled off the top of a non-full-screen region is
 /// discarded (matches xterm behaviour) — scrollback only receives
 /// rows that came off the top of the full screen.</para>
+///
+/// <para><b>Row storage:</b> <see cref="_rows"/> is a physical list
+/// plus a logical head index <see cref="_rowsHead"/>. Logical row 0
+/// maps to physical <c>_rows[_rowsHead]</c>; logical row r maps to
+/// <c>_rows[(_rowsHead + r) % _rows.Count]</c>. A full-screen scroll
+/// just bumps the head, which makes the scroll O(1) instead of the
+/// O(Rows) that <c>List.RemoveAt(0) + Insert(end)</c> paid. Partial-
+/// region scrolls still shift pointers within the region (there's no
+/// cheap trick for those) but go through the same logical→physical
+/// mapping. <see cref="Resize"/> normalises head to 0 before mutating
+/// the physical list so list growth / shrink stays simple.</para>
 /// </summary>
 public sealed class ScreenBuffer
 {
@@ -32,6 +43,7 @@ public sealed class ScreenBuffer
 
     public ScrollbackRing Scrollback { get; }
     private readonly List<TerminalCell[]> _rows = new();
+    private int _rowsHead;
 
     public ScreenBuffer(int cols, int rows, int scrollbackLimit)
     {
@@ -42,10 +54,20 @@ public sealed class ScreenBuffer
         for (int i = 0; i < rows; i++) _rows.Add(new TerminalCell[cols]);
     }
 
-    public TerminalCell[] GetRow(int r) => _rows[r];
+    /// <summary>Physical index into <see cref="_rows"/> for logical
+    /// row <paramref name="r"/>.</summary>
+    private int Physical(int r) => (_rowsHead + r) % _rows.Count;
+
+    public TerminalCell[] GetRow(int r) => _rows[Physical(r)];
 
     public void Resize(int cols, int rows)
     {
+        // Normalise the physical list to head = 0 before any growth /
+        // shrink — additions go to the end of the list and shrinkage
+        // drops from the top, both of which assume logical row r is
+        // physical index r.
+        NormaliseHead();
+
         if (cols != Cols)
         {
             for (int r = 0; r < _rows.Count; r++)
@@ -85,6 +107,17 @@ public sealed class ScreenBuffer
         Rows = rows;
     }
 
+    private void NormaliseHead()
+    {
+        if (_rowsHead == 0 || _rows.Count == 0) return;
+        int n = _rows.Count;
+        var ordered = new TerminalCell[n][];
+        for (int i = 0; i < n; i++) ordered[i] = _rows[(_rowsHead + i) % n];
+        _rows.Clear();
+        _rows.AddRange(ordered);
+        _rowsHead = 0;
+    }
+
     // ---- Region-aware scroll operations ----
 
     /// <summary>
@@ -99,14 +132,36 @@ public sealed class ScreenBuffer
         if (top > bottom || n <= 0) return;
         bool fullScreen = top == 0 && bottom == Rows - 1;
         n = Math.Min(n, bottom - top + 1);
+
+        if (fullScreen)
+        {
+            // O(1) rotate: physical slot at _rowsHead currently holds
+            // logical row 0. Push it to scrollback, drop a blank in
+            // its place (reusing the scrollback evictee when the ring
+            // is saturated), then advance the head so that slot
+            // becomes the new logical bottom.
+            for (int i = 0; i < n; i++)
+            {
+                int headIdx = _rowsHead;
+                var evicted = _rows[headIdx];
+                var recycled = PushScrollback(evicted);
+                _rows[headIdx] = TakeOrAllocBlank(recycled);
+                _rowsHead = (_rowsHead + 1) % _rows.Count;
+            }
+            return;
+        }
+
+        // Partial region: shift row pointers within [top, bottom]. N
+        // pointer moves per scrolled line — same as before the circular
+        // conversion. The evicted top row's array is recycled as the
+        // new bottom blank.
         for (int i = 0; i < n; i++)
         {
-            var evicted = _rows[top];
-            TerminalCell[]? recycled = null;
-            if (fullScreen) recycled = PushScrollback(evicted);
-            else            recycled = evicted; // region-local; discarded row is reusable
-            _rows.RemoveAt(top);
-            _rows.Insert(bottom, TakeOrAllocBlank(recycled));
+            var evicted = _rows[Physical(top)];
+            for (int r = top; r < bottom; r++)
+                _rows[Physical(r)] = _rows[Physical(r + 1)];
+            Array.Clear(evicted, 0, Cols);
+            _rows[Physical(bottom)] = evicted;
         }
     }
 
@@ -120,12 +175,30 @@ public sealed class ScreenBuffer
         top    = Math.Max(0, top);
         bottom = Math.Min(Rows - 1, bottom);
         if (top > bottom || n <= 0) return;
+        bool fullScreen = top == 0 && bottom == Rows - 1;
         n = Math.Min(n, bottom - top + 1);
+
+        if (fullScreen)
+        {
+            // O(1) reverse-rotate: decrement head first, then clear
+            // the row at the new head position — it used to be the
+            // logical bottom, now it becomes logical row 0 (blank).
+            for (int i = 0; i < n; i++)
+            {
+                _rowsHead = (_rowsHead - 1 + _rows.Count) % _rows.Count;
+                Array.Clear(_rows[_rowsHead], 0, Cols);
+            }
+            return;
+        }
+
+        // Partial region: shift pointers within [top, bottom].
         for (int i = 0; i < n; i++)
         {
-            var evicted = _rows[bottom];
-            _rows.RemoveAt(bottom);
-            _rows.Insert(top, TakeOrAllocBlank(evicted));
+            var evicted = _rows[Physical(bottom)];
+            for (int r = bottom; r > top; r--)
+                _rows[Physical(r)] = _rows[Physical(r - 1)];
+            Array.Clear(evicted, 0, Cols);
+            _rows[Physical(top)] = evicted;
         }
     }
 
@@ -142,9 +215,11 @@ public sealed class ScreenBuffer
         n = Math.Min(n, scrollBottom - at + 1);
         for (int i = 0; i < n; i++)
         {
-            var evicted = _rows[scrollBottom];
-            _rows.RemoveAt(scrollBottom);
-            _rows.Insert(at, TakeOrAllocBlank(evicted));
+            var evicted = _rows[Physical(scrollBottom)];
+            for (int r = scrollBottom; r > at; r--)
+                _rows[Physical(r)] = _rows[Physical(r - 1)];
+            Array.Clear(evicted, 0, Cols);
+            _rows[Physical(at)] = evicted;
         }
     }
 
@@ -159,9 +234,11 @@ public sealed class ScreenBuffer
         n = Math.Min(n, scrollBottom - at + 1);
         for (int i = 0; i < n; i++)
         {
-            var evicted = _rows[at];
-            _rows.RemoveAt(at);
-            _rows.Insert(scrollBottom, TakeOrAllocBlank(evicted));
+            var evicted = _rows[Physical(at)];
+            for (int r = at; r < scrollBottom; r++)
+                _rows[Physical(r)] = _rows[Physical(r + 1)];
+            Array.Clear(evicted, 0, Cols);
+            _rows[Physical(scrollBottom)] = evicted;
         }
     }
 
@@ -192,8 +269,7 @@ public sealed class ScreenBuffer
 
     /// <summary>Return either <paramref name="recycled"/> (cleared in
     /// place) or a freshly-allocated blank row of the current width.
-    /// Used anywhere we need a blank-row slot — ScrollUp/Down,
-    /// InsertLines, DeleteLines, region scrolls.</summary>
+    /// Used anywhere we need a blank-row slot after a region scroll.</summary>
     private TerminalCell[] TakeOrAllocBlank(TerminalCell[]? recycled)
     {
         if (recycled != null && recycled.Length == Cols)

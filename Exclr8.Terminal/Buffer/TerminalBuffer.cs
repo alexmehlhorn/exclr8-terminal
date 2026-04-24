@@ -70,6 +70,15 @@ public sealed class TerminalBuffer : IParserActions
     public int ScrollTop    { get; private set; }
     public int ScrollBottom { get; private set; }
 
+    /// <summary>True when a <see cref="Print"/> has laid down at least
+    /// one cell with the <see cref="CellFlags2.Blink"/> bit since the
+    /// last reset. Lets the host skip 2 Hz blink-timer repaints when
+    /// nothing on the grid actually blinks — the common case. Cleared
+    /// on <see cref="FullReset"/> / <see cref="SoftReset"/>; once set,
+    /// stays set until reset (we don't walk the grid to find out when
+    /// the last Blink cell scrolls off).</summary>
+    public bool HasBlinkContent { get; private set; }
+
     public enum Charset { Ascii, DecSpecialGraphics }
     private readonly Charset[] _gSlots = { Charset.Ascii, Charset.Ascii };
     private int _activeG; // 0 = G0, 1 = G1
@@ -529,10 +538,17 @@ public sealed class TerminalBuffer : IParserActions
             else          { CursorCol = Cols - 2; }
         }
 
+        // Cache the active link id once per Print — this is the hot
+        // path for any large text dump and the two reads (cell +
+        // wide-char continuation) both resolve through two property
+        // hops (_osc.ActiveLinkId). Cache removes any doubt about
+        // whether JIT folded the common subexpression.
+        ushort linkId = _osc.ActiveLinkId;
+
         var row  = _active.GetRow(CursorRow);
         var cell = _pen;
         cell.Rune        = rune;
-        cell.HyperlinkId = _osc.ActiveLinkId;
+        cell.HyperlinkId = linkId;
 
         // IRM (insert mode): shift the row right by `width` before
         // writing. Cells pushed past the right margin are discarded.
@@ -575,6 +591,7 @@ public sealed class TerminalBuffer : IParserActions
         // override the cell-shape flags (IsWide / IsContinuation) we
         // set based on the rune width.
         var penExtras = _pen.Flags2 & CellFlags2.Blink;
+        if (penExtras != 0) HasBlinkContent = true;
         if (width == 2)
         {
             cell.Flags2 = CellFlags2.IsWide | penExtras;
@@ -584,7 +601,7 @@ public sealed class TerminalBuffer : IParserActions
                 var cont = _pen;
                 cont.Rune        = 0;
                 cont.Flags2      = CellFlags2.IsContinuation | penExtras;
-                cont.HyperlinkId = _osc.ActiveLinkId;
+                cont.HyperlinkId = linkId;
                 row[CursorCol + 1] = cont;
             }
             CursorCol += 2;
@@ -730,11 +747,11 @@ public sealed class TerminalBuffer : IParserActions
         }
     }
 
-    public void OscDispatch(string payload) => _osc.Dispatch(payload);
+    public void OscDispatch(ReadOnlySpan<char> payload) => _osc.Dispatch(payload);
 
     public void ReplyToPty(ReadOnlySpan<byte> bytes)
     {
-        foreach (var b in bytes) _pendingReplies.Add(b);
+        _pendingReplies.AddRange(bytes);
     }
 
     // ---- Implementation helpers ----
@@ -838,6 +855,7 @@ public sealed class TerminalBuffer : IParserActions
         _alternateSaved = default;
         _gSlots[0] = Charset.Ascii; _gSlots[1] = Charset.Ascii;
         _activeG = 0;
+        HasBlinkContent = false;
     }
 
     // ---- Window manipulation CSI t — safe subset ----
@@ -1056,6 +1074,7 @@ public sealed class TerminalBuffer : IParserActions
         _osc.Reset();
         _tabStops = null; // will rebuild with defaults on next access
         _lastPrintRune = 0;
+        HasBlinkContent = false;
         _parser.Reset();
     }
 

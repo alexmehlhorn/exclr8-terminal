@@ -24,9 +24,11 @@ public sealed class ClipboardRequestEventArgs : EventArgs
 /// host when titles change or a clipboard write is requested; replies
 /// to the PTY via the provided callback for query sequences.
 ///
-/// <para>Separated from <see cref="TerminalBuffer"/> so the string-
-/// heavy OSC parsing and payload formatting don't clutter the cell
-/// grid; the buffer holds a single instance and forwards events.</para>
+/// <para>The whole dispatch path is span-based: <see cref="Dispatch"/>
+/// receives a <c>ReadOnlySpan&lt;char&gt;</c> that points into the
+/// parser's internal buffer and is valid only for the call. We only
+/// materialise strings at the *storage* sites — the window title,
+/// hyperlink URLs, decoded OSC 52 clipboard text.</para>
 /// </summary>
 internal sealed class OscDispatcher
 {
@@ -77,31 +79,40 @@ internal sealed class OscDispatcher
         _windowTitle = string.Empty;
     }
 
-    public void Dispatch(string payload)
+    public void Dispatch(ReadOnlySpan<char> payload)
     {
         int semi = payload.IndexOf(';');
         if (semi < 0) return;
-        if (!int.TryParse(payload.AsSpan(0, semi), out int cmd)) return;
-        var data = payload.Substring(semi + 1);
+        if (!int.TryParse(payload[..semi], out int cmd)) return;
+        var data = payload[(semi + 1)..];
         switch (cmd)
         {
             case 0:
-                _windowTitle = data;
-                TitleChanged?.Invoke(this, data);
-                IconNameChanged?.Invoke(this, data);
+            {
+                // OSC 0 sets both window title and icon name — the
+                // string gets stored + handed to two events, so a
+                // single allocation is unavoidable.
+                var s = new string(data);
+                _windowTitle = s;
+                TitleChanged?.Invoke(this, s);
+                IconNameChanged?.Invoke(this, s);
                 return;
+            }
             case 1:
-                IconNameChanged?.Invoke(this, data);
+                IconNameChanged?.Invoke(this, new string(data));
                 return;
             case 2:
-                _windowTitle = data;
-                TitleChanged?.Invoke(this, data);
+            {
+                var s = new string(data);
+                _windowTitle = s;
+                TitleChanged?.Invoke(this, s);
                 return;
+            }
             case 4:  HandleOsc4 (data); return;
             case 8:  HandleOsc8 (data); return;
-            case 10: HandleOscSpecialColor(10, () => DefaultForegroundRgb, v => DefaultForegroundRgb = v, data); return;
-            case 11: HandleOscSpecialColor(11, () => DefaultBackgroundRgb, v => DefaultBackgroundRgb = v, data); return;
-            case 12: HandleOscSpecialColor(12, () => DefaultCursorRgb,     v => DefaultCursorRgb     = v, data); return;
+            case 10: HandleOscSpecialColor(10, DefaultForegroundRgb, data, v => DefaultForegroundRgb = v); return;
+            case 11: HandleOscSpecialColor(11, DefaultBackgroundRgb, data, v => DefaultBackgroundRgb = v); return;
+            case 12: HandleOscSpecialColor(12, DefaultCursorRgb,     data, v => DefaultCursorRgb     = v); return;
             case 52: HandleOsc52(data); return;
         }
     }
@@ -125,18 +136,19 @@ internal sealed class OscDispatcher
         return _palette256;
     }
 
-    private void HandleOsc4(string data)
+    private void HandleOsc4(ReadOnlySpan<char> data)
     {
         // "idx;spec[;idx;spec...]". "?" = query, else parse + set.
         // Set path is maintained for query round-trip consistency;
         // note that mutations do NOT propagate to the renderer's
         // static palette — that's a broader refactor (see R7).
-        var parts = data.Split(';');
-        for (int i = 0; i + 1 < parts.Length; i += 2)
+        while (!data.IsEmpty)
         {
-            if (!int.TryParse(parts[i], out int idx) || idx < 0 || idx > 255) continue;
-            var spec = parts[i + 1];
-            if (spec == "?")
+            var idxSpan = TakeToken(ref data);
+            if (data.IsEmpty && idxSpan.IsEmpty) break;
+            var spec    = TakeToken(ref data);
+            if (!int.TryParse(idxSpan, out int idx) || idx < 0 || idx > 255) continue;
+            if (spec.Length == 1 && spec[0] == '?')
             {
                 var pal = EnsurePalette256();
                 ReplyAscii($"\x1b]4;{idx};{RgbSpec(pal[idx])}\x1b\\");
@@ -148,11 +160,12 @@ internal sealed class OscDispatcher
         }
     }
 
-    private void HandleOscSpecialColor(int cmd, Func<uint> getter, Action<uint> setter, string data)
+    private void HandleOscSpecialColor(int cmd, uint currentValue,
+        ReadOnlySpan<char> data, Action<uint> setter)
     {
-        if (data == "?")
+        if (data.Length == 1 && data[0] == '?')
         {
-            ReplyAscii($"\x1b]{cmd};{RgbSpec(getter())}\x1b\\");
+            ReplyAscii($"\x1b]{cmd};{RgbSpec(currentValue)}\x1b\\");
         }
         else if (TryParseRgbSpec(data, out var rgb))
         {
@@ -162,27 +175,29 @@ internal sealed class OscDispatcher
 
     // ---- OSC 8: hyperlink open / close ----
 
-    private void HandleOsc8(string data)
+    private void HandleOsc8(ReadOnlySpan<char> data)
     {
         // Payload is "params;URL". Empty URL closes the active link.
         int semi = data.IndexOf(';');
         if (semi < 0) { ActiveLinkId = 0; return; }
-        string url = data.Substring(semi + 1);
-        if (string.IsNullOrEmpty(url))
+        var urlSpan = data[(semi + 1)..];
+        if (urlSpan.IsEmpty)
         {
             ActiveLinkId = 0;
         }
         else
         {
+            // URL gets retained — single string allocation here is
+            // unavoidable.
             ActiveLinkId = _nextHyperlinkId++;
             if (_nextHyperlinkId == 0) _nextHyperlinkId = 1;
-            _hyperlinks[ActiveLinkId] = url;
+            _hyperlinks[ActiveLinkId] = new string(urlSpan);
         }
     }
 
     // ---- OSC 52: clipboard ----
 
-    private void HandleOsc52(string data)
+    private void HandleOsc52(ReadOnlySpan<char> data)
     {
         // "clipboards;payload". Payload is base64 for set or "?" for
         // get. We gate on AllowClipboardAccess. Get path ignored: the
@@ -190,13 +205,28 @@ internal sealed class OscDispatcher
         if (!AllowClipboardAccess) return;
         int semi = data.IndexOf(';');
         if (semi < 0) return;
-        var body = data.Substring(semi + 1);
-        if (body == "?") return;
+        var body = data[(semi + 1)..];
+        if (body.Length == 1 && body[0] == '?') return;
+
+        // Decode base64 directly from the char span into a pooled /
+        // stackalloc byte buffer, then UTF-8-decode to the event's
+        // payload string. That string's the one retained allocation —
+        // no intermediate base64-string copy.
         string decoded;
         try
         {
-            var bytes = Convert.FromBase64String(body);
-            decoded = Encoding.UTF8.GetString(bytes);
+            byte[]? rented = null;
+            Span<byte> bytes = body.Length <= 2048
+                ? stackalloc byte[2048]
+                : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(body.Length));
+            bytes = bytes[..body.Length];
+            if (!Convert.TryFromBase64Chars(body, bytes, out int written))
+            {
+                if (rented != null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+                return;
+            }
+            decoded = Encoding.UTF8.GetString(bytes[..written]);
+            if (rented != null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
         }
         catch (FormatException)
         {
@@ -217,32 +247,39 @@ internal sealed class OscDispatcher
         return $"rgb:{r:x2}{r:x2}/{g:x2}{g:x2}/{b:x2}{b:x2}";
     }
 
-    private static bool TryParseRgbSpec(string spec, out uint rgb)
+    private static bool TryParseRgbSpec(ReadOnlySpan<char> spec, out uint rgb)
     {
         rgb = 0;
-        if (spec.StartsWith('#') && (spec.Length == 7 || spec.Length == 13))
+        if (spec.Length > 0 && spec[0] == '#' && (spec.Length == 7 || spec.Length == 13))
         {
             int step = spec.Length == 7 ? 2 : 4;
-            if (!int.TryParse(spec.AsSpan(1,        2), System.Globalization.NumberStyles.HexNumber, null, out int r)) return false;
-            if (!int.TryParse(spec.AsSpan(1+step,   2), System.Globalization.NumberStyles.HexNumber, null, out int g)) return false;
-            if (!int.TryParse(spec.AsSpan(1+step*2, 2), System.Globalization.NumberStyles.HexNumber, null, out int b)) return false;
+            if (!int.TryParse(spec.Slice(1,        2), System.Globalization.NumberStyles.HexNumber, null, out int r)) return false;
+            if (!int.TryParse(spec.Slice(1+step,   2), System.Globalization.NumberStyles.HexNumber, null, out int g)) return false;
+            if (!int.TryParse(spec.Slice(1+step*2, 2), System.Globalization.NumberStyles.HexNumber, null, out int b)) return false;
             rgb = (uint)((r << 16) | (g << 8) | b);
             return true;
         }
         if (spec.StartsWith("rgb:", StringComparison.Ordinal))
         {
-            var parts = spec.Substring(4).Split('/');
-            if (parts.Length != 3) return false;
-            if (!TryTopByte(parts[0], out int r)) return false;
-            if (!TryTopByte(parts[1], out int g)) return false;
-            if (!TryTopByte(parts[2], out int b)) return false;
+            var rest = spec[4..];
+            int slash1 = rest.IndexOf('/');
+            if (slash1 < 0) return false;
+            var rr = rest[..slash1];
+            rest = rest[(slash1 + 1)..];
+            int slash2 = rest.IndexOf('/');
+            if (slash2 < 0) return false;
+            var gg = rest[..slash2];
+            var bb = rest[(slash2 + 1)..];
+            if (!TryTopByte(rr, out int r)) return false;
+            if (!TryTopByte(gg, out int g)) return false;
+            if (!TryTopByte(bb, out int b)) return false;
             rgb = (uint)((r << 16) | (g << 8) | b);
             return true;
         }
         return false;
     }
 
-    private static bool TryTopByte(string hex, out int value)
+    private static bool TryTopByte(ReadOnlySpan<char> hex, out int value)
     {
         value = 0;
         if (hex.Length == 0 || hex.Length > 4) return false;
@@ -257,6 +294,24 @@ internal sealed class OscDispatcher
         };
         value = scaled & 0xFF;
         return true;
+    }
+
+    /// <summary>Consume the next ';'-delimited token from <paramref name="data"/>
+    /// and advance the slice past it. Leaves the separator out of the
+    /// returned span. Returns the remainder (no separator) when there
+    /// is no further ';'.</summary>
+    private static ReadOnlySpan<char> TakeToken(ref ReadOnlySpan<char> data)
+    {
+        int i = data.IndexOf(';');
+        if (i < 0)
+        {
+            var all = data;
+            data = default;
+            return all;
+        }
+        var tok = data[..i];
+        data = data[(i + 1)..];
+        return tok;
     }
 
     private void ReplyAscii(string s) => _reply(Encoding.ASCII.GetBytes(s));
