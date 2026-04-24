@@ -424,25 +424,33 @@ public class TerminalControl : Control
         }
     }
 
-    /// <summary>Try to delete a live-screen selection that sits
-    /// immediately before the shell's cursor. Sends one backspace
-    /// byte per selected character and returns the byte count sent,
-    /// or 0 when the selection isn't in a delete-safe position.</summary>
+    /// <summary>Try to delete a live-screen selection that sits on
+    /// the cursor's row at or behind the cursor. Sends one DEL byte
+    /// per character we can safely erase and returns the count, or 0
+    /// when the selection isn't in a delete-safe position (different
+    /// row, starts past cursor, etc.).</summary>
     private int TryDeleteSelection()
     {
         var sel = _buffer.Selection;
         if (sel == null) return 0;
         var (r1, c1, r2, c2) = sel.Normalized();
 
-        // Only handle single-row selections that end at (or
-        // immediately before) the cursor on the current line. This
-        // covers the "I just typed this, delete it" case without
-        // pretending we can unambiguously delete text elsewhere.
+        // Single-row selections only. We can't translate multi-row
+        // selections into backspaces without knowing how long each
+        // wrapped segment is in the shell's logical line buffer.
         int cursorAbs = _buffer.VisualToAbsRow(_buffer.CursorRow);
         if (r1 != cursorAbs || r2 != cursorAbs) return 0;
-        if (c2 + 1 != _buffer.CursorCol) return 0;
 
-        int n = c2 - c1 + 1;
+        // The selection has to start before the cursor (there's
+        // something to erase) and reach up to or past the cursor
+        // (so we're erasing the tail, not a middle slice the
+        // shell's line-editor wouldn't line up with). If the user
+        // over-dragged into trailing blanks past the cursor we
+        // still accept it and just clamp N to the typed portion.
+        if (c1 >= _buffer.CursorCol)     return 0;
+        if (c2 + 1 < _buffer.CursorCol)  return 0;
+
+        int n = _buffer.CursorCol - c1;
         if (n <= 0) return 0;
 
         var payload = new byte[n];
