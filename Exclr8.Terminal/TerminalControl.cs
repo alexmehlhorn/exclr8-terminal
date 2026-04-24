@@ -79,6 +79,22 @@ public class TerminalControl : Control
 
     public TerminalBuffer Buffer => _buffer;
 
+    /// <summary>Local observer of user input flowing through the
+    /// terminal. Subscribe to <see cref="InputEventStream.LineCommitted"/>
+    /// to react to committed lines (running-process badge, Claude
+    /// slash-commands, cwd tracking, dangerous-command warnings,
+    /// etc.) without each feature re-parsing the byte stream.</summary>
+    public InputEventStream InputEvents { get; } = new();
+
+    /// <summary>Emit user input to both subscribers (host PTY writer)
+    /// and the local observer stream. <paramref name="origin"/> lets
+    /// observers distinguish Typed / Pasted / Programmatic sources.</summary>
+    private void RaiseInput(byte[] payload, InputLineOrigin origin)
+    {
+        Input?.Invoke(this, payload);
+        InputEvents.Feed(payload, origin);
+    }
+
     /// <summary>Optional color overrides. Null = defaults. `new`
     /// deliberately hides <see cref="StyledElement.Theme"/> — we want a
     /// strongly-typed palette here, not the Avalonia ControlTheme.</summary>
@@ -218,7 +234,7 @@ public class TerminalControl : Control
         {
             payload = inner;
         }
-        Input?.Invoke(this, payload);
+        RaiseInput(payload, InputLineOrigin.Pasted);
     }
 
     public override void Render(DrawingContext ctx)
@@ -419,7 +435,7 @@ public class TerminalControl : Control
             // Actual shell input — snap to live buffer so the user
             // sees the prompt they're typing into.
             _buffer.ResetScrollOffset();
-            Input?.Invoke(this, bytes);
+            RaiseInput(bytes, InputLineOrigin.Typed);
             e.Handled = true;
         }
     }
@@ -455,7 +471,7 @@ public class TerminalControl : Control
 
         var payload = new byte[n];
         for (int i = 0; i < n; i++) payload[i] = 0x7F; // DEL = shell erase-char
-        Input?.Invoke(this, payload);
+        RaiseInput(payload, InputLineOrigin.Programmatic);
         return n;
     }
 
@@ -480,7 +496,7 @@ public class TerminalControl : Control
         if (e.Text.Length == 1 && e.Text[0] < 0x20) { e.Handled = true; return; }
         _buffer.ResetScrollOffset();
         var bytes = KeyMapper.MapTextInput(e.Text, _altHeld);
-        if (bytes.Length > 0) { Input?.Invoke(this, bytes); e.Handled = true; }
+        if (bytes.Length > 0) { RaiseInput(bytes, InputLineOrigin.Typed); e.Handled = true; }
     }
 
     // ---- Mouse ----
