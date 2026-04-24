@@ -569,7 +569,7 @@ public class WorkloadTortureTests
     // See: /BUGS-FOUND.md #1.
     // ------------------------------------------------------------------
 
-    [Fact(Skip = "BUGS-FOUND.md #1 — wide-over-wide orphan continuation")]
+    [Fact]
     public void OverwriteWideWithWide_DoesNotLeaveOrphanContinuation()
     {
         var buf = NewBuffer(20, 8);

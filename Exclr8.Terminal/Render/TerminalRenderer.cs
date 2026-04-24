@@ -399,15 +399,29 @@ public sealed class TerminalRenderer
     private void DrawSelection(DrawingContext ctx, TerminalBuffer buf, double pixelShift)
     {
         var sel = buf.Selection!;
-        var (r1, c1, r2, c2) = sel.Normalized();
+        // Selection rows are in absolute coords. Map each into the
+        // current viewport and skip rows that fall outside it so
+        // scrolling past the selection just hides it cleanly.
+        var (r1Abs, c1, r2Abs, c2) = sel.Normalized();
+        int sbCount    = buf.ScrollbackCount;
+        int viewTopAbs = sbCount - buf.ScrollOffset;
+        int viewBotAbs = viewTopAbs + buf.Rows - 1;
+
+        int fromAbs = Math.Max(r1Abs, viewTopAbs - 1); // -1 for sub-line bleed
+        int toAbs   = Math.Min(r2Abs, viewBotAbs);
+        if (fromAbs > toAbs) return;
+
         var brush = new SolidColorBrush(Color.FromArgb(0x60, 0x58, 0x9A, 0xF8));
-        for (int r = Math.Max(r1, 0); r <= Math.Min(r2, buf.Rows - 1); r++)
+        for (int rAbs = fromAbs; rAbs <= toAbs; rAbs++)
         {
-            int cs = r == r1 ? c1 : 0;
-            int ce = r == r2 ? c2 : buf.Cols - 1;
+            int visualRow = rAbs - viewTopAbs;
+            int cs = rAbs == r1Abs ? c1 : 0;
+            int ce = rAbs == r2Abs ? c2 : buf.Cols - 1;
             ctx.FillRectangle(brush,
-                new Rect(cs * CellWidth, r * CellHeight + pixelShift,
-                         (ce - cs + 1) * CellWidth, CellHeight));
+                new Rect(cs * CellWidth,
+                         visualRow * CellHeight + pixelShift,
+                         (ce - cs + 1) * CellWidth,
+                         CellHeight));
         }
     }
 

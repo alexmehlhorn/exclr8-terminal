@@ -68,7 +68,7 @@ public class WorkloadFuzzTests
     /// as <see cref="WorkloadBugRepros.OverwriteWideWithWide_DoesNotLeaveOrphanContinuation"/>
     /// — see BUGS-FOUND.md. Remove the Skip when the cleanup in
     /// <c>TerminalBuffer.Print</c> is widened.</summary>
-    [Fact(Skip = "BUGS-FOUND.md #1 — wide-over-wide orphan continuation")]
+    [Fact]
     public void Fuzz_Utf8MixedStreams_NoThrow()
     {
         var rng = new Random(0xBADBED);

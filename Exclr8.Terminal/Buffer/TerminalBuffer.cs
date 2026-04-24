@@ -321,17 +321,32 @@ public sealed class TerminalBuffer : IParserActions
     }
 
     // ---- Selection ----
+    // All callers pass rows in VISUAL coords (0..Rows-1) from mouse
+    // events; we convert to absolute internally so the highlight is
+    // anchored to content, not viewport. Scrolling after selecting
+    // keeps the selection glued to the same bytes.
+
+    /// <summary>Convert a visual row (0 = top of current viewport) to
+    /// the corresponding absolute row (0 = oldest scrollback).</summary>
+    public int VisualToAbsRow(int visualRow) =>
+        _active.Scrollback.Count - ScrollOffset + visualRow;
+
+    /// <summary>Inverse of <see cref="VisualToAbsRow"/>.</summary>
+    public int AbsToVisualRow(int absRow) =>
+        absRow - (_active.Scrollback.Count - ScrollOffset);
 
     public void StartSelection(int row, int col)
     {
-        Selection = new TerminalSelection(row, col, row, col, SelectionMode.Character);
+        int abs = VisualToAbsRow(row);
+        Selection = new TerminalSelection(abs, col, abs, col, SelectionMode.Character);
         Bump();
     }
 
     public void ExtendSelection(int row, int col)
     {
         if (Selection == null) return;
-        Selection = Selection with { EndRow = row, EndCol = col };
+        int abs = VisualToAbsRow(row);
+        Selection = Selection with { EndRow = abs, EndCol = col };
         Bump();
     }
 
@@ -347,22 +362,26 @@ public sealed class TerminalBuffer : IParserActions
         int s = col, e = col;
         while (s > 0           && IsWordChar(cells[s - 1])) s--;
         while (e < Cols - 1    && IsWordChar(cells[e + 1])) e++;
-        Selection = new TerminalSelection(row, s, row, e, SelectionMode.Word);
+        int abs = VisualToAbsRow(row);
+        Selection = new TerminalSelection(abs, s, abs, e, SelectionMode.Word);
         Bump();
     }
 
     public void SelectLine(int row)
     {
-        Selection = new TerminalSelection(row, 0, row, Cols - 1, SelectionMode.Line);
+        int abs = VisualToAbsRow(row);
+        Selection = new TerminalSelection(abs, 0, abs, Cols - 1, SelectionMode.Line);
         Bump();
     }
 
-    /// <summary>Select every visible row in the current viewport. If
-    /// the user is viewing scrollback, this selects that region; at
-    /// the live prompt it selects the visible screen.</summary>
+    /// <summary>Select every row in the buffer — scrollback + live
+    /// screen. Absolute-anchored, so scrolling after Select-All keeps
+    /// the same region selected.</summary>
     public void SelectAll()
     {
-        Selection = new TerminalSelection(0, 0, Rows - 1, Cols - 1, SelectionMode.Line);
+        int sb   = _active.Scrollback.Count;
+        int last = sb + Rows - 1;
+        Selection = new TerminalSelection(0, 0, last, Cols - 1, SelectionMode.Line);
         Bump();
     }
 
@@ -502,10 +521,14 @@ public sealed class TerminalBuffer : IParserActions
     {
         if (Selection == null) return string.Empty;
         var (r1, c1, r2, c2) = Selection.Normalized();
+        int sbCount = _active.Scrollback.Count;
         var sb = new StringBuilder();
         for (int r = r1; r <= r2; r++)
         {
-            var cells = GetRowForRender(r);
+            // Selection rows are absolute — row 0 is the oldest
+            // scrollback line, row (sbCount + Rows - 1) is the bottom
+            // of the live screen. AbsoluteRow resolves for both.
+            var cells = AbsoluteRow(r, sbCount);
             if (cells == null) continue;
             int cs = r == r1 ? c1 : 0;
             int ce = r == r2 ? c2 : Cols - 1;
@@ -576,6 +599,21 @@ public sealed class TerminalBuffer : IParserActions
         if ((row[CursorCol].Flags2 & CellFlags2.IsWide) != 0 && CursorCol + 1 < Cols)
         {
             row[CursorCol + 1].Flags2 &= ~CellFlags2.IsContinuation;
+        }
+        // Wide-writing over a wide-left: we're placing width=2 at
+        // CursorCol, which means the cell at CursorCol+1 becomes OUR
+        // continuation. If CursorCol+1 was itself a wide-left (IsWide),
+        // its continuation at CursorCol+2 is now orphaned — still
+        // flagged IsContinuation but with no wide-left partner. Clear
+        // it so the renderer doesn't treat it as an unselectable
+        // phantom cell. Tracked as BUGS-FOUND.md #1.
+        if (width == 2
+            && CursorCol + 1 < Cols
+            && (row[CursorCol + 1].Flags2 & CellFlags2.IsWide) != 0
+            && CursorCol + 2 < Cols)
+        {
+            row[CursorCol + 2].Flags2 &= ~CellFlags2.IsContinuation;
+            row[CursorCol + 2].Rune    = 0;
         }
 
         // Preserve SGR-driven Flags2 bits (Blink) from the pen, but
