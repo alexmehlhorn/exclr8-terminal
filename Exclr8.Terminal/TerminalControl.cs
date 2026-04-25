@@ -67,6 +67,27 @@ public class TerminalControl : Control, IDisposable
     private bool _altHeld;
     private TerminalTheme? _colorScheme;
 
+    // Synchronized-output (DECSET 2026) state. While the app holds the
+    // mode on, we coalesce InvalidateVisual calls — the rendered frame
+    // is "atomic" with respect to the byte stream so a half-painted
+    // composition (the typical TUI tearing pattern) never reaches the
+    // screen. A guard timer caps how long we'll honour the request, so
+    // a misbehaving emitter that opens BSU and never closes it can't
+    // freeze the display.
+    private readonly DispatcherTimer _syncOutputTimer;
+    private static readonly TimeSpan SyncOutputMaxHold = TimeSpan.FromMilliseconds(150);
+
+    // Resize debounce. Window-manager drag-resize gestures and tab/
+    // pane reparents emit a burst of Bounds changes — sometimes
+    // dozens within a single frame — and reflowing on every one
+    // makes the buffer thrash and the PTY receive a SIGWINCH storm.
+    // The debounce coalesces the burst: each Bounds change schedules
+    // a deferred resize, restarting the timer; only the FINAL size
+    // (after activity stops) reaches the buffer + the Resized event.
+    private readonly DispatcherTimer _resizeDebounceTimer;
+    private (int Cols, int Rows)? _pendingResize;
+    private static readonly TimeSpan ResizeDebounceDelay = TimeSpan.FromMilliseconds(50);
+
     /// <summary>User typed — payload is the byte sequence ready for the
     /// PTY writer.</summary>
     public event EventHandler<ReadOnlyMemory<byte>>? Input;
@@ -80,6 +101,62 @@ public class TerminalControl : Control, IDisposable
 
     /// <summary>User clicked an OSC 8 hyperlink.</summary>
     public event EventHandler<string>? HyperlinkClicked;
+
+    /// <summary>OSC 0 / OSC 2 — window title set by the shell.</summary>
+    public event EventHandler<string>? TitleChanged
+    {
+        add    => _buffer.TitleChanged += value;
+        remove => _buffer.TitleChanged -= value;
+    }
+
+    /// <summary>OSC 0 / OSC 1 — icon name. Most shells use OSC 0 which
+    /// sets both title and icon name simultaneously.</summary>
+    public event EventHandler<string>? IconNameChanged
+    {
+        add    => _buffer.IconNameChanged += value;
+        remove => _buffer.IconNameChanged -= value;
+    }
+
+    /// <summary>OSC 7 — shell-announced current working directory.
+    /// Hosts subscribe to this to drive "open new tab here" UX,
+    /// session recall, or breadcrumbs.</summary>
+    public event EventHandler<string>? WorkingDirectoryChanged
+    {
+        add    => _buffer.WorkingDirectoryChanged += value;
+        remove => _buffer.WorkingDirectoryChanged -= value;
+    }
+
+    /// <summary>Last working directory the shell announced (OSC 7).
+    /// Null until the shell emits one.</summary>
+    public string? WorkingDirectory => _buffer.WorkingDirectory;
+
+    /// <summary>OSC 133 — FinalTerm/iTerm2 semantic prompt markers
+    /// (PromptStart/PromptEnd/CommandStart/CommandEnd + exit code).
+    /// Hosts use these to draw command-status gutters, jump-to-prompt
+    /// nav, and AI-style command boundaries.</summary>
+    public event EventHandler<SemanticPromptEventArgs>? SemanticPrompt
+    {
+        add    => _buffer.SemanticPrompt += value;
+        remove => _buffer.SemanticPrompt -= value;
+    }
+
+    /// <summary>OSC 52 — shell asked to write to the OS clipboard.
+    /// Only fires when <see cref="AllowClipboardAccess"/> is true; the
+    /// host decides whether to honour the request.</summary>
+    public event EventHandler<ClipboardRequestEventArgs>? ClipboardRequested
+    {
+        add    => _buffer.ClipboardRequested += value;
+        remove => _buffer.ClipboardRequested -= value;
+    }
+
+    /// <summary>OSC 52 routing gate. False (default) silently drops
+    /// shell-initiated clipboard writes; true raises
+    /// <see cref="ClipboardRequested"/>.</summary>
+    public bool AllowClipboardAccess
+    {
+        get => _buffer.AllowClipboardAccess;
+        set => _buffer.AllowClipboardAccess = value;
+    }
 
     public TerminalBuffer Buffer => _buffer;
 
@@ -132,9 +209,17 @@ public class TerminalControl : Control, IDisposable
     private readonly HashSet<int> _recentlyExitedPids = new();
     private const int ExitPidMemory = 1024;
     private IProcessChildWatcher? _processWatcher;
-    private int _processTreeSubscribers;
     private int _rootProcessId;
     private Action<ProcessTreeChange>? _processTreeChangedInner;
+
+    /// <summary>Live subscriber count derived from the delegate's
+    /// invocation list. Tracking this via a separate counter let
+    /// repeated <c>-=</c>'s of the same handler drive the count
+    /// negative, which would prevent a future legitimate add from
+    /// starting the watcher. Reading it from the delegate keeps the
+    /// two in sync by construction.</summary>
+    private int ProcessTreeSubscriberCount =>
+        _processTreeChangedInner?.GetInvocationList().Length ?? 0;
 
     /// <summary>The shell / session root pid the terminal's watcher
     /// should hang off. VibeCoder sets this to the PTY's pid on spawn
@@ -172,7 +257,6 @@ public class TerminalControl : Control, IDisposable
             lock (_processWatchLock)
             {
                 _processTreeChangedInner += value;
-                _processTreeSubscribers++;
                 EnsureWatcherStarted_Locked();
             }
         }
@@ -182,8 +266,7 @@ public class TerminalControl : Control, IDisposable
             lock (_processWatchLock)
             {
                 _processTreeChangedInner -= value;
-                _processTreeSubscribers--;
-                if (_processTreeSubscribers <= 0) StopWatcher_Locked();
+                if (ProcessTreeSubscriberCount == 0) StopWatcher_Locked();
             }
         }
     }
@@ -191,7 +274,7 @@ public class TerminalControl : Control, IDisposable
     private void EnsureWatcherStarted_Locked()
     {
         if (_processWatcher != null) return;
-        if (_processTreeSubscribers <= 0) return;
+        if (ProcessTreeSubscriberCount == 0) return;
         try
         {
             var w = ProcessChildWatcherFactory.Create();
@@ -214,9 +297,9 @@ public class TerminalControl : Control, IDisposable
         // a future session shouldn't inherit stale suppression for
         // pids the OS might reuse.
         _recentlyExitedPids.Clear();
-        // Note: _processTreeSubscribers is not reset here — the
-        // subscriber count is maintained by the event add/remove
-        // accessors, not by us.
+        // Subscriber count is derived from
+        // _processTreeChangedInner.GetInvocationList(); we don't
+        // touch the delegate here, so the count stays accurate.
         if (w == null) return;
         w.TreeChanged -= OnWatcherTreeChanged;
         try { w.Dispose(); } catch { }
@@ -316,7 +399,19 @@ public class TerminalControl : Control, IDisposable
 
         _renderer = new TerminalRenderer();
         _buffer   = new TerminalBuffer(80, 24);
-        _buffer.Changed += (_, _) => InvalidateVisual();
+        _buffer.Changed += OnBufferChanged;
+        _buffer.SynchronizedOutputChanged += OnSynchronizedOutputChanged;
+        _syncOutputTimer = new DispatcherTimer { Interval = SyncOutputMaxHold };
+        _syncOutputTimer.Tick += (_, _) =>
+        {
+            // Safety net: an app that opened BSU but never sent ESU
+            // shouldn't be able to freeze us. Force-flush + stop.
+            _syncOutputTimer.Stop();
+            InvalidateVisual();
+        };
+
+        _resizeDebounceTimer = new DispatcherTimer { Interval = ResizeDebounceDelay };
+        _resizeDebounceTimer.Tick += (_, _) => ApplyPendingResize();
 
         this.GetObservable(BoundsProperty)
             .Subscribe(new AnonymousObserver<Rect>(_ => RecomputeGrid()));
@@ -340,6 +435,29 @@ public class TerminalControl : Control, IDisposable
 
         _scrollbarTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
         _scrollbarTimer.Tick += OnScrollbarTick;
+    }
+
+    private void OnBufferChanged(object? sender, EventArgs e)
+    {
+        // Hold off rendering while the app has DECSET 2026 active — the
+        // guard timer (or matching DECRST) will trigger the actual
+        // InvalidateVisual.
+        if (_buffer.SynchronizedOutput) return;
+        InvalidateVisual();
+    }
+
+    private void OnSynchronizedOutputChanged(object? sender, bool on)
+    {
+        if (on)
+        {
+            _syncOutputTimer.Stop();
+            _syncOutputTimer.Start();
+        }
+        else
+        {
+            _syncOutputTimer.Stop();
+            InvalidateVisual();
+        }
     }
 
     /// <summary>Surface "scrollbar-worthy activity". Snaps opacity to
@@ -475,7 +593,34 @@ public class TerminalControl : Control, IDisposable
     private void RecomputeGrid()
     {
         var (cols, rows) = _renderer.ComputeGrid(Bounds.Size);
-        if (cols < MinUsableCols || rows < MinUsableRows) return;
+        // Either an unusable transient size or a return to the
+        // current grid invalidates any earlier pending resize: that
+        // stashed (cols, rows) was a momentary layout artefact, and
+        // applying it 50ms later — when Bounds has settled back to
+        // the current size — would emit a wrong Resized event and
+        // pointlessly thrash the buffer. Drop both the pending
+        // value and the timer.
+        if (cols < MinUsableCols || rows < MinUsableRows
+            || (cols == _buffer.Cols && rows == _buffer.Rows))
+        {
+            _pendingResize = null;
+            _resizeDebounceTimer.Stop();
+            return;
+        }
+        // Stash the target dims and (re)start the debounce timer.
+        // ApplyPendingResize runs after activity stops; until then,
+        // the buffer keeps its current dimensions and the PTY isn't
+        // spammed with SIGWINCH-equivalent Resized events.
+        _pendingResize = (cols, rows);
+        _resizeDebounceTimer.Stop();
+        _resizeDebounceTimer.Start();
+    }
+
+    private void ApplyPendingResize()
+    {
+        _resizeDebounceTimer.Stop();
+        if (_pendingResize is not (int cols, int rows)) return;
+        _pendingResize = null;
         if (cols == _buffer.Cols && rows == _buffer.Rows) return;
         _buffer.Resize(cols, rows);
         Resized?.Invoke(this, (cols, rows));
@@ -540,7 +685,15 @@ public class TerminalControl : Control, IDisposable
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
-        _altHeld = (e.KeyModifiers & KeyModifiers.Alt) != 0;
+        // _altHeld feeds OnTextInput's "meta sends ESC" prefix.
+        // AltGr (the right Alt key on most ISO keyboards) is reported
+        // as Ctrl+Alt by Windows/Linux; on those layouts AltGr+Q is
+        // how the user types `@`, AltGr+5 is `€`, etc. Treating that
+        // as "Alt held" would prefix every AltGr-produced character
+        // with ESC and ship `\e@` to the shell instead of `@`. Real
+        // Alt-as-meta only fires with Alt and NOT Ctrl.
+        _altHeld = (e.KeyModifiers & KeyModifiers.Alt)     != 0
+                && (e.KeyModifiers & KeyModifiers.Control) == 0;
 
         bool isMac = OperatingSystem.IsMacOS();
         bool meta  = (e.KeyModifiers & KeyModifiers.Meta)    != 0;
@@ -649,7 +802,8 @@ public class TerminalControl : Control, IDisposable
             // fall through to send the key normally
         }
 
-        var bytes = KeyMapper.Map(e, _buffer.ApplicationCursorKeys, _buffer.ApplicationKeypad);
+        var bytes = KeyMapper.Map(e, _buffer.ApplicationCursorKeys, _buffer.ApplicationKeypad,
+            _buffer.ModifyOtherKeys);
         if (bytes.Length > 0)
         {
             // Actual shell input — snap to live buffer so the user
@@ -698,7 +852,8 @@ public class TerminalControl : Control, IDisposable
     protected override void OnKeyUp(KeyEventArgs e)
     {
         base.OnKeyUp(e);
-        _altHeld = (e.KeyModifiers & KeyModifiers.Alt) != 0;
+        _altHeld = (e.KeyModifiers & KeyModifiers.Alt)     != 0
+                && (e.KeyModifiers & KeyModifiers.Control) == 0;
     }
 
     protected override void OnTextInput(TextInputEventArgs e)
@@ -767,6 +922,7 @@ public class TerminalControl : Control, IDisposable
         if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
         {
             SendMouse(btn, row, col, e.KeyModifiers, pressed: true);
+            e.Handled = true;
             return;
         }
 
@@ -833,7 +989,11 @@ public class TerminalControl : Control, IDisposable
         if (_mouseDown)
         {
             if (_buffer.MouseMode >= 1002 && _buffer.ScrollOffset == 0)
-            { SendMouse(_pressedBtn + 32, row, col, e.KeyModifiers, pressed: true); return; }
+            {
+                SendMouse(_pressedBtn + 32, row, col, e.KeyModifiers, pressed: true);
+                e.Handled = true;
+                return;
+            }
             if (_buffer.MouseMode == 0 || _buffer.ScrollOffset > 0)
             {
                 // First drag movement — materialise the selection
@@ -850,6 +1010,7 @@ public class TerminalControl : Control, IDisposable
         else if (_buffer.MouseMode >= 1003 && _buffer.ScrollOffset == 0)
         {
             SendMouse(35, row, col, e.KeyModifiers, pressed: true); // btn=3 = motion without button
+            e.Handled = true;
         }
     }
 
@@ -870,7 +1031,11 @@ public class TerminalControl : Control, IDisposable
         _mouseDown = false;
 
         if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
-        { SendMouse(_pressedBtn, row, col, e.KeyModifiers, pressed: false); return; }
+        {
+            SendMouse(_pressedBtn, row, col, e.KeyModifiers, pressed: false);
+            e.Handled = true;
+            return;
+        }
 
         if (wasDown)
         {
@@ -924,16 +1089,65 @@ public class TerminalControl : Control, IDisposable
 
     private void SendMouse(int btn, int row, int col, KeyModifiers mods, bool pressed)
     {
-        // Always SGR (mode 1006) encoding — unambiguous at any grid
-        // size. Apps that only speak the legacy X10 encoding won't
-        // receive events but modern ones all handle 1006.
+        // X10 mouse mode (DECSET 9) is press-only: drop releases. Same
+        // for motion (which we synthesise as btn+32 / btn=35) — X10 can't
+        // encode them. Modern modes (1000/1002/1003) accept everything.
+        if (_buffer.MouseMode == 9 && !pressed) return;
+        if (_buffer.MouseMode == 9 && btn >= 32) return;
+
         int b = btn;
         if ((mods & KeyModifiers.Shift)   != 0) b += 4;
         if ((mods & KeyModifiers.Alt)     != 0) b += 8;
         if ((mods & KeyModifiers.Control) != 0) b += 16;
-        char fin = pressed ? 'M' : 'm';
-        var seq = Encoding.ASCII.GetBytes($"\x1b[<{b};{col + 1};{row + 1}{fin}");
-        Input?.Invoke(this, seq);
+
+        byte[] seq;
+        switch (_buffer.MouseEncoding)
+        {
+            case MouseEncoding.Sgr:
+            {
+                // ESC [ < b ; x ; y M  (press) / m (release). 1-based
+                // coords; no column limit.
+                char fin = pressed ? 'M' : 'm';
+                seq = Encoding.ASCII.GetBytes($"\x1b[<{b};{col + 1};{row + 1}{fin}");
+                break;
+            }
+            case MouseEncoding.SgrPixels:
+            {
+                // Same wire format, but x and y are pixel coordinates.
+                // Compute from cell × cell-size; clamp to a sane lower
+                // bound so apps that divide by zero on tiny grids
+                // don't crash.
+                int px = (int)Math.Max(1, (col + 0.5) * _renderer.CellWidth);
+                int py = (int)Math.Max(1, (row + 0.5) * _renderer.CellHeight);
+                char fin = pressed ? 'M' : 'm';
+                seq = Encoding.ASCII.GetBytes($"\x1b[<{b};{px};{py}{fin}");
+                break;
+            }
+            default:
+            {
+                // Legacy X10/1000 encoding: ESC [ M Cb Cx Cy with each
+                // coordinate as a single byte at +32 offset. Releases
+                // surface as button=3 (encoded as 35 = 32+3) since the
+                // wire format has no press/release flag. Mouse columns
+                // beyond 223 can't be encoded — clamp rather than
+                // emit a corrupt sequence (matches xterm).
+                int wireBtn = pressed ? b : 3 | (b & ~3); // release = button 3 in low 2 bits
+                int cx = Math.Min(col + 1, 223);
+                int cy = Math.Min(row + 1, 223);
+                seq = new byte[] {
+                    0x1B, (byte)'[', (byte)'M',
+                    (byte)(wireBtn + 32),
+                    (byte)(cx + 32),
+                    (byte)(cy + 32),
+                };
+                break;
+            }
+        }
+        // Route through RaiseInput so the local InputEventStream sees
+        // mouse bytes alongside keystrokes — keeps observers consistent.
+        // Origin = Programmatic since the bytes are control-plane
+        // (mouse-event encoding), not user-typed text.
+        RaiseInput(seq, InputLineOrigin.Programmatic);
     }
 
     private (int row, int col) GridPos(Point p)
@@ -1032,8 +1246,11 @@ public class TerminalControl : Control, IDisposable
     /// <summary>Jump to the previous search match.</summary>
     public void FindPrev() => _buffer.PrevMatch();
 
-    /// <summary>Leave find mode — drops matches and hides highlights.</summary>
-    public void CloseFind() => _buffer.ClearSearch();
+    /// <summary>Leave find mode — drops matches, hides highlights, and
+    /// invalidates any in-flight async search so its results can't
+    /// reappear after the find UI closes. Equivalent to calling
+    /// <c>Find(null)</c>.</summary>
+    public void CloseFind() => Find(null);
 
     /// <summary>Number of matches for the current needle. Useful for a
     /// host-rendered "N of M" counter in the find bar.</summary>
@@ -1176,6 +1393,15 @@ public class TerminalControl : Control, IDisposable
 
         _blinkTimer.Stop();
         _scrollbarTimer.Stop();
+        _syncOutputTimer.Stop();
+        _resizeDebounceTimer.Stop();
+
+        // The buffer is exposed publicly and a host may keep a
+        // reference to it after disposing the control (e.g. for
+        // post-mortem inspection). Detach our handlers so the buffer
+        // doesn't hold this control alive through them.
+        _buffer.Changed                   -= OnBufferChanged;
+        _buffer.SynchronizedOutputChanged -= OnSynchronizedOutputChanged;
 
         _searchCts?.Cancel();
         _searchCts?.Dispose();

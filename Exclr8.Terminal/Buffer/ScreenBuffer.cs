@@ -43,7 +43,15 @@ public sealed class ScreenBuffer
 
     public ScrollbackRing Scrollback { get; }
     private readonly List<TerminalCell[]> _rows = new();
+    /// <summary>Per-row wrap flag. <c>_rowsWrapped[Physical(r)]</c> is
+    /// true when row r is the continuation of an auto-wrap from r-1
+    /// (or, for r=0, from the bottom of scrollback). Set by the buffer
+    /// when DECAWM kicks in; consumed by reflow on resize.</summary>
+    private readonly List<bool> _rowsWrapped = new();
     private int _rowsHead;
+
+    public bool GetWrapped(int r) => _rowsWrapped[Physical(r)];
+    public void SetWrapped(int r, bool v) => _rowsWrapped[Physical(r)] = v;
 
     public ScreenBuffer(int cols, int rows, int scrollbackLimit)
     {
@@ -51,7 +59,11 @@ public sealed class ScreenBuffer
         Rows = rows;
         _scrollbackLimit = scrollbackLimit;
         Scrollback = new ScrollbackRing(Math.Max(1, scrollbackLimit));
-        for (int i = 0; i < rows; i++) _rows.Add(new TerminalCell[cols]);
+        for (int i = 0; i < rows; i++)
+        {
+            _rows.Add(new TerminalCell[cols]);
+            _rowsWrapped.Add(false);
+        }
     }
 
     /// <summary>Physical index into <see cref="_rows"/> for logical
@@ -60,7 +72,14 @@ public sealed class ScreenBuffer
 
     public TerminalCell[] GetRow(int r) => _rows[Physical(r)];
 
-    public void Resize(int cols, int rows)
+    /// <summary>Resize the screen + scrollback to a new column / row
+    /// count. When <paramref name="cols"/> changes, lines previously
+    /// marked as wrapped continuations are reflowed to the new width
+    /// — see <see cref="Reflow"/>. Returns the new (row, col) cursor
+    /// position derived from <paramref name="cursorRow"/> /
+    /// <paramref name="cursorCol"/>; the caller updates the buffer's
+    /// cursor state from the result.</summary>
+    public (int row, int col) Resize(int cols, int rows, int cursorRow, int cursorCol)
     {
         // Normalise the physical list to head = 0 before any growth /
         // shrink — additions go to the end of the list and shrinkage
@@ -70,41 +89,330 @@ public sealed class ScreenBuffer
 
         if (cols != Cols)
         {
-            for (int r = 0; r < _rows.Count; r++)
-            {
-                var old = _rows[r];
-                var next = new TerminalCell[cols];
-                Array.Copy(old, next, Math.Min(old.Length, cols));
-                _rows[r] = next;
-            }
-            for (int i = 0; i < Scrollback.Count; i++)
-            {
-                var old = Scrollback[i];
-                var next = new TerminalCell[cols];
-                Array.Copy(old, next, Math.Min(old.Length, cols));
-                Scrollback[i] = next;
-            }
+            (cursorRow, cursorCol) = Reflow(cols, cursorRow, cursorCol);
             Cols = cols;
         }
 
         if (rows > Rows)
         {
-            for (int i = Rows; i < rows; i++) _rows.Add(new TerminalCell[Cols]);
+            for (int i = Rows; i < rows; i++)
+            {
+                _rows.Add(new TerminalCell[Cols]);
+                _rowsWrapped.Add(false);
+            }
         }
         else if (rows < Rows)
         {
-            // Shrink: drop the top rows on the floor. We deliberately do
-            // NOT push them to scrollback — repeated grow/shrink cycles
-            // (e.g. moving a cell between layouts with different cell
-            // sizes) would otherwise add the same content to scrollback
-            // on every shrink, creating duplicate history. Scrollback
-            // should grow from live shell output scrolling off the top,
-            // not from layout-driven resizes. (A full fix would reflow
-            // lines to the new width; tracked separately.)
+            // Shrink. Hard rule: layout-driven shrinks must NOT push
+            // live-screen rows into scrollback. If they did, repeated
+            // grow/shrink cycles (e.g. switching between tabs whose
+            // cells have different sizes, or any TUI that redraws
+            // its full screen on SIGWINCH) would push the same
+            // freshly-redrawn content into scrollback every cycle and
+            // the user sees duplicated history. Scrollback grows from
+            // genuine output scrolling off the top via ScrollUpRegion,
+            // never from resize.
+            //
+            // Strategy:
+            //   1. Drop blank tail rows (free, common after reflow).
+            //   2. Drop blank top rows (also free).
+            //   3. If we still need to shrink and the cursor is below
+            //      the new bottom, drop from the TOP — content shifts
+            //      up so the cursor stays onscreen. Cursor index moves
+            //      with content.
+            //   4. Otherwise drop from the BOTTOM.
             int extra = Rows - rows;
-            for (int i = 0; i < extra; i++) _rows.RemoveAt(0);
+            while (extra > 0 && _rows.Count > 0 && IsBlankRow(_rows[^1]))
+            {
+                _rows.RemoveAt(_rows.Count - 1);
+                _rowsWrapped.RemoveAt(_rowsWrapped.Count - 1);
+                extra--;
+            }
+            while (extra > 0 && _rows.Count > 0 && IsBlankRow(_rows[0]))
+            {
+                _rows.RemoveAt(0);
+                _rowsWrapped.RemoveAt(0);
+                extra--;
+                cursorRow--;
+            }
+            if (extra > 0 && cursorRow >= rows)
+            {
+                int dropTop = Math.Min(extra, cursorRow - rows + 1);
+                for (int i = 0; i < dropTop; i++)
+                {
+                    _rows.RemoveAt(0);
+                    _rowsWrapped.RemoveAt(0);
+                }
+                cursorRow -= dropTop;
+                extra -= dropTop;
+            }
+            while (extra > 0 && _rows.Count > 0)
+            {
+                _rows.RemoveAt(_rows.Count - 1);
+                _rowsWrapped.RemoveAt(_rowsWrapped.Count - 1);
+                extra--;
+            }
+            cursorRow = Math.Max(0, Math.Min(cursorRow, rows - 1));
         }
         Rows = rows;
+        cursorRow = Math.Max(0, Math.Min(cursorRow, Rows - 1));
+        cursorCol = Math.Max(0, Math.Min(cursorCol, Cols - 1));
+        return (cursorRow, cursorCol);
+    }
+
+    /// <summary>Reflow scrollback + live screen to a new column count.
+    /// Wrapped row groups are joined into a single logical line and
+    /// re-split at the new width. Wide cells never straddle the new
+    /// wrap boundary — a blank cell is left at the row's end if a
+    /// wide cell would otherwise span. Returns the cursor position in
+    /// the reflowed live screen.</summary>
+    private (int row, int col) Reflow(int newCols, int cursorRow, int cursorCol)
+    {
+        // Collect ALL existing rows (scrollback + live) as logical lines
+        // in order. Each line is a list of cells; the boundary between
+        // lines is where the source row's wrap flag is false.
+        var lines = new List<List<TerminalCell>>();
+        // Cursor tracking: which logical line the cursor is in
+        // (cursorLineIdx) and the cell offset within that line
+        // (cursorOffsetInLine). Carried into the redistribution loop
+        // so we can land the cursor on the EXACT cell — including on
+        // blank logical lines, where a global cell-index would clash
+        // with the end of the previous line.
+        int cursorLineIdx = -1;
+        int cursorOffsetInLine = 0;
+        // Scrollback rows first.
+        var srcCols = Cols;
+        var current = new List<TerminalCell>();
+        for (int i = 0; i < Scrollback.Count; i++)
+        {
+            var row = Scrollback[i];
+            int len = TrimmedLength(row, srcCols);
+            for (int c = 0; c < len; c++) current.Add(row[c]);
+            // Determine whether the next physical row in *logical* order
+            // is a continuation: that's either the next scrollback row
+            // (if any) or the first live-screen row (when this is the
+            // last scrollback row). Without the live-row fallback the
+            // last scrollback row prematurely closes a logical line
+            // that actually continues into the live screen, leaving
+            // the first N narrow rows un-rejoined on widen.
+            bool nextIsWrapped;
+            if (i + 1 < Scrollback.Count)
+                nextIsWrapped = Scrollback.IsWrapped(i + 1);
+            else
+                nextIsWrapped = _rows.Count > 0 && _rowsWrapped[Physical(0)];
+            if (!nextIsWrapped)
+            {
+                lines.Add(current);
+                current = new List<TerminalCell>();
+            }
+        }
+
+        // Trailing blank live rows below the cursor are padding, not
+        // content. Find the last live row that's worth gathering: the
+        // max of the cursor row and the last non-blank row. Beyond
+        // that, rows are filled with blanks at the end of the new
+        // layout instead of contributing empty logical lines.
+        int lastInteresting = cursorRow;
+        for (int r = _rows.Count - 1; r > lastInteresting; r--)
+        {
+            if (TrimmedLength(_rows[Physical(r)], srcCols) > 0
+                || _rowsWrapped[Physical(r)])
+            {
+                lastInteresting = r;
+                break;
+            }
+        }
+
+        for (int r = 0; r <= lastInteresting && r < _rows.Count; r++)
+        {
+            var row = _rows[Physical(r)];
+            int len = TrimmedLength(row, srcCols);
+            // Capture cursor (line index, offset) before adding this
+            // row's cells. The line we end up in is whichever line
+            // gets pushed (or whichever empty line is added) for this
+            // physical row.
+            if (r == cursorRow)
+            {
+                cursorLineIdx = lines.Count;
+                cursorOffsetInLine = current.Count + Math.Min(cursorCol, srcCols);
+            }
+            for (int c = 0; c < len; c++) current.Add(row[c]);
+            bool nextWrapped = r + 1 < _rows.Count && _rowsWrapped[Physical(r + 1)];
+            if (!nextWrapped)
+            {
+                lines.Add(current);
+                current = new List<TerminalCell>();
+            }
+        }
+        if (current.Count > 0)
+        {
+            lines.Add(current);
+        }
+
+        // Redistribute. Each logical line splits into ceil(len /
+        // newCols) physical rows. Wide cells get pushed to the next
+        // row if they would span a boundary. Empty logical lines map
+        // to one blank row.
+        var redistributed = new List<(TerminalCell[] Row, bool Wrapped)>();
+        int newCursorRow = -1, newCursorCol = -1;
+        for (int lineIdx = 0; lineIdx < lines.Count; lineIdx++)
+        {
+            var line = lines[lineIdx];
+            bool isCursorLine = lineIdx == cursorLineIdx;
+            // Empty logical lines still occupy one redistributed row,
+            // and the cursor can legitimately be on one (a blank row
+            // between paragraphs). Place the cursor explicitly on
+            // that row before adding it.
+            if (line.Count == 0)
+            {
+                if (isCursorLine && newCursorRow < 0)
+                {
+                    newCursorRow = redistributed.Count;
+                    newCursorCol = 0;
+                }
+                redistributed.Add((new TerminalCell[newCols], false));
+                continue;
+            }
+            int idx = 0;
+            bool wrappedFlag = false;
+            int firstRowOfLine = redistributed.Count;
+            while (idx < line.Count)
+            {
+                var rowArr = new TerminalCell[newCols];
+                int outCol = 0;
+                int curRowIndex = redistributed.Count;
+                while (outCol < newCols && idx < line.Count)
+                {
+                    // Capture the cursor BEFORE writing the cell at
+                    // its source-line index — that's the mapping the
+                    // host wants ("the cursor is on this cell"). Done
+                    // via the explicit (line, offset) pair so wide-
+                    // cell wrap-skips don't throw off the math.
+                    if (isCursorLine && newCursorRow < 0 && idx == cursorOffsetInLine)
+                    {
+                        newCursorRow = curRowIndex;
+                        newCursorCol = outCol;
+                    }
+                    var cell = line[idx];
+                    bool isWide = (cell.Flags2 & CellFlags2.IsWide) != 0;
+                    if (isWide && outCol + 1 >= newCols)
+                    {
+                        // No room for the wide pair on this line — wrap.
+                        // Leave a trailing blank in outCol so the wide
+                        // cell starts the next row.
+                        break;
+                    }
+                    rowArr[outCol++] = cell;
+                    idx++;
+                    if (isWide && idx < line.Count
+                        && (line[idx].Flags2 & CellFlags2.IsContinuation) != 0)
+                    {
+                        rowArr[outCol++] = line[idx];
+                        idx++;
+                    }
+                }
+                redistributed.Add((rowArr, wrappedFlag));
+                wrappedFlag = true; // subsequent rows of this line are continuations
+            }
+            // Cursor at end-of-line (offset == line.Count) lands one
+            // column past the last placed cell. Walk to where the
+            // last cell of the line landed and step one to the right
+            // on the same row, wrapping to next row if at margin.
+            if (isCursorLine && newCursorRow < 0
+                && cursorOffsetInLine >= line.Count)
+            {
+                int lastRowIndex = redistributed.Count - 1;
+                // Find the trailing-cell column on the last row by
+                // counting non-default cells from the right. Cheap —
+                // newCols is small and we only do this once per
+                // line at most.
+                var lastRow = redistributed[lastRowIndex].Row;
+                int lastCol = newCols - 1;
+                while (lastCol > 0 && lastRow[lastCol].Rune == 0
+                       && (lastRow[lastCol].Flags2 & CellFlags2.IsContinuation) == 0)
+                    lastCol--;
+                int placeCol = lastCol + 1;
+                if (placeCol >= newCols)
+                {
+                    // Past the right edge — deferred-wrap convention.
+                    newCursorRow = lastRowIndex;
+                    newCursorCol = newCols - 1;
+                }
+                else
+                {
+                    newCursorRow = lastRowIndex;
+                    newCursorCol = placeCol;
+                }
+            }
+        }
+        if (newCursorRow < 0)
+        {
+            // Cursor was past all content — pin to the end.
+            newCursorRow = redistributed.Count;
+            newCursorCol = 0;
+        }
+
+        // Split into scrollback (front) and live screen (last `Rows`).
+        // The alternate screen is configured with ScrollbackLimit = 0
+        // so its history is intentionally transient — reflow must
+        // honour that. Without the gate, reflow that produced more
+        // rows than the live screen could hold would quietly leak
+        // them into the alt screen's ring (capacity is clamped to a
+        // minimum of 1 internally), and a later switch back to the
+        // primary would expose ghost rows.
+        int liveCount = Rows;
+        int sbCount = ScrollbackLimit > 0
+            ? Math.Max(0, redistributed.Count - liveCount)
+            : 0;
+        // Replace scrollback contents.
+        Scrollback.Clear();
+        for (int i = 0; i < sbCount; i++)
+        {
+            Scrollback.Add(redistributed[i].Row, redistributed[i].Wrapped);
+        }
+        // Replace live screen.
+        _rows.Clear();
+        _rowsWrapped.Clear();
+        for (int i = sbCount; i < sbCount + liveCount; i++)
+        {
+            if (i < redistributed.Count)
+            {
+                _rows.Add(redistributed[i].Row);
+                _rowsWrapped.Add(redistributed[i].Wrapped);
+            }
+            else
+            {
+                _rows.Add(new TerminalCell[newCols]);
+                _rowsWrapped.Add(false);
+            }
+        }
+        _rowsHead = 0;
+
+        // Re-derive cursor in live-screen coordinates.
+        int outCursorRow = Math.Max(0, Math.Min(newCursorRow - sbCount, Rows - 1));
+        int outCursorCol = Math.Max(0, Math.Min(newCursorCol, newCols - 1));
+        return (outCursorRow, outCursorCol);
+    }
+
+    /// <summary>Length of meaningful content in <paramref name="row"/>:
+    /// strip trailing cells that are visually blank (rune 0, no SGR
+    /// state). Required for sane reflow — a row that printed "hi" in
+    /// 80 cols shouldn't gain 78 trailing blanks when reflowed to 40
+    /// cols, blowing into a second row.</summary>
+    private static int TrimmedLength(TerminalCell[] row, int upTo)
+    {
+        int n = Math.Min(row.Length, upTo);
+        while (n > 0)
+        {
+            var cell = row[n - 1];
+            if (cell.Rune != 0) break;
+            if (cell.Flags != 0 || cell.Flags2 != 0) break;
+            if (cell.FgIndex != 0 || cell.BgIndex != 0) break;
+            if (cell.FgRgb != 0 || cell.BgRgb != 0) break;
+            if (cell.HyperlinkId != 0) break;
+            n--;
+        }
+        return n;
     }
 
     private void NormaliseHead()
@@ -112,9 +420,16 @@ public sealed class ScreenBuffer
         if (_rowsHead == 0 || _rows.Count == 0) return;
         int n = _rows.Count;
         var ordered = new TerminalCell[n][];
-        for (int i = 0; i < n; i++) ordered[i] = _rows[(_rowsHead + i) % n];
+        var orderedW = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            ordered[i]  = _rows[(_rowsHead + i) % n];
+            orderedW[i] = _rowsWrapped[(_rowsHead + i) % n];
+        }
         _rows.Clear();
         _rows.AddRange(ordered);
+        _rowsWrapped.Clear();
+        for (int i = 0; i < n; i++) _rowsWrapped.Add(orderedW[i]);
         _rowsHead = 0;
     }
 
@@ -144,8 +459,10 @@ public sealed class ScreenBuffer
             {
                 int headIdx = _rowsHead;
                 var evicted = _rows[headIdx];
-                var recycled = PushScrollback(evicted);
+                bool evictedWrapped = _rowsWrapped[headIdx];
+                var recycled = PushScrollback(evicted, evictedWrapped);
                 _rows[headIdx] = TakeOrAllocBlank(recycled);
+                _rowsWrapped[headIdx] = false; // new blank bottom row
                 _rowsHead = (_rowsHead + 1) % _rows.Count;
             }
             return;
@@ -154,14 +471,18 @@ public sealed class ScreenBuffer
         // Partial region: shift row pointers within [top, bottom]. N
         // pointer moves per scrolled line — same as before the circular
         // conversion. The evicted top row's array is recycled as the
-        // new bottom blank.
+        // new bottom blank. Wrap flags shift in lockstep with rows.
         for (int i = 0; i < n; i++)
         {
             var evicted = _rows[Physical(top)];
             for (int r = top; r < bottom; r++)
-                _rows[Physical(r)] = _rows[Physical(r + 1)];
+            {
+                _rows[Physical(r)]        = _rows[Physical(r + 1)];
+                _rowsWrapped[Physical(r)] = _rowsWrapped[Physical(r + 1)];
+            }
             Array.Clear(evicted, 0, Cols);
-            _rows[Physical(bottom)] = evicted;
+            _rows[Physical(bottom)]        = evicted;
+            _rowsWrapped[Physical(bottom)] = false;
         }
     }
 
@@ -187,6 +508,7 @@ public sealed class ScreenBuffer
             {
                 _rowsHead = (_rowsHead - 1 + _rows.Count) % _rows.Count;
                 Array.Clear(_rows[_rowsHead], 0, Cols);
+                _rowsWrapped[_rowsHead] = false;
             }
             return;
         }
@@ -196,9 +518,13 @@ public sealed class ScreenBuffer
         {
             var evicted = _rows[Physical(bottom)];
             for (int r = bottom; r > top; r--)
-                _rows[Physical(r)] = _rows[Physical(r - 1)];
+            {
+                _rows[Physical(r)]        = _rows[Physical(r - 1)];
+                _rowsWrapped[Physical(r)] = _rowsWrapped[Physical(r - 1)];
+            }
             Array.Clear(evicted, 0, Cols);
-            _rows[Physical(top)] = evicted;
+            _rows[Physical(top)]        = evicted;
+            _rowsWrapped[Physical(top)] = false;
         }
     }
 
@@ -217,9 +543,13 @@ public sealed class ScreenBuffer
         {
             var evicted = _rows[Physical(scrollBottom)];
             for (int r = scrollBottom; r > at; r--)
-                _rows[Physical(r)] = _rows[Physical(r - 1)];
+            {
+                _rows[Physical(r)]        = _rows[Physical(r - 1)];
+                _rowsWrapped[Physical(r)] = _rowsWrapped[Physical(r - 1)];
+            }
             Array.Clear(evicted, 0, Cols);
-            _rows[Physical(at)] = evicted;
+            _rows[Physical(at)]        = evicted;
+            _rowsWrapped[Physical(at)] = false;
         }
     }
 
@@ -236,15 +566,20 @@ public sealed class ScreenBuffer
         {
             var evicted = _rows[Physical(at)];
             for (int r = at; r < scrollBottom; r++)
-                _rows[Physical(r)] = _rows[Physical(r + 1)];
+            {
+                _rows[Physical(r)]        = _rows[Physical(r + 1)];
+                _rowsWrapped[Physical(r)] = _rowsWrapped[Physical(r + 1)];
+            }
             Array.Clear(evicted, 0, Cols);
-            _rows[Physical(scrollBottom)] = evicted;
+            _rows[Physical(scrollBottom)]        = evicted;
+            _rowsWrapped[Physical(scrollBottom)] = false;
         }
     }
 
     public void Clear()
     {
         foreach (var row in _rows) Array.Clear(row, 0, row.Length);
+        for (int i = 0; i < _rowsWrapped.Count; i++) _rowsWrapped[i] = false;
     }
 
     public void ClearScrollback() => Scrollback.Clear();
@@ -253,7 +588,7 @@ public sealed class ScreenBuffer
     /// evicted from the ring (if the ring was at capacity) so callers
     /// can reuse it as the new blank row, skipping an allocation on
     /// steady-state scroll.</summary>
-    private TerminalCell[]? PushScrollback(TerminalCell[] row)
+    private TerminalCell[]? PushScrollback(TerminalCell[] row, bool wrapped = false)
     {
         if (ScrollbackLimit <= 0) return null;
         // Skip fully-blank rows: on initial layout the buffer starts at
@@ -264,7 +599,7 @@ public sealed class ScreenBuffer
         // phantom screen of nothing above the first prompt.
         if (IsBlankRow(row)) return null;
         if (Scrollback.Capacity != ScrollbackLimit) Scrollback.Capacity = ScrollbackLimit;
-        return Scrollback.Add(row);
+        return Scrollback.Add(row, wrapped);
     }
 
     /// <summary>Return either <paramref name="recycled"/> (cleared in
@@ -287,3 +622,4 @@ public sealed class ScreenBuffer
         return true;
     }
 }
+

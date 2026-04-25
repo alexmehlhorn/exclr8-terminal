@@ -80,4 +80,69 @@ public class BufferResizeTests
         buf.Resize(10, 0);
         Assert.Equal(5, buf.Rows);
     }
+
+    [Fact]
+    public void Resize_NarrowingWrapsLongLineAcrossRows()
+    {
+        var buf = NewBuffer(10, 4);
+        buf.Feed("abcdefgh");
+        buf.Resize(5, 4);
+        Assert.Equal("abcde", buf.RowText(0));
+        Assert.Equal("fgh", buf.RowText(1).TrimEnd());
+    }
+
+    [Fact]
+    public void Resize_WideningRejoinsWrappedLine()
+    {
+        var buf = NewBuffer(5, 4);
+        // "abcdefgh" written into a 5-col buffer auto-wraps after the
+        // 5th cell, leaving row 0 = "abcde" and row 1 = "fgh  " with
+        // wrap flag set.
+        buf.Feed("abcdefgh");
+        buf.Resize(10, 4);
+        // After widening, the two rows should re-merge into one logical
+        // line on row 0.
+        Assert.Equal("abcdefgh", buf.RowText(0).TrimEnd());
+    }
+
+    [Fact]
+    public void Resize_NarrowingDoesNotWrapNonWrappedLines()
+    {
+        var buf = NewBuffer(10, 4);
+        // Two separate lines, each shorter than the new width. Reflow
+        // must NOT join them into one logical line.
+        buf.Feed("abc\r\ndef");
+        buf.Resize(5, 4);
+        Assert.Equal("abc", buf.RowText(0).TrimEnd());
+        Assert.Equal("def", buf.RowText(1).TrimEnd());
+    }
+
+    [Fact]
+    public void Resize_RowShrinkGrowCycleDoesNotInflateScrollback()
+    {
+        // Scenario: a TUI is parked with the cursor near the bottom
+        // (where input prompts and status lines live). Cell host shrinks
+        // → grows → shrinks repeatedly as the user toggles between tabs
+        // whose layouts have different row counts. Each shrink must
+        // NOT push live-screen rows into scrollback, otherwise the TUI's
+        // SIGWINCH redraw lays the same content down again and the user
+        // sees duplicated history.
+        var buf = NewBuffer(20, 10);
+        // Fill every row with content so blank-tail-drop can't absorb
+        // the shrink; cursor parks on the last row.
+        for (int r = 0; r < 10; r++)
+        {
+            buf.Feed($"line{r}");
+            if (r < 9) buf.Feed("\r\n");
+        }
+        int sbBefore = buf.ScrollbackCount;
+
+        for (int i = 0; i < 5; i++)
+        {
+            buf.Resize(20, 6);
+            buf.Resize(20, 10);
+        }
+
+        Assert.Equal(sbBefore, buf.ScrollbackCount);
+    }
 }

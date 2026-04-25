@@ -24,14 +24,19 @@ namespace Exclr8.Terminal.Input;
 /// </summary>
 public static class KeyMapper
 {
-    public static byte[] Map(KeyEventArgs e, bool appCursorKeys = false, bool appKeypad = false)
-        => Map(e.Key, e.KeyModifiers, appCursorKeys, appKeypad);
+    public static byte[] Map(KeyEventArgs e, bool appCursorKeys = false, bool appKeypad = false,
+        int modifyOtherKeys = 0)
+        => Map(e.Key, e.KeyModifiers, appCursorKeys, appKeypad, modifyOtherKeys);
 
-    /// <summary>Pure logical form of <see cref="Map(KeyEventArgs, bool, bool)"/> —
+    /// <summary>Pure logical form of <see cref="Map(KeyEventArgs, bool, bool, int)"/> —
     /// same mapping, but takes the key and modifiers directly so it
     /// can be unit-tested without constructing an Avalonia
-    /// <see cref="KeyEventArgs"/>.</summary>
-    public static byte[] Map(Key key, KeyModifiers mods, bool appCursorKeys = false, bool appKeypad = false)
+    /// <see cref="KeyEventArgs"/>. <paramref name="modifyOtherKeys"/>
+    /// is the XTMODKEYS level (0/1/2) the host has set; level 2
+    /// switches Ctrl/Shift/Alt + ASCII combinations to the unambiguous
+    /// <c>CSI 27;mod;key~</c> form.</summary>
+    public static byte[] Map(Key key, KeyModifiers mods, bool appCursorKeys = false, bool appKeypad = false,
+        int modifyOtherKeys = 0)
     {
         bool ctrl  = (mods & KeyModifiers.Control) != 0;
         bool alt   = (mods & KeyModifiers.Alt)     != 0;
@@ -48,6 +53,23 @@ public static class KeyMapper
         // / readline can tell Ctrl+Up from Up.
         int mod = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (meta ? 8 : 0);
         bool hasMod = mod > 1;
+
+        // modifyOtherKeys level 2: Shift+Enter / Shift+Tab / Ctrl+Enter
+        // / Ctrl+Tab / Ctrl+Backspace need the disambiguating CSI form.
+        // Without it, Ctrl+Tab is indistinguishable from plain Tab.
+        if (modifyOtherKeys >= 2 && hasMod)
+        {
+            int? code = key switch
+            {
+                Key.Enter  => 13,
+                Key.Tab    => 9,
+                Key.Back   => 127,
+                Key.Escape => 27,
+                Key.Space  => 32,
+                _ => (int?)null,
+            };
+            if (code is int kc) return Esc($"[27;{mod};{kc}~");
+        }
 
         switch (key)
         {
@@ -107,7 +129,17 @@ public static class KeyMapper
 
         // Ctrl+A..Z → 0x01..0x1A.
         if (ctrl && !alt && key >= Key.A && key <= Key.Z)
+        {
+            // modifyOtherKeys level 2: every Ctrl/Shift+letter goes
+            // through the unambiguous CSI form so Ctrl+Shift+letter
+            // doesn't collide with plain Ctrl+letter.
+            if (modifyOtherKeys >= 2 && (shift || meta))
+            {
+                int kc = (int)('a' + (key - Key.A));
+                return Esc($"[27;{mod};{kc}~");
+            }
             return new byte[] { (byte)(key - Key.A + 1) };
+        }
 
         // Ctrl+symbol mappings.
         if (ctrl && !alt)

@@ -134,4 +134,30 @@ public class KeyMapperTests
     {
         Assert.Empty(Map(Key.C, KeyModifiers.Meta));
     }
+
+    [Fact]
+    public void MapTextInput_AltOnly_PrefixesESC()
+    {
+        // Real Alt-as-meta — `\eX` is what shells expect for Alt+x.
+        Assert.Equal(new byte[] { 0x1B, (byte)'x' },
+            KeyMapper.MapTextInput("x", altPressed: true));
+    }
+
+    [Fact]
+    public void MapTextInput_NoAlt_RawUtf8()
+    {
+        Assert.Equal(new byte[] { (byte)'x' },
+            KeyMapper.MapTextInput("x", altPressed: false));
+    }
+
+    [Fact]
+    public void ModifyOtherKeys_Level2_CtrlShiftLetterUsesCsiU()
+    {
+        // Ctrl+Shift+A at modifyOtherKeys level 2 must NOT collapse to
+        // 0x01 (the plain Ctrl+A C0). It uses the disambiguating
+        // CSI 27;mod;keycode~ form so editors can distinguish.
+        var bytes = KeyMapper.Map(Key.A, KeyModifiers.Control | KeyModifiers.Shift,
+            modifyOtherKeys: 2);
+        Assert.Equal(Encoding.ASCII.GetBytes("\x1b[27;6;97~"), bytes);
+    }
 }

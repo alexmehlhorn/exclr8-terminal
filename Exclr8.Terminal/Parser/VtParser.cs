@@ -26,10 +26,12 @@ public sealed class VtParser
         CsiIntermediate,
         CsiIgnore,
         OscString,
-        DcsEntry,           // we consume-and-ignore DCS so vim/tmux don't break
-        DcsPassthrough,
+        DcsEntry,
+        DcsParam,
+        DcsIntermediate,
+        DcsPassthrough,     // payload between DCS framing and ST
         DcsIgnore,
-        SosPmApcString,     // ditto — consumed until ST
+        SosPmApcString,     // consumed until ST
     }
 
     private readonly IParserActions _actions;
@@ -39,18 +41,27 @@ public sealed class VtParser
     private int _paramCount;
     private int _currentParam;
     // CSI colon-subparameter tracking. Two distinct modes:
-    //   _inSubParam:    we're swallowing a sub-param cluster that
-    //                   modifies the current primary (e.g. the '3' in
-    //                   `\e[4:3m` — curly underline). Digits & further
-    //                   colons are ignored until ';' / final byte.
+    //   _inSubParam:    we're inside a sub-param cluster that modifies
+    //                   the current primary (e.g. the '3' in `\e[4:3m`
+    //                   — curly underline). Digits accumulate into
+    //                   _subParam, which is surfaced as part of the
+    //                   sub-param span on dispatch. Multiple colons
+    //                   in one cluster aren't useful for any SGR sub
+    //                   we care about (4:N) so we keep just the first.
     //   _inExtColorRun: we're inside an extended-colour run introduced
-    //                   by SGR 38 or 48, where colons legitimately
+    //                   by SGR 38, 48, or 58, where colons legitimately
     //                   separate colour-spec components. Colons in
     //                   this mode push params like ';' does. Reset on
     //                   ';' or the final byte.
     // Reset on state re-entry.
     private bool _inSubParam;
     private bool _inExtColorRun;
+    private int  _subParam;
+
+    // Sub-params parallel to _params, keyed by primary index. Slot i
+    // holds the colon-sub for _params[i] (0 if none). Sized to the
+    // primaries array so they always match up.
+    private readonly int[] _subParams = new int[32];
     private char _privatePrefix;
     private readonly StringBuilder _intermediates = new();
     // OSC payload accumulator — plain char[] + length instead of a
@@ -60,6 +71,18 @@ public sealed class VtParser
     // payload (title/URL storage) materialise a string themselves.
     private char[] _oscBuffer = new char[256];
     private int _oscLen;
+
+    // DCS framing + payload — parameters and payload are dispatched
+    // together when ST arrives. Allocated lazily; same hard cap as OSC
+    // applies to the payload so a runaway emitter can't blow memory.
+    private readonly int[] _dcsParams = new int[16];
+    private int _dcsParamCount;
+    private int _dcsCurrentParam;
+    private char _dcsPrivatePrefix;
+    private readonly StringBuilder _dcsIntermediates = new();
+    private char _dcsFinal;
+    private char[] _dcsBuffer = new char[256];
+    private int _dcsLen;
 
     // UTF-8 accumulator — printable codepoints that span multiple bytes
     // are assembled here before dispatch to Print().
@@ -78,6 +101,12 @@ public sealed class VtParser
         _oscLen = 0;
         _utf8State = 0;
         _utf8Accum = 0;
+        _dcsParamCount = 0;
+        _dcsCurrentParam = 0;
+        _dcsPrivatePrefix = (char)0;
+        _dcsIntermediates.Clear();
+        _dcsFinal = (char)0;
+        _dcsLen = 0;
     }
 
     public void Parse(ReadOnlySpan<byte> data)
@@ -133,6 +162,8 @@ public sealed class VtParser
                 case State.CsiIgnore:      CsiIgnore(b); break;
                 case State.OscString:      OscString(b); break;
                 case State.DcsEntry:       DcsEntry(b); break;
+                case State.DcsParam:       DcsParam(b); break;
+                case State.DcsIntermediate: DcsIntermediate(b); break;
                 case State.DcsPassthrough: DcsPassthrough(b); break;
                 case State.DcsIgnore:      DcsIgnore(b); break;
                 case State.SosPmApcString: SosPmApcString(b); break;
@@ -245,6 +276,10 @@ public sealed class VtParser
         _currentParam = 0;
         _inSubParam = false;
         _inExtColorRun = false;
+        _subParam = 0;
+        // Sub-params are sparsely populated; clear the whole array so
+        // last frame's values don't leak into this one.
+        Array.Clear(_subParams, 0, _subParams.Length);
         _privatePrefix = (char)0;
         _intermediates.Clear();
     }
@@ -274,10 +309,14 @@ public sealed class VtParser
 
         if (b >= 0x30 && b <= 0x39)
         {
-            // Digits inside a sub-parameter don't modify the primary
-            // param — we already pushed the primary when the ':' was
-            // seen. Skip over the sub-param content entirely.
-            if (_inSubParam) return;
+            if (_inSubParam)
+            {
+                // Accumulate the sub-param value so we can attach it
+                // to the just-pushed primary on cluster end.
+                if (_subParam < ParamMax)
+                    _subParam = _subParam * 10 + (b - 0x30);
+                return;
+            }
             if (_currentParam < ParamMax)
                 _currentParam = _currentParam * 10 + (b - 0x30);
             return;
@@ -286,8 +325,10 @@ public sealed class VtParser
         {
             // Semicolon: push the current primary (unless we were mid
             // sub-param — the primary was already pushed when ':'
-            // opened it), then leave both colon modes.
-            if (!_inSubParam) PushParam();
+            // opened it). When leaving a sub-param cluster, attach the
+            // accumulated sub-param value to the primary that owns it.
+            if (_inSubParam) FinalizeSubParam();
+            else             PushParam();
             _inSubParam = false;
             _inExtColorRun = false;
             return;
@@ -300,32 +341,38 @@ public sealed class VtParser
             //       to surface as primary params so ApplyExtColor
             //       receives them. Latch _inExtColorRun on the FIRST
             //       colon in the run (when the just-seen primary is
-            //       38 or 48) and keep treating colons like
+            //       38 / 48 / 58) and keep treating colons like
             //       semicolons until ';' or the final byte.
             //   (b) Style sub-params on any other SGR — e.g.
-            //       `\e[4:3m` (curly underline). Swallow the whole
-            //       sub-param cluster so sub-param 3 doesn't become a
-            //       stray SGR-3 italic.
+            //       `\e[4:3m` (curly underline). The first sub-param
+            //       value is captured into _subParams[primaryIdx] and
+            //       attached when the cluster ends.
             if (_inExtColorRun)
             {
                 PushParam();
                 return;
             }
             // Haven't entered an ext-colour run yet. Look at the
-            // primary we're about to push: if it's 38/48, latch the
-            // run mode.
-            if (!_inSubParam && (_currentParam == 38 || _currentParam == 48))
+            // primary we're about to push: 38/48 = colour, 58 =
+            // underline colour.
+            if (!_inSubParam && (_currentParam == 38 || _currentParam == 48 || _currentParam == 58))
             {
                 PushParam();
                 _inExtColorRun = true;
                 return;
             }
-            if (!_inSubParam) { PushParam(); _inSubParam = true; }
+            if (!_inSubParam)
+            {
+                PushParam();
+                _inSubParam = true;
+                _subParam = 0;
+            }
             return;
         }
         if (b >= 0x20 && b <= 0x2F)
         {
-            if (!_inSubParam) PushParam();
+            if (_inSubParam) FinalizeSubParam();
+            else             PushParam();
             _inSubParam = false; _inExtColorRun = false;
             _intermediates.Append((char)b);
             _state = State.CsiIntermediate;
@@ -334,11 +381,22 @@ public sealed class VtParser
         if (b >= 0x3C && b <= 0x3F)  { _state = State.CsiIgnore; return; } // private modifier mid-params
         if (b >= 0x40 && b <= 0x7E)
         {
-            if (!_inSubParam) PushParam();
+            if (_inSubParam) FinalizeSubParam();
+            else             PushParam();
             _inSubParam = false; _inExtColorRun = false;
             DispatchCsi((char)b);
             return;
         }
+    }
+
+    /// <summary>Stamp the pending sub-param value onto the most
+    /// recently pushed primary. Called when leaving a sub-param
+    /// cluster (on ';' / intermediate / final byte).</summary>
+    private void FinalizeSubParam()
+    {
+        if (_paramCount > 0)
+            _subParams[_paramCount - 1] = _subParam;
+        _subParam = 0;
     }
 
     private void CsiIntermediate(byte b)
@@ -364,8 +422,9 @@ public sealed class VtParser
     {
         // Ensure there's at least one param recorded (handles bare `ESC [ H`).
         if (_paramCount == 0) _params[_paramCount++] = _currentParam;
-        _actions.CsiDispatch(final,
+        _actions.CsiDispatchWithSub(final,
             new ReadOnlySpan<int>(_params, 0, _paramCount),
+            new ReadOnlySpan<int>(_subParams, 0, _paramCount),
             _intermediates.ToString(),
             _privatePrefix);
         _state = State.Ground;
@@ -412,29 +471,121 @@ public sealed class VtParser
     }
 
     // ------------------------------------------------------------------
-    // DCS / SOS / PM / APC — consume until ST, no dispatch.
+    // DCS — Device Control String. ESC P params intermediates final
+    // payload ST. Parameters parse like CSI; payload accumulates until
+    // the closing ST and is dispatched to the action target.
     // ------------------------------------------------------------------
 
-    private void EnterDcsEntry() => _state = State.DcsEntry;
+    /// <summary>Hard cap on accumulated DCS payload length (chars).
+    /// Anything past this is silently dropped until the sequence
+    /// terminator arrives.</summary>
+    private const int DcsMaxLength = 64 * 1024;
+
+    private void EnterDcsEntry()
+    {
+        _state = State.DcsEntry;
+        _dcsParamCount = 0;
+        _dcsCurrentParam = 0;
+        _dcsPrivatePrefix = (char)0;
+        _dcsIntermediates.Clear();
+        _dcsFinal = (char)0;
+        _dcsLen = 0;
+    }
 
     private void DcsEntry(byte b)
     {
         if (b < 0x20) return;
-        if (b >= 0x40 && b <= 0x7E) { _state = State.DcsPassthrough; return; }
         if (b == 0x7F) return;
-        // Anything else → eat until ST.
-        _state = State.DcsPassthrough;
+        if (b >= 0x30 && b <= 0x39) { _dcsCurrentParam = b - 0x30; _state = State.DcsParam; return; }
+        if (b == 0x3B)               { PushDcsParam(); _state = State.DcsParam; return; }
+        if (b >= 0x3C && b <= 0x3F)  { _dcsPrivatePrefix = (char)b; _state = State.DcsParam; return; }
+        if (b >= 0x20 && b <= 0x2F)  { _dcsIntermediates.Append((char)b); _state = State.DcsIntermediate; return; }
+        if (b >= 0x40 && b <= 0x7E)  { _dcsFinal = (char)b; _state = State.DcsPassthrough; return; }
+    }
+
+    private void DcsParam(byte b)
+    {
+        if (b < 0x20) return;
+        if (b == 0x7F) return;
+        if (b >= 0x30 && b <= 0x39)
+        {
+            if (_dcsCurrentParam < ParamMax)
+                _dcsCurrentParam = _dcsCurrentParam * 10 + (b - 0x30);
+            return;
+        }
+        if (b == 0x3B) { PushDcsParam(); return; }
+        if (b >= 0x20 && b <= 0x2F)
+        {
+            PushDcsParam();
+            _dcsIntermediates.Append((char)b);
+            _state = State.DcsIntermediate;
+            return;
+        }
+        if (b >= 0x3C && b <= 0x3F) { _state = State.DcsIgnore; return; }
+        if (b >= 0x40 && b <= 0x7E)
+        {
+            PushDcsParam();
+            _dcsFinal = (char)b;
+            _state = State.DcsPassthrough;
+            return;
+        }
+    }
+
+    private void DcsIntermediate(byte b)
+    {
+        if (b < 0x20) return;
+        if (b >= 0x20 && b <= 0x2F) { _dcsIntermediates.Append((char)b); return; }
+        if (b >= 0x40 && b <= 0x7E)
+        {
+            _dcsFinal = (char)b;
+            _state = State.DcsPassthrough;
+            return;
+        }
     }
 
     private void DcsPassthrough(byte b)
     {
-        if (b == 0x1B) { _state = State.Escape; _intermediates.Clear(); return; }
-        // Drop payload — we don't implement any DCS sequences yet.
+        if (b == 0x1B)
+        {
+            DispatchDcs();
+            _state = State.Escape;
+            _intermediates.Clear();
+            return;
+        }
+        if (b == 0x07) { DispatchDcs(); _state = State.Ground; return; }
+        if (_dcsLen >= DcsMaxLength) return;
+        if (_dcsLen >= _dcsBuffer.Length)
+        {
+            int next = Math.Min(_dcsBuffer.Length * 2, DcsMaxLength);
+            Array.Resize(ref _dcsBuffer, next);
+        }
+        _dcsBuffer[_dcsLen++] = (char)b;
     }
 
     private void DcsIgnore(byte b)
     {
         if (b == 0x1B) { _state = State.Escape; _intermediates.Clear(); return; }
+    }
+
+    private void PushDcsParam()
+    {
+        if (_dcsParamCount < _dcsParams.Length) _dcsParams[_dcsParamCount++] = _dcsCurrentParam;
+        _dcsCurrentParam = 0;
+    }
+
+    private void DispatchDcs()
+    {
+        // Bare DCS with no final byte (e.g. truncated input) is ignored.
+        if (_dcsFinal == 0) return;
+        // Ensure at least one parameter is recorded so the action gets a
+        // consistent shape regardless of whether the sender included one.
+        if (_dcsParamCount == 0) _dcsParams[_dcsParamCount++] = _dcsCurrentParam;
+        _actions.DcsDispatch(
+            _dcsFinal,
+            new ReadOnlySpan<int>(_dcsParams, 0, _dcsParamCount),
+            _dcsIntermediates.ToString(),
+            _dcsPrivatePrefix,
+            _dcsBuffer.AsSpan(0, _dcsLen));
     }
 
     private void SosPmApcString(byte b)

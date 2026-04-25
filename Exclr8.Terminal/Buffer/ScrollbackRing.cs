@@ -14,12 +14,37 @@ namespace Exclr8.Terminal.Buffer;
 public sealed class ScrollbackRing : IEnumerable<TerminalCell[]>
 {
     private TerminalCell[]?[] _buf;
+    private bool[] _wrapped;
     private int _head;
     private int _count;
+    private long _evicted;
+
+    /// <summary>Total number of rows that have been dropped from the
+    /// ring since construction — through eviction, capacity shrink,
+    /// or explicit clear. Markers use this as a stable, monotonically
+    /// increasing reference so their Line getter can detect when their
+    /// anchored content has scrolled off the top.</summary>
+    public long EvictionCount => _evicted;
 
     public ScrollbackRing(int capacity)
     {
-        _buf = new TerminalCell[]?[Math.Max(1, capacity)];
+        int cap = Math.Max(1, capacity);
+        _buf = new TerminalCell[]?[cap];
+        _wrapped = new bool[cap];
+    }
+
+    public bool IsWrapped(int index)
+    {
+        if ((uint)index >= (uint)_count)
+            throw new ArgumentOutOfRangeException(nameof(index));
+        return _wrapped[(_head + index) % _wrapped.Length];
+    }
+
+    public void SetWrapped(int index, bool value)
+    {
+        if ((uint)index >= (uint)_count)
+            throw new ArgumentOutOfRangeException(nameof(index));
+        _wrapped[(_head + index) % _wrapped.Length] = value;
     }
 
     public int Count => _count;
@@ -50,24 +75,30 @@ public sealed class ScrollbackRing : IEnumerable<TerminalCell[]>
     /// evicted row if eviction happened — callers can recycle its
     /// backing array as the new bottom-of-screen blank to avoid
     /// allocating on steady-state scroll.</summary>
-    public TerminalCell[]? Add(TerminalCell[] row)
+    public TerminalCell[]? Add(TerminalCell[] row, bool wrapped = false)
     {
         if (_buf.Length == 0) return null;
         if (_count < _buf.Length)
         {
-            _buf[(_head + _count) % _buf.Length] = row;
+            int slot = (_head + _count) % _buf.Length;
+            _buf[slot] = row;
+            _wrapped[slot] = wrapped;
             _count++;
             return null;
         }
         var evicted = _buf[_head]!;
         _buf[_head] = row;
+        _wrapped[_head] = wrapped;
         _head = (_head + 1) % _buf.Length;
+        _evicted++;
         return evicted;
     }
 
     public void Clear()
     {
+        _evicted += _count;
         Array.Clear(_buf, 0, _buf.Length);
+        Array.Clear(_wrapped, 0, _wrapped.Length);
         _head = 0;
         _count = 0;
     }
@@ -86,10 +117,17 @@ public sealed class ScrollbackRing : IEnumerable<TerminalCell[]>
         // Keep the newest `keep` rows; drop the oldest if shrinking.
         int keep = Math.Min(newCapacity, _count);
         int skip = _count - keep;
-        var next = new TerminalCell[]?[newCapacity];
-        for (int i = 0; i < keep; i++) next[i] = this[skip + i];
+        var next   = new TerminalCell[]?[newCapacity];
+        var nextW  = new bool[newCapacity];
+        for (int i = 0; i < keep; i++)
+        {
+            next[i]  = this[skip + i];
+            nextW[i] = IsWrapped(skip + i);
+        }
         _buf = next;
+        _wrapped = nextW;
         _head = 0;
         _count = keep;
+        _evicted += skip;
     }
 }

@@ -334,17 +334,50 @@ public sealed class TerminalRenderer
         double dy = buf.PixelScrollOffset;
         int startRow = dy > 0 ? -1 : 0;
         int endRow   = buf.Rows - 1;
+
+        // Bottom-layer decorations paint behind cell content so
+        // backgrounds bleed through where the cell bg is the default.
+        if (buf.Decorations.Count > 0) DrawDecorations(ctx, buf, dy, DecorationLayer.Bottom);
+
         for (int r = startRow; r <= endRow; r++)
         {
             var row = buf.GetRowForRender(r);
             if (row != null) DrawRow(ctx, buf, row, r, dy, defBg, theme);
         }
 
+        if (buf.Decorations.Count > 0) DrawDecorations(ctx, buf, dy, DecorationLayer.Top);
+
         if (buf.SearchMatches.Count > 0) DrawSearchMatches(ctx, buf, dy);
         if (buf.Selection != null)       DrawSelection(ctx, buf, dy);
 
         DrawCursor(ctx, buf, dy, focused, theme);
         DrawScrollbar(ctx, buf, size);
+    }
+
+    private void DrawDecorations(DrawingContext ctx, TerminalBuffer buf, double pixelShift, DecorationLayer layer)
+    {
+        int sbCount    = buf.ScrollbackCount;
+        int viewTopAbs = sbCount - buf.ScrollOffset;
+        int viewBotAbs = viewTopAbs + buf.Rows - 1;
+        for (int i = 0; i < buf.Decorations.Count; i++)
+        {
+            var d = buf.Decorations[i];
+            if (d.Layer != layer || !d.Marker.IsValid) continue;
+            int absRow = d.Marker.Line;
+            if (absRow < viewTopAbs - 1 || absRow > viewBotAbs) continue;
+            int visualRow = absRow - viewTopAbs;
+            int x0 = Math.Max(0, d.X);
+            int width = d.Width <= 0 ? buf.Cols - x0 : Math.Min(d.Width, buf.Cols - x0);
+            if (width <= 0) continue;
+            if (d.BackgroundRgb is uint bg)
+            {
+                ctx.FillRectangle(BrushFor(Color.FromUInt32(0xFF000000 | bg)),
+                    new Rect(x0 * CellWidth,
+                             visualRow * CellHeight + pixelShift,
+                             width * CellWidth,
+                             CellHeight));
+            }
+        }
     }
 
     /// <summary>
@@ -450,6 +483,10 @@ public sealed class TerminalRenderer
                     && row[c].Flags   == cell.Flags
                     && row[c].FgRgb   == cell.FgRgb
                     && row[c].BgRgb   == cell.BgRgb
+                    && row[c].UnderlineStyle == cell.UnderlineStyle
+                    && row[c].UnderlineRgb   == cell.UnderlineRgb
+                    && (row[c].Flags2 & CellFlags2.UlColorSet)
+                       == (cell.Flags2 & CellFlags2.UlColorSet)
                     && (row[c].Rune == 0) == (cell.Rune == 0))
                 {
                     c++;
@@ -518,15 +555,76 @@ public sealed class TerminalRenderer
 
         if ((flags & CellFlags.Underline) != 0)
         {
-            double ly = y + CellHeight - 2;
-            ctx.DrawLine(PenFor(fg, 1),
-                new Point(x, ly), new Point(x + w, ly));
+            // Underline colour: SGR 58 takes precedence, else fg.
+            var head = row[start];
+            Color ulColor = (head.Flags2 & CellFlags2.UlColorSet) != 0
+                ? Color.FromUInt32(0xFF000000 | head.UnderlineRgb)
+                : fg;
+            DrawUnderline(ctx, x, y, w, ulColor, head.UnderlineStyle);
         }
         if ((flags & CellFlags.Strikethrough) != 0)
         {
             double ly = y + CellHeight * 0.5;
             ctx.DrawLine(PenFor(fg, 1),
                 new Point(x, ly), new Point(x + w, ly));
+        }
+    }
+
+    /// <summary>Draw the SGR 4 underline style for a glyph run. Single
+    /// is one straight line at baseline−2; double is two parallel; curly
+    /// is a sine wave; dotted/dashed are short segments along the same
+    /// baseline. Mirrors what xterm and kitty draw for these styles.</summary>
+    private void DrawUnderline(DrawingContext ctx, double x, double y, double w,
+        Color color, UnderlineStyle style)
+    {
+        double baseline = y + CellHeight - 2;
+        switch (style)
+        {
+            case UnderlineStyle.None:
+            case UnderlineStyle.Single:
+                ctx.DrawLine(PenFor(color, 1),
+                    new Point(x, baseline), new Point(x + w, baseline));
+                break;
+            case UnderlineStyle.Double:
+                ctx.DrawLine(PenFor(color, 1),
+                    new Point(x, baseline - 1), new Point(x + w, baseline - 1));
+                ctx.DrawLine(PenFor(color, 1),
+                    new Point(x, baseline + 1), new Point(x + w, baseline + 1));
+                break;
+            case UnderlineStyle.Curly:
+            {
+                // Build a sine-style stroke by chaining short segments.
+                // 4 px wavelength, 1 px amplitude — close enough to
+                // what kitty / iTerm draw at typical terminal sizes.
+                var pen = PenFor(color, 1);
+                double step = 2;
+                double amp  = 1;
+                Point prev = new Point(x, baseline);
+                for (double dx = 0; dx <= w; dx += step)
+                {
+                    double phase = (dx / step) % 2;
+                    Point next = new Point(x + dx, baseline + (phase < 1 ? -amp : +amp));
+                    ctx.DrawLine(pen, prev, next);
+                    prev = next;
+                }
+                break;
+            }
+            case UnderlineStyle.Dotted:
+            {
+                var pen = PenFor(color, 1);
+                for (double dx = 0; dx + 1 < w; dx += 2)
+                    ctx.DrawLine(pen, new Point(x + dx, baseline),
+                        new Point(x + dx + 1, baseline));
+                break;
+            }
+            case UnderlineStyle.Dashed:
+            {
+                var pen = PenFor(color, 1);
+                for (double dx = 0; dx + 2 < w; dx += 4)
+                    ctx.DrawLine(pen, new Point(x + dx, baseline),
+                        new Point(x + dx + 3, baseline));
+                break;
+            }
         }
     }
 
@@ -627,7 +725,10 @@ public sealed class TerminalRenderer
     {
         if ((c.Flags & CellFlags.FgRgb) != 0) return Color.FromUInt32(0xFF000000 | c.FgRgb);
         if (c.FgIndex == 0 && c.FgRgb == 0)   return theme?.Foreground ?? TerminalPalette.DefaultForeground;
-        if (theme?.AnsiColors != null && c.FgIndex < 16 && theme.AnsiColors[c.FgIndex].HasValue)
+        if (theme?.AnsiColors != null
+            && c.FgIndex < 16
+            && c.FgIndex < theme.AnsiColors.Length
+            && theme.AnsiColors[c.FgIndex].HasValue)
             return theme.AnsiColors[c.FgIndex]!.Value;
         return TerminalPalette.FromIndex(c.FgIndex);
     }
@@ -636,7 +737,10 @@ public sealed class TerminalRenderer
     {
         if ((c.Flags & CellFlags.BgRgb) != 0) return Color.FromUInt32(0xFF000000 | c.BgRgb);
         if (c.BgIndex == 0 && c.BgRgb == 0)   return defBg;
-        if (theme?.AnsiColors != null && c.BgIndex < 16 && theme.AnsiColors[c.BgIndex].HasValue)
+        if (theme?.AnsiColors != null
+            && c.BgIndex < 16
+            && c.BgIndex < theme.AnsiColors.Length
+            && theme.AnsiColors[c.BgIndex].HasValue)
             return theme.AnsiColors[c.BgIndex]!.Value;
         return TerminalPalette.FromIndex(c.BgIndex);
     }

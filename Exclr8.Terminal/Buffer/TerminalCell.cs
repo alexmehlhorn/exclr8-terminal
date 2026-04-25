@@ -1,6 +1,21 @@
 namespace Exclr8.Terminal.Buffer;
 
 /// <summary>
+/// SGR 4:N underline style. 0 = none (no underline drawn even if the
+/// Underline flag is set — defensive). Mirrors the kitty / WezTerm
+/// extension that's now widely supported.
+/// </summary>
+public enum UnderlineStyle : byte
+{
+    None    = 0,
+    Single  = 1,
+    Double  = 2,
+    Curly   = 3,
+    Dotted  = 4,
+    Dashed  = 5,
+}
+
+/// <summary>
 /// One character cell in the terminal grid.
 ///
 /// <para>Colors can be either 256-palette indices (<see cref="FgIndex"/> /
@@ -39,6 +54,18 @@ public struct TerminalCell
     public uint FgRgb;
     public uint BgRgb;
 
+    /// <summary>SGR 4:N underline style. Default 0 = no special form;
+    /// when <see cref="CellFlags.Underline"/> is set we treat 0 the
+    /// same as <see cref="UnderlineStyle.Single"/> for backward
+    /// compatibility with plain SGR 4.</summary>
+    public UnderlineStyle UnderlineStyle;
+
+    /// <summary>SGR 58 underline colour. 0 = use the foreground.
+    /// Stored as packed 0xRRGGBB; <see cref="CellFlags2.UlColorSet"/>
+    /// must be true for the renderer to honour this — otherwise it
+    /// uses the cell's foreground.</summary>
+    public uint UnderlineRgb;
+
     public static readonly TerminalCell Blank = default;
 }
 
@@ -53,6 +80,10 @@ public enum CellFlags2 : byte
     /// <summary>SGR 5 (slow blink) / SGR 6 (rapid). The renderer toggles
     /// visibility on the shared blink timer; SGR 25 clears this flag.</summary>
     Blink          = 1 << 2,
+    /// <summary>SGR 58 set an underline colour. Renderer uses
+    /// <see cref="TerminalCell.UnderlineRgb"/> when this is set,
+    /// otherwise falls back to the foreground.</summary>
+    UlColorSet     = 1 << 3,
 }
 
 [System.Flags]

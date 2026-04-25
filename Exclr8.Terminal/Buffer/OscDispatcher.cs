@@ -16,6 +16,36 @@ public sealed class ClipboardRequestEventArgs : EventArgs
     public ClipboardRequestEventArgs(string text) { Text = text; }
 }
 
+/// <summary>FinalTerm/iTerm2 semantic-prompt marker raised when the
+/// shell emits OSC 133. Hosts use these to draw "previous prompt"
+/// jumps, command-status gutters, and AI-style command boundaries.
+/// </summary>
+public enum SemanticPromptKind
+{
+    /// <summary>OSC 133 ; A — start of prompt.</summary>
+    PromptStart,
+    /// <summary>OSC 133 ; B — end of prompt / start of input.</summary>
+    PromptEnd,
+    /// <summary>OSC 133 ; C — command starts executing.</summary>
+    CommandStart,
+    /// <summary>OSC 133 ; D — command finished. Optional exit code in
+    /// <see cref="SemanticPromptEventArgs.ExitCode"/>.</summary>
+    CommandEnd,
+}
+
+public sealed class SemanticPromptEventArgs : EventArgs
+{
+    public SemanticPromptKind Kind { get; }
+    /// <summary>Exit code reported by OSC 133 ; D ; &lt;code&gt;. Null if
+    /// the kind is anything else or no code was supplied.</summary>
+    public int? ExitCode { get; }
+    public SemanticPromptEventArgs(SemanticPromptKind kind, int? exitCode = null)
+    {
+        Kind = kind;
+        ExitCode = exitCode;
+    }
+}
+
 /// <summary>
 /// Handles OSC (Operating System Command) sequences — window title,
 /// icon name, palette query/set, hyperlink framing (OSC 8), clipboard
@@ -63,6 +93,18 @@ internal sealed class OscDispatcher
     /// <see cref="AllowClipboardAccess"/> is true.</summary>
     public event EventHandler<ClipboardRequestEventArgs>? ClipboardRequested;
 
+    /// <summary>Working directory the shell announced via OSC 7. The
+    /// payload is `file://host/path` style; we strip the URL framing
+    /// and surface the raw path. Useful for "open new tab here" UX.
+    /// </summary>
+    public string? WorkingDirectory { get; private set; }
+
+    public event EventHandler<string>? WorkingDirectoryChanged;
+
+    /// <summary>OSC 133 — FinalTerm/iTerm2 semantic prompts. Fired with
+    /// kind A/B/C/D and an optional exit code on D.</summary>
+    public event EventHandler<SemanticPromptEventArgs>? SemanticPrompt;
+
     public OscDispatcher(Action<byte[]> reply) { _reply = reply; }
 
     public bool TryGetHyperlink(ushort id, out string url) =>
@@ -82,7 +124,15 @@ internal sealed class OscDispatcher
     public void Dispatch(ReadOnlySpan<char> payload)
     {
         int semi = payload.IndexOf(';');
-        if (semi < 0) return;
+        if (semi < 0)
+        {
+            // Some commands (notably 133 ; A and 133 ; B from minimal
+            // implementations) are emitted without a body. The number
+            // alone is the whole payload. Handle the no-body forms
+            // explicitly rather than dropping them.
+            if (int.TryParse(payload, out int bare)) DispatchNoBody(bare);
+            return;
+        }
         if (!int.TryParse(payload[..semi], out int cmd)) return;
         var data = payload[(semi + 1)..];
         switch (cmd)
@@ -109,12 +159,105 @@ internal sealed class OscDispatcher
                 return;
             }
             case 4:  HandleOsc4 (data); return;
+            case 7:  HandleOsc7 (data); return;
             case 8:  HandleOsc8 (data); return;
             case 10: HandleOscSpecialColor(10, DefaultForegroundRgb, data, v => DefaultForegroundRgb = v); return;
             case 11: HandleOscSpecialColor(11, DefaultBackgroundRgb, data, v => DefaultBackgroundRgb = v); return;
             case 12: HandleOscSpecialColor(12, DefaultCursorRgb,     data, v => DefaultCursorRgb     = v); return;
             case 52: HandleOsc52(data); return;
+            case 133: HandleOsc133(data); return;
         }
+    }
+
+    private void DispatchNoBody(int cmd)
+    {
+        // Only OSC 133 needs a no-body path today; treat the bare
+        // number as a generic command-end with no exit code.
+        if (cmd == 133) { /* missing kind selector — ignore */ }
+    }
+
+    // ---- OSC 7: working directory ----
+
+    private void HandleOsc7(ReadOnlySpan<char> data)
+    {
+        // Payload is typically file://hostname/encoded/path. Strip the
+        // scheme/host and percent-decode the path. Bare paths (some
+        // shells don't bother with the file:// prefix) pass through.
+        var path = data;
+        if (path.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+        {
+            path = path[7..];
+            int slash = path.IndexOf('/');
+            // file://host/... — drop the host component.
+            if (slash >= 0) path = path[slash..];
+            else            path = default;
+        }
+        if (path.IsEmpty) return;
+        string decoded = PercentDecode(path);
+        if (decoded == WorkingDirectory) return;
+        WorkingDirectory = decoded;
+        WorkingDirectoryChanged?.Invoke(this, decoded);
+    }
+
+    private static string PercentDecode(ReadOnlySpan<char> input)
+    {
+        // Quick path: nothing to decode.
+        if (input.IndexOf('%') < 0) return new string(input);
+        var sb = new StringBuilder(input.Length);
+        for (int i = 0; i < input.Length; i++)
+        {
+            char c = input[i];
+            if (c == '%' && i + 2 < input.Length
+                && IsHex(input[i + 1]) && IsHex(input[i + 2]))
+            {
+                int hi = HexVal(input[i + 1]);
+                int lo = HexVal(input[i + 2]);
+                sb.Append((char)((hi << 4) | lo));
+                i += 2;
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static bool IsHex(char c) =>
+        (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    private static int HexVal(char c) =>
+        c <= '9' ? c - '0' : (c & 0x5F) - 'A' + 10;
+
+    // ---- OSC 133: FinalTerm/iTerm2 semantic prompts ----
+
+    private void HandleOsc133(ReadOnlySpan<char> data)
+    {
+        // Payload is "<kind>[;extra...]" where kind is A/B/C/D. We only
+        // surface the kind selector — extra fields (e.g. "aid=...") are
+        // command-line metadata that hosts that need it can parse on top.
+        if (data.IsEmpty) return;
+        char kind = data[0];
+        SemanticPromptKind k;
+        int? exitCode = null;
+        switch (kind)
+        {
+            case 'A': k = SemanticPromptKind.PromptStart; break;
+            case 'B': k = SemanticPromptKind.PromptEnd; break;
+            case 'C': k = SemanticPromptKind.CommandStart; break;
+            case 'D':
+                k = SemanticPromptKind.CommandEnd;
+                // OSC 133 ; D ; <exit code>
+                if (data.Length > 2 && data[1] == ';')
+                {
+                    var rest = data[2..];
+                    int semi = rest.IndexOf(';');
+                    if (semi >= 0) rest = rest[..semi];
+                    if (int.TryParse(rest, out int code)) exitCode = code;
+                }
+                break;
+            default: return;
+        }
+        SemanticPrompt?.Invoke(this, new SemanticPromptEventArgs(k, exitCode));
     }
 
     /// <summary>Reports the current window title via OSC l / OSC L

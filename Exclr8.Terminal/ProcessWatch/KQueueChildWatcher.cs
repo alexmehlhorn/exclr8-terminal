@@ -172,7 +172,7 @@ internal sealed class KQueueChildWatcher : IProcessChildWatcher
                     _watched.TryRemove(pid, out _);
                     lock (_childrenLock) _lastChildren.Remove(pid);
                 }
-                if ((f & NOTE_FORK) != 0 || (f & NOTE_EXEC) != 0)
+                if ((f & NOTE_FORK) != 0)
                 {
                     HashSet<int> current = ListChildrenOf(pid);
                     HashSet<int> prev;
@@ -199,6 +199,41 @@ internal sealed class KQueueChildWatcher : IProcessChildWatcher
                         {
                             TerminalLog.Error($"[KQueueChildWatcher] fork dispatch: {ex.Message}");
                         }
+                    }
+                }
+                if ((f & NOTE_EXEC) != 0)
+                {
+                    // exec replaces the program running under this pid
+                    // (its argv/comm change; the pid stays the same).
+                    // Subscribers that pattern-match the program name
+                    // — toolbar badge, agent-launch detection — won't
+                    // see the new identity unless we re-emit. Surface
+                    // it as another Created with the freshly-queried
+                    // name; ParentPid is 0 because we don't track it
+                    // here and consumers walk the tree themselves to
+                    // figure out where the pid sits.
+                    //
+                    // Reset the children snapshot too: the previous
+                    // program's children (if any) are gone from the
+                    // post-exec process's perspective. Without this,
+                    // a NOTE_FORK delivered after exec compares against
+                    // the pre-exec child set and might suppress the
+                    // first fork as a "duplicate" if pids happen to
+                    // line up.
+                    string? name = LookupProcessName(pid);
+                    lock (_childrenLock) _lastChildren[pid] = ListChildrenOf(pid);
+                    try
+                    {
+                        TreeChanged?.Invoke(new ProcessTreeChange(
+                            Kind:        ProcessTreeChangeKind.Created,
+                            Pid:         pid,
+                            ParentPid:   0,
+                            Name:        name,
+                            CommandLine: null));
+                    }
+                    catch (Exception ex)
+                    {
+                        TerminalLog.Error($"[KQueueChildWatcher] exec dispatch: {ex.Message}");
                     }
                 }
             }

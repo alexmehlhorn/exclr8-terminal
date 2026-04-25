@@ -18,16 +18,22 @@ public class ParserTests
     {
         public StringBuilder Printed = new();
         public List<byte> Executes = new();
-        public List<(char Final, int[] Params, string Intermediates, char Prefix)> Csi = new();
+        public List<(char Final, int[] Params, int[] Subs, string Intermediates, char Prefix)> Csi = new();
         public List<(char Final, string Intermediates)> Esc = new();
         public List<string> Osc = new();
+        public List<(char Final, int[] Params, string Intermediates, char Prefix, string Payload)> Dcs = new();
         public List<byte> Replies = new();
 
         public void Print(int r) => Printed.Append(char.ConvertFromUtf32(r));
         public void Execute(byte c) => Executes.Add(c);
-        public void CsiDispatch(char f, ReadOnlySpan<int> p, string i, char pr) => Csi.Add((f, p.ToArray(), i, pr));
+        public void CsiDispatch(char f, ReadOnlySpan<int> p, string i, char pr)
+            => Csi.Add((f, p.ToArray(), Array.Empty<int>(), i, pr));
+        public void CsiDispatchWithSub(char f, ReadOnlySpan<int> p, ReadOnlySpan<int> sp, string i, char pr)
+            => Csi.Add((f, p.ToArray(), sp.ToArray(), i, pr));
         public void EscDispatch(char f, string i) => Esc.Add((f, i));
         public void OscDispatch(ReadOnlySpan<char> s) => Osc.Add(new string(s));
+        public void DcsDispatch(char f, ReadOnlySpan<int> p, string i, char pr, ReadOnlySpan<char> payload)
+            => Dcs.Add((f, p.ToArray(), i, pr, new string(payload)));
         public void ReplyToPty(ReadOnlySpan<byte> b) { foreach (var x in b) Replies.Add(x); }
     }
 

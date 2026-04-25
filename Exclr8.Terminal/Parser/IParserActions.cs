@@ -26,6 +26,18 @@ public interface IParserActions
     /// </summary>
     void CsiDispatch(char final, ReadOnlySpan<int> parameters, string intermediates, char privatePrefix);
 
+    /// <summary>
+    /// CSI dispatch with parallel sub-params (SGR 4:3 = curly
+    /// underline). Slot i in <paramref name="subParameters"/> holds
+    /// the colon-sub-parameter attached to <c>parameters[i]</c>, or 0
+    /// if none. The default forwards to the simpler overload —
+    /// implementations that care about sub-params override this and
+    /// ignore the four-arg form.
+    /// </summary>
+    void CsiDispatchWithSub(char final, ReadOnlySpan<int> parameters,
+        ReadOnlySpan<int> subParameters, string intermediates, char privatePrefix)
+        => CsiDispatch(final, parameters, intermediates, privatePrefix);
+
     /// <summary>An ESC dispatch — <c>ESC final</c> with possible intermediates.</summary>
     void EscDispatch(char final, string intermediates);
 
@@ -35,6 +47,13 @@ public interface IParserActions
     /// to retain the payload (window title, OSC 8 URL, clipboard
     /// text) must materialise their own string.</summary>
     void OscDispatch(ReadOnlySpan<char> payload);
+
+    /// <summary>A DCS dispatch — <c>DCS params intermediates final
+    /// payload ST</c>. Both <paramref name="parameters"/> and
+    /// <paramref name="payload"/> point into parser-owned buffers;
+    /// implementations must not retain them past the call.</summary>
+    void DcsDispatch(char final, ReadOnlySpan<int> parameters, string intermediates,
+        char privatePrefix, ReadOnlySpan<char> payload);
 
     /// <summary>
     /// Request the terminal write bytes back to the PTY. Used for DSR
