@@ -25,6 +25,11 @@ public sealed class TerminalRenderer
     public double CellWidth  { get; private set; }
     public double CellHeight { get; private set; }
 
+    /// <summary>Whether to draw a 1-px underline beneath OSC 8
+    /// hyperlink cells. See <see cref="TerminalControl.ShowHyperlinkUnderline"/>
+    /// for the rationale.</summary>
+    public bool ShowHyperlinkUnderline { get; set; } = true;
+
     /// <summary>Current font size (pt). Mutable so Cmd+= / Cmd+- /
     /// Cmd+0 can zoom without tearing down the renderer. Changing it
     /// re-measures the cell; callers should trigger a grid reflow.</summary>
@@ -104,6 +109,38 @@ public sealed class TerminalRenderer
     /// blink cycle.</summary>
     public bool BlinkVisible { get; set; } = true;
 
+    /// <summary>Enable OpenType ligatures (<c>liga</c> / <c>clig</c> /
+    /// <c>calt</c>) on glyph runs. Programming fonts (Fira Code,
+    /// JetBrains Mono, Cascadia Code, …) substitute multi-character
+    /// sequences like <c>==</c>, <c>-&gt;</c>, <c>!=</c> with composite
+    /// glyphs — this turns those substitutions on. Off by default
+    /// because plain monospace fonts without ligatures get nothing
+    /// from it and the feature flip invalidates the layout cache.
+    /// </summary>
+    public bool EnableLigatures
+    {
+        get => _enableLigatures;
+        set
+        {
+            if (_enableLigatures == value) return;
+            _enableLigatures = value;
+            // Cached layouts were built without ligatures (or with them);
+            // either way they no longer match the active feature set.
+            _textCache.Clear();
+        }
+    }
+    private bool _enableLigatures;
+
+    /// <summary>OpenType feature set applied when
+    /// <see cref="EnableLigatures"/> is true. Built once and reused —
+    /// FontFeature has no per-frame state.</summary>
+    private static readonly FontFeatureCollection LigaFeatures = new()
+    {
+        new FontFeature { Tag = "liga", Value = 1, Start = 0, End = int.MaxValue },
+        new FontFeature { Tag = "clig", Value = 1, Start = 0, End = int.MaxValue },
+        new FontFeature { Tag = "calt", Value = 1, Start = 0, End = int.MaxValue },
+    };
+
     // ---- Allocation caches ----
     // Per-frame content changes character-by-character but the set of
     // distinct colours is small (default fg/bg, palette indices, a
@@ -132,7 +169,7 @@ public sealed class TerminalRenderer
     private readonly StringBuilder _glyphSb = new();
 
     private readonly record struct TextCacheEntry(
-        string Text, int Variant, int SizeTenths, uint Fg, FormattedText Ft);
+        string Text, int Variant, int SizeTenths, uint Fg, bool Liga, FormattedText Ft);
 
     private static uint ColorKey(Color c) =>
         ((uint)c.A << 24) | ((uint)c.R << 16) | ((uint)c.G << 8) | c.B;
@@ -188,12 +225,14 @@ public sealed class TerminalRenderer
         }
         int size10 = (int)(size * 10);
         uint fgKey = ColorKey(fg);
-        int hash = ComputeRunHash(sb, variantIdx, size10, fgKey);
+        bool liga = _enableLigatures;
+        int hash = ComputeRunHash(sb, variantIdx, size10, fgKey, liga);
 
         if (_textCache.TryGetValue(hash, out var entry)
             && entry.Variant == variantIdx
             && entry.SizeTenths == size10
             && entry.Fg == fgKey
+            && entry.Liga == liga
             && SbEqualsString(sb, entry.Text))
         {
             return entry.Ft;
@@ -203,19 +242,26 @@ public sealed class TerminalRenderer
         string text = sb.ToString();
         var ft = new FormattedText(text, CultureInfo.InvariantCulture,
             FlowDirection.LeftToRight, tf, size, BrushFor(fg));
+        // Programming-font ligatures: liga / clig / calt. Off by
+        // default — ordinary monospace fonts don't substitute, and
+        // turning the features on adds a per-cache-miss shaping pass.
+        // Hosts that ship Fira Code / JetBrains Mono / Cascadia opt
+        // in via TerminalControl.EnableLigatures.
+        if (liga) ft.SetFontFeatures(LigaFeatures);
         // Hash collisions on a 512-entry dict in a 32-bit hash space are
         // astronomically rare; single-slot overwrite is acceptable —
         // the evicted entry just gets rebuilt next frame.
-        _textCache[hash] = new TextCacheEntry(text, variantIdx, size10, fgKey, ft);
+        _textCache[hash] = new TextCacheEntry(text, variantIdx, size10, fgKey, liga, ft);
         return ft;
     }
 
-    private static int ComputeRunHash(StringBuilder sb, int variant, int size10, uint fg)
+    private static int ComputeRunHash(StringBuilder sb, int variant, int size10, uint fg, bool liga)
     {
         var hc = new HashCode();
         hc.Add(variant);
         hc.Add(size10);
         hc.Add(fg);
+        hc.Add(liga);
         int len = sb.Length;
         for (int i = 0; i < len; i++) hc.Add(sb[i]);
         return hc.ToHashCode();
@@ -319,9 +365,19 @@ public sealed class TerminalRenderer
     }
 
     public void Render(DrawingContext ctx, TerminalBuffer buf,
-        Size size, bool focused, TerminalTheme? theme = null)
+        Size size, bool focused, TerminalTheme? theme = null,
+        IReadOnlyList<ILinkProvider>? linkProviders = null)
     {
-        var defBg = theme?.Background ?? TerminalPalette.DefaultBackground;
+        // Default colours: shell-issued OSC 10/11/12 wins over host
+        // theme, theme over static palette. Without the explicit-set
+        // gate the renderer would always pick the buffer's pre-seeded
+        // value and the host theme would never apply.
+        Color defFg = buf.DefaultForegroundExplicit
+            ? Color.FromUInt32(0xFF000000 | buf.DefaultForegroundRgb)
+            : theme?.Foreground ?? TerminalPalette.DefaultForeground;
+        Color defBg = buf.DefaultBackgroundExplicit
+            ? Color.FromUInt32(0xFF000000 | buf.DefaultBackgroundRgb)
+            : theme?.Background ?? TerminalPalette.DefaultBackground;
         ctx.FillRectangle(BrushFor(defBg), new Rect(size));
 
         // Smooth scroll: when PixelScrollOffset > 0 we're partway
@@ -342,8 +398,14 @@ public sealed class TerminalRenderer
         for (int r = startRow; r <= endRow; r++)
         {
             var row = buf.GetRowForRender(r);
-            if (row != null) DrawRow(ctx, buf, row, r, dy, defBg, theme);
+            if (row != null) DrawRow(ctx, buf, row, r, dy, defFg, defBg, theme);
         }
+
+        // Plain-URL / custom-link underlines. Drawn after cell content
+        // so the underline sits on top of the run; before the cursor /
+        // selection so those still take visual priority.
+        if (linkProviders != null && linkProviders.Count > 0)
+            DrawLinkUnderlines(ctx, buf, linkProviders, dy);
 
         if (buf.Decorations.Count > 0) DrawDecorations(ctx, buf, dy, DecorationLayer.Top);
 
@@ -352,6 +414,55 @@ public sealed class TerminalRenderer
 
         DrawCursor(ctx, buf, dy, focused, theme);
         DrawScrollbar(ctx, buf, size);
+    }
+
+    /// <summary>Hard cap on link spans we'll draw per provider per
+    /// row. A misbehaving regex returning thousands of matches
+    /// shouldn't tank the frame; the cap sets a predictable upper
+    /// bound on render time.</summary>
+    private const int MaxLinksPerProviderPerRow = 64;
+
+    private void DrawLinkUnderlines(DrawingContext ctx, TerminalBuffer buf,
+        IReadOnlyList<ILinkProvider> providers, double pixelShift)
+    {
+        // Per visible row: build text + colMap once, query each
+        // provider, translate string-index coords to cell columns,
+        // draw a thin underline. Astral runes occupy 2 string indices
+        // but 1 cell — without colMap we'd draw the underline shifted
+        // right of where the cells actually are.
+        var pen = PenFor(Color.FromArgb(0xC0, 0x58, 0x9A, 0xF8), 1);
+        for (int visualRow = 0; visualRow < buf.Rows; visualRow++)
+        {
+            var cells = buf.GetRowForRender(visualRow);
+            if (cells == null) continue;
+            // Skip rows that are visibly blank — a regex run over
+            // empty space costs at minimum the regex's own start/end
+            // overhead, and there's nothing to underline anyway.
+            if (IsBlankCellRow(cells)) continue;
+            string rowText = RowText.Build(cells, out int[] colMap);
+            double y = visualRow * CellHeight + pixelShift + CellHeight - 1;
+            for (int i = 0; i < providers.Count; i++)
+            {
+                int drawn = 0;
+                foreach (var link in providers[i].Provide(rowText))
+                {
+                    if (drawn >= MaxLinksPerProviderPerRow) break;
+                    int startCell = colMap[link.StartCol];
+                    int endCell   = colMap[Math.Min(link.EndCol - 1, colMap.Length - 1)];
+                    double x0 = startCell * CellWidth;
+                    double x1 = (endCell + 1) * CellWidth;
+                    ctx.DrawLine(pen, new Point(x0, y), new Point(x1, y));
+                    drawn++;
+                }
+            }
+        }
+    }
+
+    private static bool IsBlankCellRow(TerminalCell[] cells)
+    {
+        for (int i = 0; i < cells.Length; i++)
+            if (cells[i].Rune != 0) return false;
+        return true;
     }
 
     private void DrawDecorations(DrawingContext ctx, TerminalBuffer buf, double pixelShift, DecorationLayer layer)
@@ -457,7 +568,7 @@ public sealed class TerminalRenderer
     }
 
     private void DrawRow(DrawingContext ctx, TerminalBuffer buf,
-        TerminalCell[] row, int r, double pixelShift, Color defBg, TerminalTheme? theme)
+        TerminalCell[] row, int r, double pixelShift, Color defFg, Color defBg, TerminalTheme? theme)
     {
         double y = r * CellHeight + pixelShift;
         int c = 0;
@@ -503,8 +614,8 @@ public sealed class TerminalRenderer
             var    runRect = new Rect(x, y, runW, CellHeight);
 
             bool  inv = (cell.Flags & CellFlags.Inverse) != 0;
-            Color fg  = inv ? ResolveBg(cell, defBg, theme) : ResolveFg(cell, theme);
-            Color bg  = inv ? ResolveFg(cell, theme)        : ResolveBg(cell, defBg, theme);
+            Color fg  = inv ? ResolveBg(cell, buf, defBg, theme) : ResolveFg(cell, buf, defFg, theme);
+            Color bg  = inv ? ResolveFg(cell, buf, defFg, theme) : ResolveBg(cell, buf, defBg, theme);
 
             if (bg != defBg)
                 ctx.FillRectangle(BrushFor(bg), runRect);
@@ -522,7 +633,11 @@ public sealed class TerminalRenderer
             }
 
             // OSC 8 hyperlink: subtle underline to signal clickability.
-            if (cell.HyperlinkId != 0)
+            // Toggleable so hosts that style their own button-shaped
+            // links (filled bg + contrasting fg, distinct from
+            // surrounding text) can opt out — see
+            // TerminalControl.ShowHyperlinkUnderline.
+            if (cell.HyperlinkId != 0 && ShowHyperlinkUnderline)
             {
                 double ly = y + CellHeight - 1;
                 ctx.DrawLine(PenFor(fg, 1),
@@ -666,7 +781,10 @@ public sealed class TerminalRenderer
 
         double x = buf.CursorCol * CellWidth;
         double y = buf.CursorRow * CellHeight + pixelShift;
-        var color = theme?.Cursor ?? TerminalPalette.DefaultCursor;
+        // OSC 12 cursor colour wins over the host theme.
+        var color = buf.DefaultCursorExplicit
+            ? Color.FromUInt32(0xFF000000 | buf.DefaultCursorRgb)
+            : theme?.Cursor ?? TerminalPalette.DefaultCursor;
         var brush = BrushFor(color);
 
         bool blinks = buf.CursorStyle is
@@ -721,10 +839,15 @@ public sealed class TerminalRenderer
         }
     }
 
-    private static Color ResolveFg(TerminalCell c, TerminalTheme? theme)
+    private static Color ResolveFg(TerminalCell c, TerminalBuffer buf, Color defFg, TerminalTheme? theme)
     {
         if ((c.Flags & CellFlags.FgRgb) != 0) return Color.FromUInt32(0xFF000000 | c.FgRgb);
-        if (c.FgIndex == 0 && c.FgRgb == 0)   return theme?.Foreground ?? TerminalPalette.DefaultForeground;
+        if (c.FgIndex == 0 && c.FgRgb == 0)   return defFg;
+        // OSC 4 dynamic palette overrides win over the theme for that
+        // specific palette slot — the shell explicitly retargeted the
+        // colour, that beats whatever the host configured at startup.
+        if (buf.TryGetDynamicPaletteColor(c.FgIndex, out uint dyn))
+            return Color.FromUInt32(0xFF000000 | dyn);
         if (theme?.AnsiColors != null
             && c.FgIndex < 16
             && c.FgIndex < theme.AnsiColors.Length
@@ -733,10 +856,12 @@ public sealed class TerminalRenderer
         return TerminalPalette.FromIndex(c.FgIndex);
     }
 
-    private static Color ResolveBg(TerminalCell c, Color defBg, TerminalTheme? theme)
+    private static Color ResolveBg(TerminalCell c, TerminalBuffer buf, Color defBg, TerminalTheme? theme)
     {
         if ((c.Flags & CellFlags.BgRgb) != 0) return Color.FromUInt32(0xFF000000 | c.BgRgb);
         if (c.BgIndex == 0 && c.BgRgb == 0)   return defBg;
+        if (buf.TryGetDynamicPaletteColor(c.BgIndex, out uint dyn))
+            return Color.FromUInt32(0xFF000000 | dyn);
         if (theme?.AnsiColors != null
             && c.BgIndex < 16
             && c.BgIndex < theme.AnsiColors.Length

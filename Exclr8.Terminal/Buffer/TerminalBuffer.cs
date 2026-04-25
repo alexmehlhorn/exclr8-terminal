@@ -175,6 +175,28 @@ public sealed class TerminalBuffer : IParserActions
         set => _osc.DefaultCursorRgb = value;
     }
 
+    /// <summary>True when the shell explicitly set a default
+    /// foreground via OSC 10. Renderers prefer the host theme over
+    /// the buffer's pre-seeded value until this is true.</summary>
+    public bool DefaultForegroundExplicit => _osc.DefaultForegroundExplicit;
+    public bool DefaultBackgroundExplicit => _osc.DefaultBackgroundExplicit;
+    public bool DefaultCursorExplicit     => _osc.DefaultCursorExplicit;
+
+    /// <summary>Palette override for index <paramref name="idx"/>
+    /// (0..255) set by the shell via OSC 4. Returns true when an
+    /// override exists; the renderer falls back to host theme +
+    /// static palette otherwise.</summary>
+    public bool TryGetDynamicPaletteColor(int idx, out uint rgb) =>
+        _osc.TryGetPaletteColor(idx, out rgb);
+
+    /// <summary>OSC 4 / 10 / 11 / 12 changed the live palette or a
+    /// default colour. Renderer hooks this to invalidate visuals.</summary>
+    public event EventHandler? PaletteChanged
+    {
+        add    => _osc.PaletteChanged += value;
+        remove => _osc.PaletteChanged -= value;
+    }
+
     // Scrollback viewport. 0 = at bottom; positive = scrolled up into
     // scrollback. TerminalControl resets this to 0 on any keystroke.
     // PixelScrollOffset carries the sub-line pixel remainder so the
@@ -383,6 +405,15 @@ public sealed class TerminalBuffer : IParserActions
         remove => _osc.SemanticPrompt -= value;
     }
 
+    /// <summary>ConEmu / Windows-Terminal task-progress notifications
+    /// (OSC 9 ; 4 ; state ; pct). Hosts surface as taskbar overlays
+    /// or dock badges.</summary>
+    public event EventHandler<ProgressEventArgs>? ProgressChanged
+    {
+        add    => _osc.ProgressChanged += value;
+        remove => _osc.ProgressChanged -= value;
+    }
+
     /// <summary>Host focus change. When DECSET 1004 (focus events) is
     /// enabled, we reply with ESC [ I (focus in) or ESC [ O (focus
     /// out). No-op otherwise.</summary>
@@ -474,22 +505,44 @@ public sealed class TerminalBuffer : IParserActions
         // (the cells that backed the selection may have moved across
         // multiple reflowed rows), drop both — the host can re-issue
         // a search on the new buffer if needed.
-        Selection = null;
+        if (Selection != null) SetSelection(null);
         _search.Clear();
         Bump();
     }
 
     public void Write(ReadOnlySpan<byte> bytes)
     {
+        int prevRow = CursorRow, prevCol = CursorCol;
         _parser.Parse(bytes);
+        if (prevRow != CursorRow || prevCol != CursorCol)
+            CursorMoved?.Invoke(this, (CursorRow, CursorCol));
         Bump();
     }
+
+    /// <summary>Cursor position changed during a Write. Fires once per
+    /// Write call, AFTER all parsing — not once per cursor mutation —
+    /// so high-rate updates (ANSI animation) don't flood subscribers.
+    /// </summary>
+    public event EventHandler<(int Row, int Col)>? CursorMoved;
+
+    /// <summary>Scroll offset changed (user scrolled scrollback or live
+    /// content reset the offset). Fires once per change.</summary>
+    public event EventHandler<int>? ScrollChanged;
+
+    /// <summary>Selection state changed — set, extended, cleared.
+    /// New value is null when cleared. Hosts use this to drive a
+    /// "selection active" UI affordance.</summary>
+    public event EventHandler<TerminalSelection?>? SelectionChanged;
 
     // ---- Scrollback viewport ----
 
     public void SetScrollOffset(int offset)
     {
-        if (_viewport.SetOffset(offset, _active.Scrollback.Count)) Bump();
+        if (_viewport.SetOffset(offset, _active.Scrollback.Count))
+        {
+            ScrollChanged?.Invoke(this, _viewport.Offset);
+            Bump();
+        }
     }
 
     public void ScrollViewUp(int n)   => SetScrollOffset(_viewport.Offset + n);
@@ -502,12 +555,20 @@ public sealed class TerminalBuffer : IParserActions
     /// the scrollback bounds.</summary>
     public void ScrollByPixels(double pixels, double lineHeight)
     {
-        if (_viewport.AddPixels(pixels, lineHeight, _active.Scrollback.Count)) Bump();
+        if (_viewport.AddPixels(pixels, lineHeight, _active.Scrollback.Count))
+        {
+            ScrollChanged?.Invoke(this, _viewport.Offset);
+            Bump();
+        }
     }
 
     public void ResetScrollOffset()
     {
-        if (_viewport.Reset()) Bump();
+        if (_viewport.Reset())
+        {
+            ScrollChanged?.Invoke(this, _viewport.Offset);
+            Bump();
+        }
     }
 
     /// <summary>Discard the scrollback buffer entirely (Cmd+K on macOS,
@@ -534,21 +595,19 @@ public sealed class TerminalBuffer : IParserActions
     public void StartSelection(int row, int col)
     {
         int abs = VisualToAbsRow(row);
-        Selection = new TerminalSelection(abs, col, abs, col, SelectionMode.Character);
-        Bump();
+        SetSelection(new TerminalSelection(abs, col, abs, col, SelectionMode.Character));
     }
 
     public void ExtendSelection(int row, int col)
     {
         if (Selection == null) return;
         int abs = VisualToAbsRow(row);
-        Selection = Selection with { EndRow = abs, EndCol = col };
-        Bump();
+        SetSelection(Selection with { EndRow = abs, EndCol = col });
     }
 
     public void ClearSelection()
     {
-        if (Selection != null) { Selection = null; Bump(); }
+        if (Selection != null) SetSelection(null);
     }
 
     public void SelectWord(int row, int col)
@@ -559,14 +618,21 @@ public sealed class TerminalBuffer : IParserActions
         while (s > 0           && IsWordChar(cells[s - 1])) s--;
         while (e < Cols - 1    && IsWordChar(cells[e + 1])) e++;
         int abs = VisualToAbsRow(row);
-        Selection = new TerminalSelection(abs, s, abs, e, SelectionMode.Word);
-        Bump();
+        SetSelection(new TerminalSelection(abs, s, abs, e, SelectionMode.Word));
     }
 
     public void SelectLine(int row)
     {
         int abs = VisualToAbsRow(row);
-        Selection = new TerminalSelection(abs, 0, abs, Cols - 1, SelectionMode.Line);
+        SetSelection(new TerminalSelection(abs, 0, abs, Cols - 1, SelectionMode.Line));
+    }
+
+    /// <summary>Centralised setter so every selection mutation fires
+    /// SelectionChanged exactly once and bumps the revision.</summary>
+    private void SetSelection(TerminalSelection? sel)
+    {
+        Selection = sel;
+        SelectionChanged?.Invoke(this, sel);
         Bump();
     }
 
@@ -577,8 +643,21 @@ public sealed class TerminalBuffer : IParserActions
     {
         int sb   = _active.Scrollback.Count;
         int last = sb + Rows - 1;
-        Selection = new TerminalSelection(0, 0, last, Cols - 1, SelectionMode.Line);
-        Bump();
+        SetSelection(new TerminalSelection(0, 0, last, Cols - 1, SelectionMode.Line));
+    }
+
+    /// <summary>Programmatic selection in absolute-row coordinates.
+    /// (0 = oldest scrollback line.) Out-of-range coords get clamped
+    /// to the buffer's reachable range. Empty / inverted ranges are
+    /// accepted (Normalized() handles ordering).</summary>
+    public void Select(int startRow, int startCol, int endRow, int endCol)
+    {
+        int total = _active.Scrollback.Count + Rows - 1;
+        int r1 = Math.Clamp(startRow, 0, total);
+        int r2 = Math.Clamp(endRow,   0, total);
+        int c1 = Math.Clamp(startCol, 0, Cols - 1);
+        int c2 = Math.Clamp(endCol,   0, Cols - 1);
+        SetSelection(new TerminalSelection(r1, c1, r2, c2, SelectionMode.Character));
     }
 
     // ---- Find / search ----
@@ -618,14 +697,23 @@ public sealed class TerminalBuffer : IParserActions
         return snap;
     }
 
-    /// <summary>Walk a snapshot producing every case-insensitive match
-    /// of <paramref name="needle"/>. Safe to run off-thread against
-    /// a <see cref="SnapshotRows"/> result. Checks
+    /// <summary>Walk a snapshot producing every match of
+    /// <paramref name="needle"/> under <paramref name="options"/>
+    /// (case-sensitivity, whole-word, regex). Safe to run off-thread
+    /// against a <see cref="SnapshotRows"/> result. Checks
     /// <paramref name="ct"/> between rows so a superseded search
     /// returns quickly.</summary>
     public static List<SearchMatch> ScanMatches(
+        TerminalCell[][] rows, string needle,
+        SearchOptions options, System.Threading.CancellationToken ct)
+        => SearchIndex.Scan(rows, needle, options, ct);
+
+    /// <summary>Legacy two-arg form preserved for source compatibility
+    /// with hosts and tests written against the case-insensitive
+    /// default.</summary>
+    public static List<SearchMatch> ScanMatches(
         TerminalCell[][] rows, string needle, System.Threading.CancellationToken ct)
-        => SearchIndex.Scan(rows, needle, ct);
+        => SearchIndex.Scan(rows, needle, SearchOptions.Default, ct);
 
     /// <summary>Replace the current search results and pick the match
     /// nearest the viewport bottom so "next" moves forward from where
@@ -686,8 +774,21 @@ public sealed class TerminalBuffer : IParserActions
         SetScrollOffset(desired);
     }
 
-    private static bool IsWordChar(TerminalCell c) =>
-        c.Rune != 0 && c.Rune != ' ' && c.Rune != '\t';
+    /// <summary>Characters double-click word-selection treats as
+    /// non-word boundaries, in addition to space and tab. Defaults
+    /// to a typical shell set; the host can override (e.g. extend
+    /// for SQL, narrow for path-like tokens).</summary>
+    public string WordSeparators { get; set; } = " \t`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+
+    private bool IsWordChar(TerminalCell c)
+    {
+        if (c.Rune == 0) return false;
+        // Plain ASCII fast path: avoid ConvertFromUtf32 for the 99%
+        // case. Outside the BMP we fall through to a string compare.
+        if (c.Rune <= 0xFFFF)
+            return WordSeparators.IndexOf((char)c.Rune) < 0;
+        return WordSeparators.IndexOf(char.ConvertFromUtf32(c.Rune), StringComparison.Ordinal) < 0;
+    }
 
     public string GetSelectedText()
     {
@@ -1013,11 +1114,18 @@ public sealed class TerminalBuffer : IParserActions
             row[c] = BlankPenCell();
     }
 
+    /// <summary>BEL (0x07) — the host's responsibility to honour
+    /// (audible beep, visual flash, desktop notification, or just
+    /// ignore). Fires synchronously while parsing, so a high-rate
+    /// emitter ("ASCII art bombing") will fire many times in quick
+    /// succession; consumers usually want to debounce.</summary>
+    public event EventHandler? Bell;
+
     public void Execute(byte c0)
     {
         switch (c0)
         {
-            case 0x07: return;                                // BEL
+            case 0x07: Bell?.Invoke(this, EventArgs.Empty); return; // BEL
             case 0x08: if (CursorCol > 0) CursorCol--; _lastPrintRune = 0; return; // BS
             case 0x09: HorizontalTab(); _lastPrintRune = 0; return;
             case 0x0A: case 0x0B: case 0x0C:
@@ -1187,6 +1295,8 @@ public sealed class TerminalBuffer : IParserActions
             case 'u': RestoreCursor(); return;
             case 'q': SetCursorStyle(p0); return;              // DECSCUSR (with/without SP intermediate)
         }
+        TerminalLog.TraceProtocol(
+            $"unhandled CSI: prefix='{(prefix == 0 ? ' ' : prefix)}' final='{final}' intermediates='{intermediates}'");
     }
 
     // ---- CUP/HVP with DECOM origin mode ----
@@ -1236,6 +1346,8 @@ public sealed class TerminalBuffer : IParserActions
             case 'M': ReverseIndex(); return;                  // RI
             case 'c': FullReset(); return;                     // RIS
         }
+        TerminalLog.TraceProtocol(
+            $"unhandled ESC: final='{final}' intermediates='{intermediates}'");
     }
 
     public void OscDispatch(ReadOnlySpan<char> payload)
@@ -1275,8 +1387,10 @@ public sealed class TerminalBuffer : IParserActions
             HandleDecrqss(payload);
             return;
         }
-        // Other DCS sequences (DECUDK, sixel, kitty graphics) — silently
-        // drop until extensibility lets a host wire them in.
+        // Other DCS sequences (DECUDK, sixel, kitty graphics) — drop
+        // until a host wires in a handler via RegisterDcsHandler.
+        TerminalLog.TraceProtocol(
+            $"unhandled DCS: prefix='{(prefix == 0 ? ' ' : prefix)}' final='{final}' intermediates='{intermediates}' payload-len={payload.Length}");
     }
 
     private void HandleDecrqss(ReadOnlySpan<char> selector)
@@ -1382,6 +1496,9 @@ public sealed class TerminalBuffer : IParserActions
             {
                 case 4:  InsertMode        = on; break;
                 case 20: LineFeedNewLine   = on; break;
+                default:
+                    TerminalLog.TraceProtocol($"unhandled ANSI mode: {(on ? "SM" : "RM")} {m}");
+                    break;
             }
         }
     }
@@ -1443,6 +1560,38 @@ public sealed class TerminalBuffer : IParserActions
         if (_lastPrintRune == 0) return;
         int rune = _lastPrintRune;
         for (int i = 0; i < count; i++) Print(rune);
+    }
+
+    /// <summary>Force-clear the active OSC 8 hyperlink id. Useful as
+    /// a recovery path when the shell's <c>OSC 8 ; ; ST</c> close
+    /// sequence got swallowed upstream and every subsequent printed
+    /// cell is inheriting the stuck link id. Doesn't touch SGR pen,
+    /// cursor, or screen contents.</summary>
+    public void ClearActiveHyperlink()
+    {
+        _osc.ClearActiveHyperlink();
+        Bump();
+    }
+
+    /// <summary>Public DECSTR (soft reset). Clears SGR pen, cursor
+    /// visibility, scroll region, insert/origin modes, charset
+    /// slots — but preserves screen contents and scrollback. Useful
+    /// for hosts that want a "reset formatting" command without
+    /// nuking history.</summary>
+    public void SoftResetTerminal()
+    {
+        SoftReset();
+        Bump();
+    }
+
+    /// <summary>Public RIS (full reset). Equivalent to receiving
+    /// <c>ESC c</c>: clears both screens, scrollback, all DEC modes,
+    /// SGR pen, cursor state, OSC 8 / title state. Hosts wire this
+    /// to a "reset terminal" command.</summary>
+    public void ResetTerminal()
+    {
+        FullReset();
+        Bump();
     }
 
     // ---- DECSTR (soft reset) ----
@@ -1531,6 +1680,9 @@ public sealed class TerminalBuffer : IParserActions
                     if (on) SaveCursor(); else RestoreCursor();
                     break;
                 case 2026: SynchronizedOutput = on; break;          // synchronized output
+                default:
+                    TerminalLog.TraceProtocol($"unhandled DEC mode: {(on ? "DECSET" : "DECRST")} {m}");
+                    break;
             }
         }
     }
@@ -1807,7 +1959,9 @@ public sealed class TerminalBuffer : IParserActions
     {
         _active = _primary;
         _primary.Clear();
+        _primary.ClearScrollback();
         _alternate.Clear();
+        _alternate.ClearScrollback();
         CursorRow = CursorCol = 0;
         _pen = TerminalCell.Blank;
         CursorVisible = true;
@@ -1821,7 +1975,8 @@ public sealed class TerminalBuffer : IParserActions
         InsertMode = false; LineFeedNewLine = false;
         ReverseWraparound = false; SynchronizedOutput = false;
         ModifyOtherKeys = 0;
-        _viewport.Reset(); Selection = null;
+        _viewport.Reset();
+        if (Selection != null) SetSelection(null);
         _osc.Reset();
         _tabStops = null; // will rebuild with defaults on next access
         _lastPrintRune = 0;

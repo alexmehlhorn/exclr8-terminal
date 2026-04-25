@@ -2,9 +2,29 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace Exclr8.Terminal.Buffer;
+
+/// <summary>Find-mode flags. Default values reproduce the legacy
+/// case-insensitive plain-text behaviour. Combine with the bitwise
+/// or-equivalent record-with syntax: <c>SearchOptions.Default with
+/// { CaseSensitive = true }</c>.</summary>
+public sealed record SearchOptions
+{
+    /// <summary>Match case (default false — case-insensitive).</summary>
+    public bool CaseSensitive { get; init; }
+    /// <summary>Only match when neighbouring characters are non-word
+    /// (whitespace, punctuation, edge of row). Default false.</summary>
+    public bool WholeWord { get; init; }
+    /// <summary>Treat the needle as a regular expression. Invalid
+    /// patterns produce zero matches rather than throwing. Default
+    /// false.</summary>
+    public bool Regex { get; init; }
+
+    public static readonly SearchOptions Default = new();
+}
 
 /// <summary>A single case-insensitive match in the buffer. <see cref="Row"/>
 /// is absolute (0 = oldest scrollback row). <see cref="Col"/> and
@@ -87,25 +107,50 @@ internal sealed class SearchIndex
         return best;
     }
 
-    /// <summary>Scan a row snapshot for case-insensitive occurrences of
-    /// <paramref name="needle"/>. Checks <paramref name="ct"/> between
-    /// rows so a superseded search returns quickly. Safe to run
-    /// off-thread against a snapshot captured on the UI thread.</summary>
+    /// <summary>Scan a row snapshot for occurrences of
+    /// <paramref name="needle"/>. <paramref name="options"/> selects
+    /// case-sensitivity, whole-word matching, and regex. Checks
+    /// <paramref name="ct"/> between rows so a superseded search
+    /// returns quickly. Safe to run off-thread against a snapshot
+    /// captured on the UI thread.</summary>
     public static List<SearchMatch> Scan(
-        TerminalCell[][] rows, string needle, CancellationToken ct)
+        TerminalCell[][] rows, string needle,
+        SearchOptions options, CancellationToken ct)
     {
         var matches = new List<SearchMatch>();
+        Regex? rx = null;
+        if (options.Regex)
+        {
+            try
+            {
+                var rxOpts = RegexOptions.CultureInvariant;
+                if (!options.CaseSensitive) rxOpts |= RegexOptions.IgnoreCase;
+                rx = new Regex(needle, rxOpts);
+            }
+            catch (ArgumentException)
+            {
+                // Invalid regex — return no matches rather than throw.
+                return matches;
+            }
+        }
         for (int r = 0; r < rows.Length; r++)
         {
             ct.ThrowIfCancellationRequested();
             var row = rows[r];
-            if (row != null) FindInRow(row, r, needle, matches);
+            if (row != null) FindInRow(row, r, needle, options, rx, matches);
         }
         return matches;
     }
 
+    /// <summary>Legacy two-arg form preserved so existing callers
+    /// (tests, simple hosts) keep compiling. Equivalent to passing
+    /// <see cref="SearchOptions.Default"/>.</summary>
+    public static List<SearchMatch> Scan(
+        TerminalCell[][] rows, string needle, CancellationToken ct)
+        => Scan(rows, needle, SearchOptions.Default, ct);
+
     private static void FindInRow(TerminalCell[] row, int absRow,
-        string needle, List<SearchMatch> into)
+        string needle, SearchOptions options, Regex? rx, List<SearchMatch> into)
     {
         // Build a searchable haystack. Astral-plane runes (most emoji,
         // CJK Ext B+) encode as a surrogate pair — two chars in the
@@ -142,15 +187,35 @@ internal sealed class SearchIndex
                 }
             }
             var haystack = sb.ToString();
-            int from = 0;
-            while (from <= haystack.Length - needle.Length)
+            if (rx != null)
             {
-                int idx = haystack.IndexOf(needle, from, StringComparison.OrdinalIgnoreCase);
-                if (idx < 0) break;
-                int startCell = colMap[idx];
-                int endCell   = colMap[idx + needle.Length - 1];
-                into.Add(new SearchMatch(absRow, startCell, endCell - startCell + 1));
-                from = idx + Math.Max(1, needle.Length);
+                foreach (Match m in rx.Matches(haystack))
+                {
+                    if (m.Length == 0) continue;
+                    if (options.WholeWord && !IsWholeWord(haystack, m.Index, m.Length)) continue;
+                    int startCell = colMap[m.Index];
+                    int endCell   = colMap[m.Index + m.Length - 1];
+                    into.Add(new SearchMatch(absRow, startCell, endCell - startCell + 1));
+                }
+            }
+            else
+            {
+                var cmp = options.CaseSensitive
+                    ? StringComparison.Ordinal
+                    : StringComparison.OrdinalIgnoreCase;
+                int from = 0;
+                while (from <= haystack.Length - needle.Length)
+                {
+                    int idx = haystack.IndexOf(needle, from, cmp);
+                    if (idx < 0) break;
+                    if (!options.WholeWord || IsWholeWord(haystack, idx, needle.Length))
+                    {
+                        int startCell = colMap[idx];
+                        int endCell   = colMap[idx + needle.Length - 1];
+                        into.Add(new SearchMatch(absRow, startCell, endCell - startCell + 1));
+                    }
+                    from = idx + Math.Max(1, needle.Length);
+                }
             }
         }
         finally
@@ -158,4 +223,14 @@ internal sealed class SearchIndex
             ArrayPool<int>.Shared.Return(colMap);
         }
     }
+
+    private static bool IsWholeWord(string haystack, int idx, int length)
+    {
+        bool leftOk  = idx == 0                     || !IsWordChar(haystack[idx - 1]);
+        bool rightOk = idx + length >= haystack.Length || !IsWordChar(haystack[idx + length]);
+        return leftOk && rightOk;
+    }
+
+    private static bool IsWordChar(char c) =>
+        char.IsLetterOrDigit(c) || c == '_';
 }

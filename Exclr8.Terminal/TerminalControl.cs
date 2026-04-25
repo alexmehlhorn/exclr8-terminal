@@ -99,8 +99,105 @@ public class TerminalControl : Control, IDisposable
     /// <summary>Cell grid dimensions changed.</summary>
     public event EventHandler<(int Cols, int Rows)>? Resized;
 
-    /// <summary>User clicked an OSC 8 hyperlink.</summary>
+    /// <summary>User clicked an OSC 8 hyperlink OR a span produced
+    /// by a registered <see cref="ILinkProvider"/>. Only URLs that
+    /// pass <see cref="LinkActivationPolicy"/> reach this event;
+    /// blocked clicks fire <see cref="LinkBlocked"/> instead.</summary>
     public event EventHandler<string>? HyperlinkClicked;
+
+    /// <summary>A hyperlink click was rejected by
+    /// <see cref="LinkActivationPolicy"/>. Hosts can surface a toast
+    /// or log it; the URL has already been dropped.</summary>
+    public event EventHandler<string>? LinkBlocked;
+
+    /// <summary>Predicate that decides whether a clicked URL is
+    /// allowed to surface as <see cref="HyperlinkClicked"/>. Default
+    /// allows only <c>http://</c> and <c>https://</c> — OSC 8 can
+    /// ship arbitrary schemes (<c>javascript:</c>, <c>file://</c>,
+    /// <c>vbs://</c>, …) and custom <see cref="ILinkProvider"/>s
+    /// can return anything, so the host has to opt in to wider
+    /// schemes explicitly. Set to <c>_ =&gt; true</c> to allow
+    /// everything.</summary>
+    public Func<string, bool> LinkActivationPolicy { get; set; } = DefaultLinkPolicy;
+
+    private static bool DefaultLinkPolicy(string url) =>
+        url.StartsWith("http://",  StringComparison.OrdinalIgnoreCase)
+     || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Run a clicked URL through the policy and either
+    /// raise <see cref="HyperlinkClicked"/> or
+    /// <see cref="LinkBlocked"/>. Centralised so OSC 8 and link-
+    /// provider paths share the same gate.</summary>
+    private void ActivateLink(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return;
+        if (LinkActivationPolicy(url))
+            HyperlinkClicked?.Invoke(this, url);
+        else
+            LinkBlocked?.Invoke(this, url);
+    }
+
+    // Registered ILinkProviders. The renderer asks each per visible
+    // row, on every frame; providers are expected to be cheap (regex
+    // per row, no allocations beyond the matches themselves).
+    private readonly List<ILinkProvider> _linkProviders = new();
+    public IReadOnlyList<ILinkProvider> LinkProviders => _linkProviders;
+
+    /// <summary>Register a custom link matcher. Returns a disposable
+    /// that detaches the provider. Most-recent registration wins
+    /// when ranges overlap.</summary>
+    public IDisposable RegisterLinkProvider(ILinkProvider provider)
+    {
+        if (provider == null) throw new ArgumentNullException(nameof(provider));
+        _linkProviders.Add(provider);
+        InvalidateVisual();
+        return new ProviderRegistration(() =>
+        {
+            _linkProviders.Remove(provider);
+            InvalidateVisual();
+        });
+    }
+
+    private sealed class ProviderRegistration : IDisposable
+    {
+        private Action? _dispose;
+        public ProviderRegistration(Action dispose) { _dispose = dispose; }
+        public void Dispose() { var d = _dispose; _dispose = null; d?.Invoke(); }
+    }
+
+    /// <summary>BEL (0x07) — the shell rang the bell. Host decides
+    /// what to do (audible beep, visual flash, desktop notification,
+    /// or ignore). Fires per BEL byte; consumers typically debounce.</summary>
+    public event EventHandler? Bell
+    {
+        add    => _buffer.Bell += value;
+        remove => _buffer.Bell -= value;
+    }
+
+    /// <summary>Cursor moved during a Write. Fires once per Write call
+    /// — not once per cursor mutation — so high-rate animations don't
+    /// flood subscribers.</summary>
+    public event EventHandler<(int Row, int Col)>? CursorMoved
+    {
+        add    => _buffer.CursorMoved += value;
+        remove => _buffer.CursorMoved -= value;
+    }
+
+    /// <summary>Scroll offset changed. Useful for hosts that drive a
+    /// custom scrollbar or "X lines back" indicator.</summary>
+    public event EventHandler<int>? ScrollChanged
+    {
+        add    => _buffer.ScrollChanged += value;
+        remove => _buffer.ScrollChanged -= value;
+    }
+
+    /// <summary>Selection set, extended, or cleared. New value is null
+    /// when cleared.</summary>
+    public event EventHandler<TerminalSelection?>? SelectionChanged
+    {
+        add    => _buffer.SelectionChanged += value;
+        remove => _buffer.SelectionChanged -= value;
+    }
 
     /// <summary>OSC 0 / OSC 2 — window title set by the shell.</summary>
     public event EventHandler<string>? TitleChanged
@@ -138,6 +235,16 @@ public class TerminalControl : Control, IDisposable
     {
         add    => _buffer.SemanticPrompt += value;
         remove => _buffer.SemanticPrompt -= value;
+    }
+
+    /// <summary>OSC 9 ; 4 — taskbar / dock-badge progress reporting
+    /// from the running command. State + optional 0..100 percentage.
+    /// Pairs naturally with <see cref="SemanticPrompt"/> for full
+    /// build/test/install lifecycle UX.</summary>
+    public event EventHandler<ProgressEventArgs>? ProgressChanged
+    {
+        add    => _buffer.ProgressChanged += value;
+        remove => _buffer.ProgressChanged -= value;
     }
 
     /// <summary>OSC 52 — shell asked to write to the OS clipboard.
@@ -386,6 +493,18 @@ public class TerminalControl : Control, IDisposable
         set { _colorScheme = value; InvalidateVisual(); }
     }
 
+    /// <summary>When true (default), OSC 8 hyperlink cells get a thin
+    /// underline drawn beneath them so the user can tell which spans
+    /// are clickable. Hosts that draw their own button-style links
+    /// (filled bg, contrasting fg, distinct from surrounding text)
+    /// can flip this off — the underline sits on the bottom of the
+    /// cell and competes visually with their styling.</summary>
+    public bool ShowHyperlinkUnderline
+    {
+        get => _renderer.ShowHyperlinkUnderline;
+        set { _renderer.ShowHyperlinkUnderline = value; InvalidateVisual(); }
+    }
+
     public TerminalControl()
     {
         Focusable    = true;
@@ -401,6 +520,7 @@ public class TerminalControl : Control, IDisposable
         _buffer   = new TerminalBuffer(80, 24);
         _buffer.Changed += OnBufferChanged;
         _buffer.SynchronizedOutputChanged += OnSynchronizedOutputChanged;
+        _buffer.PaletteChanged += OnPaletteChanged;
         _syncOutputTimer = new DispatcherTimer { Interval = SyncOutputMaxHold };
         _syncOutputTimer.Tick += (_, _) =>
         {
@@ -460,6 +580,8 @@ public class TerminalControl : Control, IDisposable
         }
     }
 
+    private void OnPaletteChanged(object? sender, EventArgs e) => InvalidateVisual();
+
     /// <summary>Surface "scrollbar-worthy activity". Snaps opacity to
     /// 1.0, starts the tick timer, and requests a repaint. Anything
     /// that involves the scrollback viewport calls this.</summary>
@@ -497,35 +619,155 @@ public class TerminalControl : Control, IDisposable
     }
 
     // ---- PTY I/O ----
+    //
+    // Producer threads (the PTY reader, an SSH channel, a replay
+    // pump) can flood Write() at thousands of chunks per second on
+    // verbose output (large `cat`, `find /`, build logs). Each chunk
+    // used to do its own Dispatcher.UIThread.Post + parse + bump,
+    // which serialises through the dispatcher and starves input/
+    // render. The coalescing queue collapses the burst:
+    //
+    //   * Producer enqueues bytes into a ConcurrentQueue.
+    //   * One Post is scheduled per "drain pass", arbitrated by a
+    //     CAS on _drainScheduled — concurrent producers all enqueue
+    //     but only the first one through schedules a drain.
+    //   * Drain runs on the UI thread, dequeues every queued chunk,
+    //     parses them in one parser pass per chunk, then yields
+    //     control back to Avalonia (re-Post a continuation) every
+    //     ~16ms so input and render don't starve mid-drain.
+    //
+    // With this in place, a 100 MB log dump turns into ~6 dispatcher
+    // posts instead of one per chunk.
+
+    private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _writeQueue = new();
+    private long _writeQueuedBytes;
+    private int  _drainScheduled; // 0 = idle, 1 = drain in flight
+    private static readonly TimeSpan DrainYieldBudget = TimeSpan.FromMilliseconds(16);
+
+    /// <summary>How a runaway producer is throttled. Default
+    /// <see cref="WriteDropPolicy.None"/> means the queue grows
+    /// unbounded — fine for trusted PTYs. Hosts that need a hard
+    /// cap (untrusted byte source, embedded device with limited
+    /// memory) set <see cref="WriteDropPolicy.OldestFirst"/> + a
+    /// non-zero <see cref="WriteQueueMaxBytes"/>.</summary>
+    public WriteDropPolicy WriteDropPolicy { get; set; } = WriteDropPolicy.None;
+
+    /// <summary>Cap on bytes held in the pending-write queue when
+    /// <see cref="WriteDropPolicy"/> is not None. 0 = unlimited.</summary>
+    public long WriteQueueMaxBytes { get; set; }
+
+    /// <summary>Bytes currently waiting in the write queue. Hosts can
+    /// surface this as a "back-pressure" indicator. Reads are
+    /// approximate when producer threads are racing the UI drain.</summary>
+    public long QueuedBytes => System.Threading.Interlocked.Read(ref _writeQueuedBytes);
+
+    /// <summary>Total bytes the drop policy has discarded since the
+    /// control was constructed. Stays at 0 with the default
+    /// <see cref="WriteDropPolicy.None"/>.</summary>
+    public long DroppedBytes { get; private set; }
 
     /// <summary>Feed bytes from your byte source (PTY, SSH channel,
     /// replay stream, …) into the terminal. Safe to call from any
-    /// thread: when invoked from a non-UI thread the payload is copied
-    /// and dispatched onto the Avalonia UI thread. Calling from the UI
-    /// thread is zero-copy.</summary>
+    /// thread. Bursts from a single producer or from many concurrent
+    /// producers are coalesced into a single drain pass on the UI
+    /// thread.</summary>
     public void Write(ReadOnlySpan<byte> bytes)
     {
-        if (Dispatcher.UIThread.CheckAccess())
+        if (bytes.IsEmpty) return;
+        var copy = bytes.ToArray();
+        EnqueueAndScheduleDrain(copy);
+    }
+
+    public void Write(byte[] bytes)
+    {
+        if (bytes == null || bytes.Length == 0) return;
+        // Take the array as-is when the caller's already given us an
+        // owned array — saves a copy on the hot path.
+        EnqueueAndScheduleDrain(bytes);
+    }
+
+    private void EnqueueAndScheduleDrain(byte[] payload)
+    {
+        // Honour the drop policy first so we don't enqueue bytes we'd
+        // immediately discard. OldestFirst drops *queued* bytes (not
+        // the current payload) — preserving freshness, matching how
+        // `journalctl --output-fields="..."` and other ring-style
+        // sinks behave.
+        if (WriteDropPolicy == WriteDropPolicy.OldestFirst
+            && WriteQueueMaxBytes > 0)
         {
-            WriteOnUi(bytes);
+            long target = WriteQueueMaxBytes - payload.Length;
+            while (System.Threading.Interlocked.Read(ref _writeQueuedBytes) > target
+                   && _writeQueue.TryDequeue(out var dropped))
+            {
+                System.Threading.Interlocked.Add(ref _writeQueuedBytes, -dropped.Length);
+                DroppedBytes += dropped.Length;
+            }
         }
-        else
+
+        _writeQueue.Enqueue(payload);
+        System.Threading.Interlocked.Add(ref _writeQueuedBytes, payload.Length);
+
+        // CAS 0→1: only the first thread through schedules a drain.
+        // Subsequent producers see _drainScheduled==1 and just
+        // enqueue; the running drain will pick up their bytes.
+        if (System.Threading.Interlocked.CompareExchange(ref _drainScheduled, 1, 0) == 0)
         {
-            // ReadOnlySpan<byte> can't be captured in a closure, so
-            // snapshot the bytes into an owned array for the dispatch.
-            var copy = bytes.ToArray();
-            Dispatcher.UIThread.Post(() => WriteOnUi(copy));
+            if (Dispatcher.UIThread.CheckAccess()) DrainOnUi();
+            else                                   Dispatcher.UIThread.Post(DrainOnUi);
         }
     }
 
-    public void Write(byte[] bytes) => Write(bytes.AsSpan());
-
-    private void WriteOnUi(ReadOnlySpan<byte> bytes)
+    private void DrainOnUi()
     {
-        _buffer.Write(bytes);
-        var replies = _buffer.TakeReplies();
-        if (replies != null) Output?.Invoke(this, replies);
-        if (_buffer.Revision != _lastRevision) InvalidateVisual();
+        // Disposal might have run between Post() and the dispatcher
+        // picking us up. Drop any leftover queued bytes — the buffer
+        // is gone, and parsing them would just churn for no reason.
+        if (_disposed)
+        {
+            while (_writeQueue.TryDequeue(out _)) { }
+            System.Threading.Interlocked.Exchange(ref _writeQueuedBytes, 0);
+            System.Threading.Interlocked.Exchange(ref _drainScheduled, 0);
+            return;
+        }
+
+        var deadline = DateTime.UtcNow + DrainYieldBudget;
+        try
+        {
+            while (_writeQueue.TryDequeue(out var chunk))
+            {
+                System.Threading.Interlocked.Add(ref _writeQueuedBytes, -chunk.Length);
+                _buffer.Write(chunk);
+                var replies = _buffer.TakeReplies();
+                if (replies != null) Output?.Invoke(this, replies);
+
+                // If the drain has been running long enough that
+                // input / render would feel sluggish, yield back to
+                // Avalonia by re-posting the drain continuation. The
+                // CAS flag stays at 1 so producers don't double-
+                // schedule.
+                if (DateTime.UtcNow >= deadline && !_writeQueue.IsEmpty)
+                {
+                    if (_buffer.Revision != _lastRevision) InvalidateVisual();
+                    Dispatcher.UIThread.Post(DrainOnUi);
+                    return;
+                }
+            }
+            if (_buffer.Revision != _lastRevision) InvalidateVisual();
+        }
+        finally
+        {
+            System.Threading.Interlocked.Exchange(ref _drainScheduled, 0);
+            // A producer might have enqueued between our last
+            // TryDequeue and the flag flip — re-check and reschedule
+            // if needed so the new bytes don't wait for the next
+            // arbitrary trigger.
+            if (!_writeQueue.IsEmpty
+                && System.Threading.Interlocked.CompareExchange(ref _drainScheduled, 1, 0) == 0)
+            {
+                Dispatcher.UIThread.Post(DrainOnUi);
+            }
+        }
     }
 
     /// <summary>Hard cap on paste payload size. Past this the paste
@@ -578,7 +820,8 @@ public class TerminalControl : Control, IDisposable
     public override void Render(DrawingContext ctx)
     {
         base.Render(ctx);
-        _renderer.Render(ctx, _buffer, Bounds.Size, IsFocused, _colorScheme);
+        _renderer.Render(ctx, _buffer, Bounds.Size, IsFocused, _colorScheme,
+            _linkProviders.Count > 0 ? _linkProviders : null);
         _lastRevision = _buffer.Revision;
     }
 
@@ -678,6 +921,23 @@ public class TerminalControl : Control, IDisposable
         _renderer.FontSize = _renderer.DefaultFontSize;
         RecomputeGrid();
         InvalidateVisual();
+    }
+
+    /// <summary>Enable OpenType programming-font ligatures (Fira Code,
+    /// JetBrains Mono, Cascadia Code, …). Substitutions like
+    /// <c>==</c> → <c>⟹</c> only apply within a same-attribute glyph
+    /// run; ligatures across SGR colour boundaries are intentionally
+    /// not joined. Off by default — fonts without ligature features
+    /// pay a small extra shaping cost for nothing.</summary>
+    public bool EnableLigatures
+    {
+        get => _renderer.EnableLigatures;
+        set
+        {
+            if (_renderer.EnableLigatures == value) return;
+            _renderer.EnableLigatures = value;
+            InvalidateVisual();
+        }
     }
 
     // ---- Keyboard ----
@@ -933,9 +1193,38 @@ public class TerminalControl : Control, IDisposable
             if (cells != null && col < cells.Length && cells[col].HyperlinkId != 0
                 && _buffer.TryGetHyperlink(cells[col].HyperlinkId, out var url))
             {
-                HyperlinkClicked?.Invoke(this, url);
+                ActivateLink(url);
                 e.Handled = true;
                 return;
+            }
+            // Plain-URL / custom link providers — most-recent wins. Run
+            // only on click, not on every frame — keeps idle overhead at
+            // zero. Convert the row to a string once per click attempt.
+            if (cells != null && _linkProviders.Count > 0)
+            {
+                string rowText = RowText.Build(cells, out int[] colMap);
+                for (int i = _linkProviders.Count - 1; i >= 0; i--)
+                {
+                    int seen = 0;
+                    foreach (var link in _linkProviders[i].Provide(rowText))
+                    {
+                        // Same per-row cap the renderer enforces — keeps
+                        // a runaway provider from spinning here on click.
+                        if (++seen > 64) break;
+                        // Translate string-index coords back to cell
+                        // columns. Without the map, an astral rune
+                        // earlier in the row would offset every URL
+                        // hit-test by 1 column too far right.
+                        int startCell = colMap[link.StartCol];
+                        int endCell   = colMap[Math.Min(link.EndCol - 1, colMap.Length - 1)];
+                        if (col >= startCell && col <= endCell)
+                        {
+                            ActivateLink(link.Url);
+                            e.Handled = true;
+                            return;
+                        }
+                    }
+                }
             }
         }
 
@@ -1058,11 +1347,61 @@ public class TerminalControl : Control, IDisposable
     // Smooth pixel scroll. Avalonia's PointerWheelEventArgs.Delta.Y
     // is OS-normalised — mouse wheels deliver ±1 per notch, macOS
     // trackpads emit fractional values matching finger motion. We
-    // scale by PixelsPerTick (roughly the height of 3 text lines, the
-    // Windows default feel) so one notch advances about three rows.
+    // scale by ScrollSensitivity (roughly the height of 3 text lines,
+    // the Windows default feel) so one notch advances about three rows.
     // The buffer does the fractional accumulation internally via
     // PixelScrollOffset — no integer rounding on our side.
-    private const double PixelsPerTick = 40.0;
+    private const double DefaultScrollSensitivity = 40.0;
+
+    /// <summary>Pixels of scroll per wheel notch / per unit of trackpad
+    /// delta. Higher = faster scroll. Default ≈ 3 text lines per
+    /// notch — the Windows default feel. Negative is clamped to 0.</summary>
+    public double ScrollSensitivity { get; set; } = DefaultScrollSensitivity;
+
+    /// <summary>Maximum lines of scrollback the primary screen retains.
+    /// Lowering it discards older scrollback eagerly; raising it
+    /// affects future evictions only. The alternate screen is always
+    /// 0 (no scrollback by design).</summary>
+    public int ScrollbackLimit
+    {
+        get => _buffer.ScrollbackLimit;
+        set => _buffer.ScrollbackLimit = value;
+    }
+
+    /// <summary>Characters that count as word boundaries for
+    /// double-click word selection. See
+    /// <see cref="TerminalBuffer.WordSeparators"/> for default.</summary>
+    public string WordSeparators
+    {
+        get => _buffer.WordSeparators;
+        set => _buffer.WordSeparators = value;
+    }
+
+    /// <summary>Cursor blink period in milliseconds. Default 500. Set
+    /// 0 to stop blinking entirely; the cursor stays solid regardless
+    /// of DECSCUSR style.</summary>
+    public int CursorBlinkIntervalMs
+    {
+        get => (int)_blinkTimer.Interval.TotalMilliseconds;
+        set
+        {
+            if (value <= 0)
+            {
+                // Stop the timer AND force the visible state back on
+                // — otherwise a setter call during the timer's hidden
+                // phase leaves the cursor (and any SGR-blink cells)
+                // permanently invisible until something else triggers
+                // a Bump.
+                _blinkTimer.Stop();
+                _blinkVisible = true;
+                _renderer.BlinkVisible = true;
+                InvalidateVisual();
+                return;
+            }
+            _blinkTimer.Interval = TimeSpan.FromMilliseconds(value);
+            if (!_blinkTimer.IsEnabled) _blinkTimer.Start();
+        }
+    }
 
     protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
     {
@@ -1082,7 +1421,7 @@ public class TerminalControl : Control, IDisposable
         // Positive wheel delta = scroll up (toward scrollback) in pixel
         // units. Buffer clamps at scrollback bounds. Buffer.Changed
         // handler drives the repaint.
-        _buffer.ScrollByPixels(e.Delta.Y * PixelsPerTick, _renderer.CellHeight);
+        _buffer.ScrollByPixels(e.Delta.Y * Math.Max(0, ScrollSensitivity), _renderer.CellHeight);
         ShowScrollbar();
         e.Handled = true;
     }
@@ -1173,6 +1512,60 @@ public class TerminalControl : Control, IDisposable
     /// <summary>Public façade: select the current viewport.</summary>
     public void SelectAll() => _buffer.SelectAll();
 
+    /// <summary>Force-clear an OSC 8 hyperlink that got "stuck"
+    /// because the close sequence (<c>OSC 8 ; ; ST</c>) was dropped
+    /// upstream. After this, freshly typed cells stop inheriting the
+    /// underline. Doesn't disturb SGR colours, cursor position, or
+    /// screen contents.</summary>
+    public void ClearActiveHyperlink() => _buffer.ClearActiveHyperlink();
+
+    /// <summary>DECSTR equivalent. Clears SGR pen, cursor visibility,
+    /// scroll region, insert/origin modes, charset slots. Screen
+    /// content and scrollback are preserved. Use as a "reset
+    /// formatting" recovery path.</summary>
+    public void SoftReset() => _buffer.SoftResetTerminal();
+
+    /// <summary>RIS equivalent. Clears both screens, scrollback, all
+    /// DEC modes, SGR pen, cursor state, OSC 8 / title / palette
+    /// state. The nuclear option for "my terminal is broken, start
+    /// over".</summary>
+    public void Reset() => _buffer.ResetTerminal();
+
+    /// <summary>True when there is a non-empty selection in the buffer.</summary>
+    public bool HasSelection => _buffer.Selection != null;
+
+    /// <summary>Plain text of the current selection, or empty when
+    /// nothing is selected. Wide-cell continuations are skipped so the
+    /// returned text matches what the renderer drew.</summary>
+    public string GetSelectionText() => _buffer.GetSelectedText();
+
+    /// <summary>(startRow, startCol, endRow, endCol) of the current
+    /// selection in absolute-row coordinates (0 = oldest scrollback),
+    /// or null when there's no selection. Useful for hosts that want
+    /// to drive a "highlighted range" badge.</summary>
+    public (int StartRow, int StartCol, int EndRow, int EndCol)? GetSelectionPosition()
+    {
+        var s = _buffer.Selection;
+        if (s == null) return null;
+        var (r1, c1, r2, c2) = s.Normalized();
+        return (r1, c1, r2, c2);
+    }
+
+    /// <summary>Programmatically select a single absolute-row range
+    /// from (startRow, startCol) to (endRow, endCol), inclusive.
+    /// Coordinates are absolute (0 = oldest scrollback row); a
+    /// caller-friendly mapping the host can derive from
+    /// <see cref="TerminalBuffer.VisualToAbsRow"/>.</summary>
+    public void Select(int startRow, int startCol, int endRow, int endCol)
+        => _buffer.Select(startRow, startCol, endRow, endCol);
+
+    /// <summary>Select a whole absolute row.</summary>
+    public void SelectLineByAbs(int absRow)
+        => _buffer.Select(absRow, 0, absRow, _buffer.Cols - 1);
+
+    /// <summary>Drop any active selection.</summary>
+    public void ClearSelection() => _buffer.ClearSelection();
+
     // ---- Find ----
 
     /// <summary>Raised when the user hits Cmd+F (Ctrl+Shift+F) so the
@@ -1192,8 +1585,11 @@ public class TerminalControl : Control, IDisposable
     /// <summary>Update the search needle and rebuild the match list.
     /// Pass null or empty to clear. Scans happen on a background thread;
     /// results are applied on the UI thread when ready. Subsequent
-    /// calls cancel the previous scan.</summary>
-    public void Find(string? needle)
+    /// calls cancel the previous scan. <paramref name="options"/>
+    /// controls case-sensitivity, whole-word and regex modes — the
+    /// default reproduces the legacy case-insensitive plain-text
+    /// search.</summary>
+    public void Find(string? needle, SearchOptions? options = null)
     {
         _searchCts?.Cancel();
         _searchCts?.Dispose();
@@ -1208,10 +1604,10 @@ public class TerminalControl : Control, IDisposable
         var cts = new CancellationTokenSource();
         _searchCts = cts;
         int gen = ++_searchGeneration;
-        _ = RunFindAsync(needle, gen, cts.Token);
+        _ = RunFindAsync(needle, options ?? SearchOptions.Default, gen, cts.Token);
     }
 
-    private async Task RunFindAsync(string needle, int gen, CancellationToken ct)
+    private async Task RunFindAsync(string needle, SearchOptions options, int gen, CancellationToken ct)
     {
         try
         {
@@ -1224,7 +1620,7 @@ public class TerminalControl : Control, IDisposable
             var snapshot = _buffer.SnapshotRows();
 
             var matches = await Task.Run(
-                () => TerminalBuffer.ScanMatches(snapshot, needle, ct),
+                () => TerminalBuffer.ScanMatches(snapshot, needle, options, ct),
                 ct).ConfigureAwait(true);
 
             if (ct.IsCancellationRequested || gen != _searchGeneration) return;
@@ -1402,6 +1798,7 @@ public class TerminalControl : Control, IDisposable
         // doesn't hold this control alive through them.
         _buffer.Changed                   -= OnBufferChanged;
         _buffer.SynchronizedOutputChanged -= OnSynchronizedOutputChanged;
+        _buffer.PaletteChanged            -= OnPaletteChanged;
 
         _searchCts?.Cancel();
         _searchCts?.Dispose();

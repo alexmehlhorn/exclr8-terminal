@@ -18,4 +18,30 @@ public static class TerminalLog
     /// tagged with the subsystem it came from.</summary>
     public static Action<string> Error { get; set; } =
         msg => Console.Error.WriteLine(msg);
+
+    /// <summary>Called for protocol-level diagnostic events
+    /// (unhandled CSI / OSC / DCS / ESC / DEC modes). Off by default
+    /// because well-behaved shells emit a steady drizzle of vendor
+    /// extensions and obscure private modes that we intentionally
+    /// don't implement; logging every one would drown real signal.
+    /// Hosts debugging compatibility issues set
+    /// <see cref="EnableProtocolTrace"/> = true and read the
+    /// messages here.</summary>
+    public static Action<string> Trace { get; set; } =
+        msg => Console.Error.WriteLine(msg);
+
+    /// <summary>Gate for protocol-trace messages. False = silent
+    /// (the default), true = every unhandled sequence flows through
+    /// <see cref="Trace"/>.</summary>
+    public static bool EnableProtocolTrace { get; set; }
+
+    /// <summary>Internal helper — gate on the flag before allocating
+    /// the formatted message. Hot path: an unrecognised CSI lands
+    /// here on every keystroke for some shells, so the flag check
+    /// must short-circuit before any string formatting.</summary>
+    internal static void TraceProtocol(string message)
+    {
+        if (!EnableProtocolTrace) return;
+        try { Trace(message); } catch { /* never throw out of the parser */ }
+    }
 }

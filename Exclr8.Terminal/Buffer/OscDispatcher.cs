@@ -46,6 +46,36 @@ public sealed class SemanticPromptEventArgs : EventArgs
     }
 }
 
+/// <summary>ConEmu / Windows Terminal taskbar-progress states reported
+/// via <c>OSC 9 ; 4 ; state ; pct ST</c>. Hosts surface these as
+/// taskbar overlays or dock badges.</summary>
+public enum ProgressState
+{
+    /// <summary>0 — remove the progress indicator.</summary>
+    Remove,
+    /// <summary>1 — normal in-progress (with a percentage).</summary>
+    Normal,
+    /// <summary>2 — error / failed (red).</summary>
+    Error,
+    /// <summary>3 — indeterminate (no percentage; spinner).</summary>
+    Indeterminate,
+    /// <summary>4 — warning / paused (yellow).</summary>
+    Warning,
+}
+
+public sealed class ProgressEventArgs : EventArgs
+{
+    public ProgressState State { get; }
+    /// <summary>0..100 percentage when reported; null for Remove or
+    /// Indeterminate states.</summary>
+    public int? Percent { get; }
+    public ProgressEventArgs(ProgressState state, int? percent = null)
+    {
+        State = state;
+        Percent = percent;
+    }
+}
+
 /// <summary>
 /// Handles OSC (Operating System Command) sequences — window title,
 /// icon name, palette query/set, hyperlink framing (OSC 8), clipboard
@@ -68,6 +98,7 @@ internal sealed class OscDispatcher
     private ushort _nextHyperlinkId = 1;
     private string _windowTitle = string.Empty;
     private uint[]? _palette256;
+    private bool[]? _paletteSet;
 
     /// <summary>Hyperlink id to apply to subsequent printed cells. 0
     /// means "no link". Set by OSC 8 open; cleared by OSC 8 close.</summary>
@@ -77,9 +108,48 @@ internal sealed class OscDispatcher
     /// remote process can otherwise silently scrape the host clipboard.</summary>
     public bool AllowClipboardAccess { get; set; }
 
-    public uint DefaultForegroundRgb { get; set; } = 0xD0D0D0;
-    public uint DefaultBackgroundRgb { get; set; } = 0x1E1E1E;
-    public uint DefaultCursorRgb     { get; set; } = 0xD0D0D0;
+    private uint _defaultForegroundRgb = 0xD0D0D0;
+    private uint _defaultBackgroundRgb = 0x1E1E1E;
+    private uint _defaultCursorRgb     = 0xD0D0D0;
+
+    public uint DefaultForegroundRgb
+    {
+        get => _defaultForegroundRgb;
+        set { _defaultForegroundRgb = value; DefaultForegroundExplicit = true; }
+    }
+    public uint DefaultBackgroundRgb
+    {
+        get => _defaultBackgroundRgb;
+        set { _defaultBackgroundRgb = value; DefaultBackgroundExplicit = true; }
+    }
+    public uint DefaultCursorRgb
+    {
+        get => _defaultCursorRgb;
+        set { _defaultCursorRgb = value; DefaultCursorExplicit = true; }
+    }
+
+    /// <summary>True once the shell has explicitly set the default
+    /// foreground via OSC 10. Until then, the renderer should fall
+    /// back to the host theme / static palette default. Without this
+    /// gate the renderer would always prefer our pre-seeded value
+    /// and a host-supplied theme would never apply.</summary>
+    public bool DefaultForegroundExplicit { get; private set; }
+    public bool DefaultBackgroundExplicit { get; private set; }
+    public bool DefaultCursorExplicit     { get; private set; }
+
+    /// <summary>Live palette overrides driven by OSC 4. Returns true
+    /// and sets <paramref name="rgb"/> when the shell has explicitly
+    /// changed entry <paramref name="index"/>. Otherwise the renderer
+    /// should consult the host theme and the static palette.</summary>
+    public bool TryGetPaletteColor(int index, out uint rgb)
+    {
+        rgb = 0;
+        if (_paletteSet == null) return false;
+        if ((uint)index >= 256) return false;
+        if (!_paletteSet[index]) return false;
+        rgb = _palette256![index];
+        return true;
+    }
 
     /// <summary>OSC 0 or OSC 2 — window title.</summary>
     public event EventHandler<string>? TitleChanged;
@@ -105,10 +175,24 @@ internal sealed class OscDispatcher
     /// kind A/B/C/D and an optional exit code on D.</summary>
     public event EventHandler<SemanticPromptEventArgs>? SemanticPrompt;
 
+    /// <summary>OSC 9 ; 4 — ConEmu/Windows-Terminal task progress.
+    /// Hosts surface as taskbar overlay or dock badge; useful pair
+    /// with OSC 133 for build/test/install command tracking.</summary>
+    public event EventHandler<ProgressEventArgs>? ProgressChanged;
+
     public OscDispatcher(Action<byte[]> reply) { _reply = reply; }
 
     public bool TryGetHyperlink(ushort id, out string url) =>
         _hyperlinks.TryGetValue(id, out url!);
+
+    /// <summary>Force-clear the active OSC 8 hyperlink. The shell
+    /// closes a hyperlink with <c>OSC 8 ; ; ST</c>, but if that close
+    /// sequence is dropped en route (e.g. because the byte stream
+    /// passed through a chat renderer that mangled escapes) the
+    /// active link gets stuck and every subsequent printed cell
+    /// inherits the underline. Hosts wire this to a "reset
+    /// formatting" menu item / shortcut as a recovery path.</summary>
+    public void ClearActiveHyperlink() => ActiveLinkId = 0;
 
     /// <summary>Reset hyperlink + title state. Called from the
     /// buffer's RIS path. Palette / default-colour overrides are kept
@@ -119,6 +203,19 @@ internal sealed class OscDispatcher
         _nextHyperlinkId = 1;
         ActiveLinkId = 0;
         _windowTitle = string.Empty;
+    }
+
+    /// <summary>Reset palette + default colours. OSC 104 / 110 / 111 /
+    /// 112 (hard palette resets) and full RIS via Reset can call this
+    /// when a stronger reset is wanted than the default Reset.</summary>
+    public void ResetPalette()
+    {
+        _palette256 = null;
+        _paletteSet = null;
+        DefaultForegroundExplicit = false;
+        DefaultBackgroundExplicit = false;
+        DefaultCursorExplicit     = false;
+        PaletteChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public void Dispatch(ReadOnlySpan<char> payload)
@@ -161,19 +258,22 @@ internal sealed class OscDispatcher
             case 4:  HandleOsc4 (data); return;
             case 7:  HandleOsc7 (data); return;
             case 8:  HandleOsc8 (data); return;
+            case 9:  HandleOsc9 (data); return;
             case 10: HandleOscSpecialColor(10, DefaultForegroundRgb, data, v => DefaultForegroundRgb = v); return;
             case 11: HandleOscSpecialColor(11, DefaultBackgroundRgb, data, v => DefaultBackgroundRgb = v); return;
             case 12: HandleOscSpecialColor(12, DefaultCursorRgb,     data, v => DefaultCursorRgb     = v); return;
             case 52: HandleOsc52(data); return;
             case 133: HandleOsc133(data); return;
         }
+        TerminalLog.TraceProtocol($"unhandled OSC: {cmd}");
     }
 
     private void DispatchNoBody(int cmd)
     {
         // Only OSC 133 needs a no-body path today; treat the bare
         // number as a generic command-end with no exit code.
-        if (cmd == 133) { /* missing kind selector — ignore */ }
+        if (cmd == 133) { /* missing kind selector — ignore */ return; }
+        TerminalLog.TraceProtocol($"unhandled OSC (no body): {cmd}");
     }
 
     // ---- OSC 7: working directory ----
@@ -228,6 +328,39 @@ internal sealed class OscDispatcher
     private static int HexVal(char c) =>
         c <= '9' ? c - '0' : (c & 0x5F) - 'A' + 10;
 
+    // ---- OSC 9: notifications + progress ----
+
+    private void HandleOsc9(ReadOnlySpan<char> data)
+    {
+        // ConEmu progress form: "4;<state>[;<pct>]". Other OSC 9 forms
+        // (notification text) we don't surface yet — silently drop.
+        if (data.Length < 2 || data[0] != '4' || data[1] != ';') return;
+        var rest = data[2..];
+        int semi = rest.IndexOf(';');
+        ReadOnlySpan<char> stateSpan, pctSpan;
+        if (semi < 0) { stateSpan = rest; pctSpan = default; }
+        else          { stateSpan = rest[..semi]; pctSpan = rest[(semi + 1)..]; }
+        if (!int.TryParse(stateSpan, out int stateInt)) return;
+
+        ProgressState state = stateInt switch
+        {
+            0 => ProgressState.Remove,
+            1 => ProgressState.Normal,
+            2 => ProgressState.Error,
+            3 => ProgressState.Indeterminate,
+            4 => ProgressState.Warning,
+            _ => ProgressState.Remove,
+        };
+        int? pct = null;
+        if (state is ProgressState.Normal or ProgressState.Error or ProgressState.Warning
+            && !pctSpan.IsEmpty
+            && int.TryParse(pctSpan, out int p))
+        {
+            pct = Math.Clamp(p, 0, 100);
+        }
+        ProgressChanged?.Invoke(this, new ProgressEventArgs(state, pct));
+    }
+
     // ---- OSC 133: FinalTerm/iTerm2 semantic prompts ----
 
     private void HandleOsc133(ReadOnlySpan<char> data)
@@ -271,6 +404,7 @@ internal sealed class OscDispatcher
     {
         if (_palette256 != null) return _palette256;
         _palette256 = new uint[256];
+        _paletteSet = new bool[256];
         for (int i = 0; i < 256; i++)
         {
             var c = TerminalPalette.Indexed[i];
@@ -282,9 +416,6 @@ internal sealed class OscDispatcher
     private void HandleOsc4(ReadOnlySpan<char> data)
     {
         // "idx;spec[;idx;spec...]". "?" = query, else parse + set.
-        // Set path is maintained for query round-trip consistency;
-        // note that mutations do NOT propagate to the renderer's
-        // static palette — that's a broader refactor (see R7).
         while (!data.IsEmpty)
         {
             var idxSpan = TakeToken(ref data);
@@ -299,9 +430,16 @@ internal sealed class OscDispatcher
             else if (TryParseRgbSpec(spec, out var rgb))
             {
                 EnsurePalette256()[idx] = rgb;
+                _paletteSet![idx] = true;
+                PaletteChanged?.Invoke(this, EventArgs.Empty);
             }
         }
     }
+
+    /// <summary>OSC 4 / 10 / 11 / 12 mutation. Renderer subscribes
+    /// to repaint when the shell changes a palette entry or default
+    /// colour at runtime.</summary>
+    public event EventHandler? PaletteChanged;
 
     private void HandleOscSpecialColor(int cmd, uint currentValue,
         ReadOnlySpan<char> data, Action<uint> setter)
@@ -313,6 +451,7 @@ internal sealed class OscDispatcher
         else if (TryParseRgbSpec(data, out var rgb))
         {
             setter(rgb);
+            PaletteChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 
