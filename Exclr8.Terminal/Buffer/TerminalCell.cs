@@ -26,11 +26,43 @@ public enum UnderlineStyle : byte
 /// <para>Zero-initialised instances render as a blank cell on default
 /// fg/bg, which lets us allocate rows via <c>new TerminalCell[N]</c>
 /// without a fill loop.</para>
+///
+/// <para><b>Field order matters.</b> Largest fields first, smallest
+/// last — explicit large-to-small ordering keeps the struct at 24
+/// bytes regardless of how the CLR interprets the layout. With a
+/// 5000-line scrollback at 80 cols, every saved byte per cell is
+/// 400 KB of working-set memory; this layout shaves the struct from
+/// the naive ordering's ~28 bytes down to 24 (and improves L1 cache
+/// density on the renderer's per-cell scan).</para>
 /// </summary>
 public struct TerminalCell
 {
+    // 4-byte fields first (each naturally 4-byte-aligned).
+
     /// <summary>UTF-32 rune. 0 = empty cell.</summary>
     public int Rune;
+
+    /// <summary>RGB foreground when <see cref="CellFlags.FgRgb"/> is
+    /// set, packed as 0x00RRGGBB. Zero otherwise.</summary>
+    public uint FgRgb;
+
+    /// <summary>RGB background when <see cref="CellFlags.BgRgb"/> is
+    /// set. Zero otherwise.</summary>
+    public uint BgRgb;
+
+    /// <summary>SGR 58 underline colour. Honoured only when
+    /// <see cref="CellFlags2.UlColorSet"/> is set; the renderer
+    /// otherwise paints underlines in the cell's foreground.</summary>
+    public uint UnderlineRgb;
+
+    // 2-byte field next.
+
+    /// <summary>OSC 8 hyperlink ID (0 = no link). Maps to a URL via
+    /// <see cref="TerminalBuffer.TryGetHyperlink(ushort,out string)"/>.</summary>
+    public ushort HyperlinkId;
+
+    // 1-byte fields last so they pack into the trailing slot without
+    // interior padding.
 
     /// <summary>Foreground 256-palette index (used when <c>FgRgb</c> flag unset).</summary>
     public byte FgIndex;
@@ -41,30 +73,13 @@ public struct TerminalCell
     /// <summary>Style + rgb-or-indexed flags.</summary>
     public CellFlags Flags;
 
-    /// <summary>Wide-char / continuation flags. Separate byte so CellFlags
-    /// stays a 7-bit legacy palette + stays easy to binary-compare.</summary>
+    /// <summary>Wide-char / continuation / blink / ul-colour flags.</summary>
     public CellFlags2 Flags2;
 
-    /// <summary>OSC 8 hyperlink ID (0 = no link). Maps to a URL via
-    /// <see cref="TerminalBuffer.TryGetHyperlink(ushort,out string)"/>.</summary>
-    public ushort HyperlinkId;
-
-    // RGB packing when FgRgb / BgRgb are set — stored in a separate uint
-    // (kept out of the main struct for size; zero == default colors).
-    public uint FgRgb;
-    public uint BgRgb;
-
-    /// <summary>SGR 4:N underline style. Default 0 = no special form;
-    /// when <see cref="CellFlags.Underline"/> is set we treat 0 the
-    /// same as <see cref="UnderlineStyle.Single"/> for backward
-    /// compatibility with plain SGR 4.</summary>
+    /// <summary>SGR 4:N underline style. None = bare SGR 4 → single
+    /// underline. Curly / Dotted / Dashed are kitty/WezTerm
+    /// extensions widely supported now.</summary>
     public UnderlineStyle UnderlineStyle;
-
-    /// <summary>SGR 58 underline colour. 0 = use the foreground.
-    /// Stored as packed 0xRRGGBB; <see cref="CellFlags2.UlColorSet"/>
-    /// must be true for the renderer to honour this — otherwise it
-    /// uses the cell's foreground.</summary>
-    public uint UnderlineRgb;
 
     public static readonly TerminalCell Blank = default;
 }

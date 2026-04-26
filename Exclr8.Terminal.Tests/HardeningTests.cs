@@ -223,6 +223,60 @@ public class HardeningTests
     }
 
     [Fact]
+    public void Osc0_RepeatedSameTitle_DoesNotRefireEvent()
+    {
+        // Bash/zsh prompt frameworks emit OSC 0 on every prompt; the
+        // string is usually identical across redraws. Dedupe so
+        // subscribers don't get a per-prompt event chain that just
+        // compare-equals back out.
+        var buf = NewBuffer();
+        int titleCount = 0, iconCount = 0;
+        buf.TitleChanged    += (_, _) => titleCount++;
+        buf.IconNameChanged += (_, _) => iconCount++;
+        buf.Feed(OSC + "0;mytitle" + ST);
+        buf.Feed(OSC + "0;mytitle" + ST);
+        buf.Feed(OSC + "0;mytitle" + ST);
+        Assert.Equal(1, titleCount);
+        Assert.Equal(1, iconCount);
+        // Different title fires once.
+        buf.Feed(OSC + "0;newtitle" + ST);
+        Assert.Equal(2, titleCount);
+        Assert.Equal(2, iconCount);
+    }
+
+    [Fact]
+    public void RowText_MightContainUrl_FastReject()
+    {
+        // Plain text rows return false → renderer skips the
+        // text-materialise + regex run.
+        var buf = NewBuffer(40, 4);
+        buf.Feed("just plain text here, no scheme");
+        var cells = buf.GetVisibleRow(0);
+        Assert.False(RowText.MightContainUrl(cells));
+
+        // Anything containing :/ returns true.
+        var buf2 = NewBuffer(40, 4);
+        buf2.Feed("see https://example.com");
+        Assert.True(RowText.MightContainUrl(buf2.GetVisibleRow(0)));
+    }
+
+    [Fact]
+    public void RowText_BuildInto_AcceptsCallerOwnedBuffers()
+    {
+        var buf = NewBuffer(20, 4);
+        buf.Feed("abc");
+        var cells = buf.GetVisibleRow(0);
+        var sb = new System.Text.StringBuilder();
+        var map = new int[cells.Length * 2];
+        int len = RowText.BuildInto(cells, sb, map);
+        Assert.Equal(cells.Length, len); // padded with spaces
+        Assert.Equal('a', sb[0]);
+        Assert.Equal('b', sb[1]);
+        Assert.Equal(0, map[0]);
+        Assert.Equal(1, map[1]);
+    }
+
+    [Fact]
     public void LinkProviderCap_FloodingProviderDoesNotHangHitTest()
     {
         // A provider that returns thousands of matches per row
@@ -245,5 +299,16 @@ public class HardeningTests
             for (int i = 0; i < 1000; i++)
                 yield return new TerminalLink(0, 1, $"https://example/{i}");
         }
+    }
+
+    [Fact]
+    public void TerminalCell_PackedTo24Bytes()
+    {
+        // Pinning the field-order packing — adding a new field
+        // without slotting it correctly will trip this test and force
+        // a deliberate re-think rather than silently bloating the
+        // scrollback footprint. With 5000 lines × 80 cols, every
+        // extra byte is +400 KB of working set.
+        Assert.Equal(24, System.Runtime.CompilerServices.Unsafe.SizeOf<TerminalCell>());
     }
 }

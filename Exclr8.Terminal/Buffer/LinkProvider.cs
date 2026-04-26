@@ -61,6 +61,23 @@ public static class RowText
         var sb = new System.Text.StringBuilder(cells.Length);
         // Worst case: every cell is an astral rune (2 chars) → twice the cell count.
         var map = new int[cells.Length * 2];
+        int textLen = BuildInto(cells, sb, map);
+        if (textLen != map.Length) Array.Resize(ref map, textLen);
+        colMap = map;
+        return sb.ToString();
+    }
+
+    /// <summary>Allocation-free variant for hot rendering paths. The
+    /// caller supplies a reusable <paramref name="sb"/> (cleared
+    /// before append) and <paramref name="colMap"/> buffer; we return
+    /// the populated length. <paramref name="colMap"/> must be at
+    /// least <c>cells.Length * 2</c>.
+    /// </summary>
+    public static int BuildInto(TerminalCell[] cells,
+        System.Text.StringBuilder sb, int[] colMap)
+    {
+        sb.Clear();
+        sb.EnsureCapacity(cells.Length);
         int mapLen = 0;
         for (int c = 0; c < cells.Length; c++)
         {
@@ -71,29 +88,47 @@ public static class RowText
                 // string-index advances 1:1 with cell-column for the
                 // tail half of the wide character.
                 sb.Append(' ');
-                map[mapLen++] = c;
+                colMap[mapLen++] = c;
                 continue;
             }
             if (rune == 0)
             {
                 sb.Append(' ');
-                map[mapLen++] = c;
+                colMap[mapLen++] = c;
             }
             else if (rune <= 0xFFFF)
             {
                 sb.Append((char)rune);
-                map[mapLen++] = c;
+                colMap[mapLen++] = c;
             }
             else
             {
                 sb.Append(char.ConvertFromUtf32(rune));
-                map[mapLen++] = c;
-                map[mapLen++] = c;
+                colMap[mapLen++] = c;
+                colMap[mapLen++] = c;
             }
         }
-        if (mapLen != map.Length) Array.Resize(ref map, mapLen);
-        colMap = map;
-        return sb.ToString();
+        return mapLen;
+    }
+
+    /// <summary>Cheap prescan: returns true if <paramref name="cells"/>
+    /// could plausibly contain a URL (looks for the <c>:</c> + two
+    /// adjacent <c>/</c> rune pattern that <c>http://</c>,
+    /// <c>https://</c>, <c>file://</c>, <c>ssh://</c>, etc. all share).
+    /// Lets the renderer skip the per-row text materialise +
+    /// regex run when no row could possibly match.</summary>
+    public static bool MightContainUrl(TerminalCell[] cells)
+    {
+        // Scan for ":/" — necessary substring of every "scheme://"
+        // prefix. False positives (e.g. ":/" in code) cost a regex
+        // run; false negatives would silently break link detection.
+        // Stop one before the end so the lookahead is in-bounds.
+        for (int i = 0; i < cells.Length - 1; i++)
+        {
+            if (cells[i].Rune == ':' && cells[i + 1].Rune == '/')
+                return true;
+        }
+        return false;
     }
 }
 

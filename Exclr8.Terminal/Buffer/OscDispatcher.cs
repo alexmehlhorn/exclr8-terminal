@@ -97,6 +97,7 @@ internal sealed class OscDispatcher
     private readonly Dictionary<ushort, string> _hyperlinks = new();
     private ushort _nextHyperlinkId = 1;
     private string _windowTitle = string.Empty;
+    private string _iconName    = string.Empty;
     private uint[]? _palette256;
     private bool[]? _paletteSet;
 
@@ -203,6 +204,7 @@ internal sealed class OscDispatcher
         _nextHyperlinkId = 1;
         ActiveLinkId = 0;
         _windowTitle = string.Empty;
+        _iconName    = string.Empty;
     }
 
     /// <summary>Reset palette + default colours. OSC 104 / 110 / 111 /
@@ -236,20 +238,33 @@ internal sealed class OscDispatcher
         {
             case 0:
             {
-                // OSC 0 sets both window title and icon name — the
-                // string gets stored + handed to two events, so a
-                // single allocation is unavoidable.
+                // OSC 0 sets both window title and icon name. zsh /
+                // bash / fish prompt-frameworks emit OSC 0 on every
+                // prompt redraw with the same string; we dedupe to
+                // avoid a per-prompt string allocation + an event-
+                // chain fire-out to subscribers that would just
+                // compare-equal-and-no-op anyway.
+                if (data.SequenceEqual(_windowTitle.AsSpan())
+                 && data.SequenceEqual(_iconName.AsSpan()))
+                    return;
                 var s = new string(data);
                 _windowTitle = s;
+                _iconName = s;
                 TitleChanged?.Invoke(this, s);
                 IconNameChanged?.Invoke(this, s);
                 return;
             }
             case 1:
-                IconNameChanged?.Invoke(this, new string(data));
+            {
+                if (data.SequenceEqual(_iconName.AsSpan())) return;
+                var s = new string(data);
+                _iconName = s;
+                IconNameChanged?.Invoke(this, s);
                 return;
+            }
             case 2:
             {
+                if (data.SequenceEqual(_windowTitle.AsSpan())) return;
                 var s = new string(data);
                 _windowTitle = s;
                 TitleChanged?.Invoke(this, s);

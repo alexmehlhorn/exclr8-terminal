@@ -127,6 +127,7 @@ public sealed class TerminalRenderer
             // Cached layouts were built without ligatures (or with them);
             // either way they no longer match the active feature set.
             _textCache.Clear();
+            _textLru.Clear();
         }
     }
     private bool _enableLigatures;
@@ -155,21 +156,36 @@ public sealed class TerminalRenderer
     private readonly Dictionary<(uint Color, int Thickness10), ImmutablePen> _penCache = new();
     // Typeface variants for the current typeface: index = (bold?1:0) | (italic?2:0).
     private readonly Typeface[] _typefaceVariants = new Typeface[4];
-    // FormattedText layout is expensive to build; keep a bounded cache
-    // keyed on a hash of (StringBuilder contents, variant, size, fg).
-    // Hashing the StringBuilder directly means a cache hit doesn't need
-    // to materialise a key string — we verify via char-by-char compare
-    // against the stored entry's text. Only a cache miss pays the
-    // ToString allocation. Flushed when full rather than running a
-    // full LRU.
-    private readonly Dictionary<int, TextCacheEntry> _textCache = new();
+    // FormattedText layout is expensive to build; keep a bounded
+    // LRU cache keyed on a hash of (StringBuilder contents, variant,
+    // size, fg, liga). Hashing the StringBuilder directly means a
+    // cache hit doesn't need to materialise a key string — we verify
+    // via char-by-char compare against the stored entry's text. Only
+    // a cache miss pays the ToString allocation.
+    //
+    // LRU rather than full-clear-on-overflow. In a long Claude / IDE
+    // streaming session the working set comfortably exceeds the cap
+    // (200-400 distinct glyph runs per syntax-highlighted screen);
+    // full-clear thrashed the hot punctuation / spaces / common
+    // keywords every time the cap was hit. LRU keeps those forever
+    // and only evicts genuine one-off identifiers.
+    private readonly Dictionary<int, LinkedListNode<TextCacheEntry>> _textCache = new();
+    private readonly LinkedList<TextCacheEntry> _textLru = new();
     private const int TextCacheMax = 512;
     // Reused across glyph runs so we don't allocate a fresh StringBuilder
     // per run. Cleared at the start of each DrawGlyphs call.
     private readonly StringBuilder _glyphSb = new();
 
-    private readonly record struct TextCacheEntry(
-        string Text, int Variant, int SizeTenths, uint Fg, bool Liga, FormattedText Ft);
+    private sealed class TextCacheEntry
+    {
+        public int Hash;
+        public string Text = "";
+        public int Variant;
+        public int SizeTenths;
+        public uint Fg;
+        public bool Liga;
+        public FormattedText Ft = null!;
+    }
 
     private static uint ColorKey(Color c) =>
         ((uint)c.A << 24) | ((uint)c.R << 16) | ((uint)c.G << 8) | c.B;
@@ -228,17 +244,33 @@ public sealed class TerminalRenderer
         bool liga = _enableLigatures;
         int hash = ComputeRunHash(sb, variantIdx, size10, fgKey, liga);
 
-        if (_textCache.TryGetValue(hash, out var entry)
-            && entry.Variant == variantIdx
-            && entry.SizeTenths == size10
-            && entry.Fg == fgKey
-            && entry.Liga == liga
-            && SbEqualsString(sb, entry.Text))
+        if (_textCache.TryGetValue(hash, out var node))
         {
-            return entry.Ft;
+            var hit = node.Value;
+            if (hit.Variant == variantIdx
+                && hit.SizeTenths == size10
+                && hit.Fg == fgKey
+                && hit.Liga == liga
+                && SbEqualsString(sb, hit.Text))
+            {
+                // Move to front of LRU. Cheap LinkedList pointer swap;
+                // no allocation. Hot tokens (punctuation, single
+                // spaces, common keywords) drift toward the head and
+                // never evict regardless of cap pressure.
+                if (node.Previous != null)
+                {
+                    _textLru.Remove(node);
+                    _textLru.AddFirst(node);
+                }
+                return hit.Ft;
+            }
+            // Hash collision with a stale entry — drop it and miss.
+            _textLru.Remove(node);
+            _textCache.Remove(hash);
         }
 
-        if (_textCache.Count >= TextCacheMax) _textCache.Clear();
+        // Miss. Build the FormattedText, evict the LRU tail if at cap,
+        // then add to the head.
         string text = sb.ToString();
         var ft = new FormattedText(text, CultureInfo.InvariantCulture,
             FlowDirection.LeftToRight, tf, size, BrushFor(fg));
@@ -248,10 +280,24 @@ public sealed class TerminalRenderer
         // Hosts that ship Fira Code / JetBrains Mono / Cascadia opt
         // in via TerminalControl.EnableLigatures.
         if (liga) ft.SetFontFeatures(LigaFeatures);
-        // Hash collisions on a 512-entry dict in a 32-bit hash space are
-        // astronomically rare; single-slot overwrite is acceptable —
-        // the evicted entry just gets rebuilt next frame.
-        _textCache[hash] = new TextCacheEntry(text, variantIdx, size10, fgKey, liga, ft);
+
+        if (_textLru.Count >= TextCacheMax)
+        {
+            // Evict the genuine LRU instead of nuking the whole cache —
+            // see the field comment above for the streaming-session
+            // rationale.
+            var lruNode = _textLru.Last!;
+            _textCache.Remove(lruNode.Value.Hash);
+            _textLru.RemoveLast();
+        }
+
+        var entry = new TextCacheEntry
+        {
+            Hash = hash, Text = text, Variant = variantIdx,
+            SizeTenths = size10, Fg = fgKey, Liga = liga, Ft = ft,
+        };
+        var newNode = _textLru.AddFirst(entry);
+        _textCache[hash] = newNode;
         return ft;
     }
 
@@ -279,6 +325,7 @@ public sealed class TerminalRenderer
     {
         for (int i = 0; i < _typefaceVariants.Length; i++) _typefaceVariants[i] = default;
         _textCache.Clear();
+        _textLru.Clear();
     }
 
     public TerminalRenderer(
@@ -422,6 +469,13 @@ public sealed class TerminalRenderer
     /// bound on render time.</summary>
     private const int MaxLinksPerProviderPerRow = 64;
 
+    // Per-renderer scratch buffers reused across DrawLinkUnderlines
+    // calls. Prevents allocating a fresh StringBuilder + int[] per
+    // visible row per frame — the hottest non-trivial allocation in
+    // the link-provider path.
+    private readonly StringBuilder _linkRowSb = new();
+    private int[] _linkColMap = new int[256];
+
     private void DrawLinkUnderlines(DrawingContext ctx, TerminalBuffer buf,
         IReadOnlyList<ILinkProvider> providers, double pixelShift)
     {
@@ -435,11 +489,20 @@ public sealed class TerminalRenderer
         {
             var cells = buf.GetRowForRender(visualRow);
             if (cells == null) continue;
-            // Skip rows that are visibly blank — a regex run over
-            // empty space costs at minimum the regex's own start/end
-            // overhead, and there's nothing to underline anyway.
+            // Two cheap rejects before we materialise text. Blank rows
+            // can't have URLs; rows with no ":/" sequence can't either.
+            // Both checks are O(cols); skip the StringBuilder.ToString
+            // and the regex when neither could match.
             if (IsBlankCellRow(cells)) continue;
-            string rowText = RowText.Build(cells, out int[] colMap);
+            if (!RowText.MightContainUrl(cells)) continue;
+
+            int needMap = cells.Length * 2;
+            if (_linkColMap.Length < needMap) _linkColMap = new int[needMap];
+            int textLen = RowText.BuildInto(cells, _linkRowSb, _linkColMap);
+            // ToString is unavoidable — providers consume `string`. But
+            // we only run it for rows that actually look URL-bearing.
+            string rowText = _linkRowSb.ToString();
+
             double y = visualRow * CellHeight + pixelShift + CellHeight - 1;
             for (int i = 0; i < providers.Count; i++)
             {
@@ -447,8 +510,8 @@ public sealed class TerminalRenderer
                 foreach (var link in providers[i].Provide(rowText))
                 {
                     if (drawn >= MaxLinksPerProviderPerRow) break;
-                    int startCell = colMap[link.StartCol];
-                    int endCell   = colMap[Math.Min(link.EndCol - 1, colMap.Length - 1)];
+                    int startCell = _linkColMap[link.StartCol];
+                    int endCell   = _linkColMap[Math.Min(link.EndCol - 1, textLen - 1)];
                     double x0 = startCell * CellWidth;
                     double x1 = (endCell + 1) * CellWidth;
                     ctx.DrawLine(pen, new Point(x0, y), new Point(x1, y));
