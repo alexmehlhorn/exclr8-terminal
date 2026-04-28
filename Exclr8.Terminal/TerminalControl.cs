@@ -1606,7 +1606,25 @@ public class TerminalControl : Control, IDisposable
 
     private (int row, int col) GridPos(Point p)
     {
-        int row = Math.Clamp((int)(p.Y / _renderer.CellHeight), 0, _buffer.Rows - 1);
+        // Smooth-scroll shifts the rendered grid DOWN by
+        // PixelScrollOffset pixels (so an older row bleeds in at the
+        // top during a wheel/trackpad scroll). The renderer draws
+        // row r at `y = r*CellHeight + pixelShift`. To invert and
+        // get the row at pixel y we have to subtract pixelShift
+        // before dividing — without that, every click during a
+        // mid-scroll lands one row too low (cell at pixel Y=20 with
+        // pixelShift=10 is visually showing row 0 starting at Y=10
+        // and ending at Y=10+CellHeight, but uncorrected math would
+        // place Y=20 in row 1). Visible symptom: drag-selections
+        // anchor on the cell *below* the click.
+        //
+        // Math.Floor (not int-cast truncation) so negative values
+        // — which happen for clicks in the bleed region above the
+        // viewport — round correctly before being clamped to 0.
+        double yShifted = p.Y - _buffer.PixelScrollOffset;
+        int row = Math.Clamp(
+            (int)Math.Floor(yShifted / _renderer.CellHeight),
+            0, _buffer.Rows - 1);
         int col = Math.Clamp((int)(p.X / _renderer.CellWidth),  0, _buffer.Cols - 1);
         return (row, col);
     }
