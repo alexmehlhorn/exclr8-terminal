@@ -301,6 +301,192 @@ public class HardeningTests
         }
     }
 
+    // ---- Wide-cell pair integrity across mutation operations ----
+    //
+    // Streaming output from CLIs that drive incremental redraws (TUI
+    // status lines, progress bars, AI-assistant token-stream UI) can
+    // mix cursor-positioning + cell-erase / cell-shift sequences with
+    // wide characters. If a mutation lands on one half of a wide pair,
+    // the *other* half can be left orphaned: a stale IsWide with no
+    // following IsContinuation, or a stale IsContinuation with no
+    // preceding IsWide. The renderer skips IsContinuation cells, so
+    // orphans render as invisible gaps — exactly the "double-space
+    // and missing characters" symptom seen in long Claude Code
+    // streaming sessions. These tests pin the invariant: every cell
+    // mutation path repairs wide-pair integrity at its boundaries.
+
+    [Fact]
+    public void EraseChars_OnWideLeftHalf_ClearsOrphanContinuation()
+    {
+        var buf = NewBuffer(10, 4);
+        buf.Feed("A中B");                       // A=col0, 中=col1+2, B=col3
+        var row = buf.GetVisibleRow(0);
+        Assert.True((row[1].Flags2 & CellFlags2.IsWide) != 0);
+        Assert.True((row[2].Flags2 & CellFlags2.IsContinuation) != 0);
+
+        buf.Feed(CSI + "1;2H");                 // cursor → col 1
+        buf.Feed(CSI + "1X");                   // ECH 1 — erase the wide-left
+        Assert.False((row[1].Flags2 & CellFlags2.IsWide)         != 0);
+        Assert.False((row[2].Flags2 & CellFlags2.IsContinuation) != 0,
+            "EraseChars on wide-left must scrub the orphan IsContinuation flag.");
+    }
+
+    [Fact]
+    public void EraseChars_OnWideRightHalf_ClearsOrphanWide()
+    {
+        var buf = NewBuffer(10, 4);
+        buf.Feed("A中B");
+        var row = buf.GetVisibleRow(0);
+
+        buf.Feed(CSI + "1;3H");                 // cursor → col 2 (the continuation)
+        buf.Feed(CSI + "1X");                   // ECH 1 — erase the continuation
+        Assert.False((row[1].Flags2 & CellFlags2.IsWide)         != 0,
+            "EraseChars on wide-right must scrub the orphan IsWide flag.");
+        Assert.False((row[2].Flags2 & CellFlags2.IsContinuation) != 0);
+    }
+
+    [Fact]
+    public void DeleteChars_AcrossWidePair_DoesNotLeaveOrphan()
+    {
+        var buf = NewBuffer(10, 4);
+        buf.Feed("A中BCD");                     // A 中(2) B C D
+        buf.Feed(CSI + "1;2H");                 // cursor → col 1
+        buf.Feed(CSI + "1P");                   // DCH 1 — delete the wide-left
+        var row = buf.GetVisibleRow(0);
+        // After DCH 1 with cursor at col 1, content shifts left. No
+        // cell should retain orphan wide-pair flags.
+        for (int c = 0; c < buf.Cols; c++)
+        {
+            bool isCont = (row[c].Flags2 & CellFlags2.IsContinuation) != 0;
+            bool isWide = (row[c].Flags2 & CellFlags2.IsWide)         != 0;
+            if (isCont)
+            {
+                Assert.True(c > 0
+                    && (row[c - 1].Flags2 & CellFlags2.IsWide) != 0,
+                    $"col {c}: orphan IsContinuation");
+            }
+            if (isWide)
+            {
+                Assert.True(c + 1 < buf.Cols
+                    && (row[c + 1].Flags2 & CellFlags2.IsContinuation) != 0,
+                    $"col {c}: orphan IsWide");
+            }
+        }
+    }
+
+    [Fact]
+    public void InsertBlanks_PushingWidePair_DoesNotLeaveOrphan()
+    {
+        var buf = NewBuffer(10, 4);
+        buf.Feed("A中BCD");
+        buf.Feed(CSI + "1;2H");                 // cursor → col 1
+        buf.Feed(CSI + "1@");                   // ICH 1 — insert one blank
+        var row = buf.GetVisibleRow(0);
+        for (int c = 0; c < buf.Cols; c++)
+        {
+            bool isCont = (row[c].Flags2 & CellFlags2.IsContinuation) != 0;
+            bool isWide = (row[c].Flags2 & CellFlags2.IsWide)         != 0;
+            if (isCont)
+                Assert.True(c > 0
+                    && (row[c - 1].Flags2 & CellFlags2.IsWide) != 0,
+                    $"col {c}: orphan IsContinuation");
+            if (isWide)
+                Assert.True(c + 1 < buf.Cols
+                    && (row[c + 1].Flags2 & CellFlags2.IsContinuation) != 0,
+                    $"col {c}: orphan IsWide");
+        }
+    }
+
+    [Fact]
+    public void ClearScreenAndScrollback_NoOscMarker_PreservesCursorRow()
+    {
+        // No OSC 133 prompt-tracking → preserve just the cursor row
+        // (typically the prompt + in-progress input). Everything
+        // above wiped, scrollback dropped.
+        var buf = NewBuffer(20, 5);
+        buf.ScrollbackLimit = 100;
+        for (int i = 0; i < 8; i++) buf.Feed($"L{i}\r\n");
+        // Cursor is now on a blank row after "L7\r\n". Type a
+        // pseudo-prompt onto the cursor row.
+        buf.Feed("$ ");
+        Assert.True(buf.ScrollbackCount > 0);
+
+        buf.ClearScreenAndScrollback();
+
+        Assert.Equal(0, buf.ScrollbackCount);
+        // Cursor row content survived at row 0.
+        Assert.Equal('$', (char)buf.GetVisibleRow(0)[0].Rune);
+        Assert.Equal(' ', (char)buf.GetVisibleRow(0)[1].Rune);
+        // Other rows blank.
+        Assert.Equal(0, buf.GetVisibleRow(1)[0].Rune);
+        // Cursor is at row 0 (its preserved row).
+        Assert.Equal(0, buf.CursorRow);
+    }
+
+    [Fact]
+    public void ClearScreenAndScrollback_WithOsc133_PreservesPromptBlock()
+    {
+        // OSC 133 prompt-tracking → preserve [PromptStart, cursor]
+        // inclusive. Multi-line prompts and wrapped input survive.
+        var buf = NewBuffer(40, 6);
+        buf.ScrollbackLimit = 100;
+        // Some output above the prompt.
+        for (int i = 0; i < 4; i++) buf.Feed($"output{i}\r\n");
+        // Two-line prompt + input on the cursor's row.
+        buf.Feed(OSC + "133;A" + ST);  // prompt-start marker fires here
+        buf.Feed("~/code on  main\r\n");
+        buf.Feed("> in-progress");
+        // Cursor is on row containing "> in-progress".
+        int cursorRowBefore = buf.CursorRow;
+
+        buf.ClearScreenAndScrollback();
+
+        Assert.Equal(0, buf.ScrollbackCount);
+        // Prompt's first line snapped to row 0.
+        Assert.StartsWith("~/code on", buf.RowText(0).TrimEnd());
+        // Input line snapped to row 1.
+        Assert.StartsWith("> in-progress", buf.RowText(1).TrimEnd());
+        // Cursor preserved relative to the block — was at row N
+        // (input line); now at row 1.
+        Assert.Equal(1, buf.CursorRow);
+    }
+
+    [Fact]
+    public void ClearScreenAndScrollback_OnAltScreen_IsNoOp()
+    {
+        // Alt-screen TUIs own their painted state; Cmd+K shouldn't
+        // wipe it from under them. iTerm2 and friends do wipe it
+        // anyway and rely on TUI redraw via SIGWINCH; we choose the
+        // safer no-op since we have no such redraw protocol on hand.
+        var buf = NewBuffer(20, 5);
+        buf.Feed(CSI + "?1049h");           // enter alt-screen
+        buf.Feed("ALT-CONTENT");
+        var snapshot = buf.RowText(0);
+
+        buf.ClearScreenAndScrollback();
+
+        Assert.Equal(snapshot, buf.RowText(0));
+    }
+
+    [Fact]
+    public void ClearScreenAndScrollback_PreservesSgrPen()
+    {
+        // Distinct from full Reset: pen + DEC modes survive so a
+        // mid-session "clear my screen" doesn't kill the user's
+        // colour scheme or app modes.
+        var buf = NewBuffer(20, 4);
+        buf.Feed(CSI + "31m");        // red foreground pen
+        buf.Feed(CSI + "?25l");       // cursor invisible
+        buf.Feed("text");
+        buf.ClearScreenAndScrollback();
+        // Pen state should still report red on the next print.
+        buf.Feed("X");
+        // The "text" was preserved on row 0; "X" appended after it.
+        Assert.Equal(1, (int)buf.GetVisibleRow(0)[4].FgIndex); // 'X' at col 4 — SGR 31 = idx 1
+        // DECTCEM still off.
+        Assert.False(buf.CursorVisible);
+    }
+
     [Fact]
     public void TerminalCell_PackedTo24Bytes()
     {

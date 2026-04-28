@@ -1,11 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <!-- Native Avalonia terminal renderer. Intentionally separate from
-       VibeCoder.App so it can be extracted/distributed. Depends only on
-       Avalonia, Skia, and OS-level process-watch primitives (WMI on
-       Windows, kqueue on macOS) — no PTY, no app-shell concerns.
-       Consumers feed it bytes via Write() and handle Input + Resized
-       events to wire it to a PTY. -->
+  <!-- Native Avalonia terminal renderer. Drop into a view, feed it
+       PTY bytes, get a fully-featured terminal — parser, renderer,
+       selection, search, scrollback, OSC 8 hyperlinks, OSC 133 shell
+       integration, ligatures, dynamic palette. No process-spawning
+       or PTY plumbing baked in; consumers wire I/O via Write() +
+       Input + Resized events. -->
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -15,6 +15,40 @@
     <!-- KQueueChildWatcher needs P/Invoke + unsafe pointer blocks
          for the kevent / proc_name interop. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Public API surface is documented; ship the XML so IntelliSense
+         lights up for consumers. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- 1701/1702 are the default; 1591 silences "missing XML doc"
+         warnings on internal helpers we deliberately don't doc. -->
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+
+  <!-- ===== NuGet package metadata ===== -->
+  <PropertyGroup>
+    <PackageId>Exclr8.Terminal</PackageId>
+    <Version>1.0.1</Version>
+    <Authors>Alexander Mehlhorn</Authors>
+    <Company>Exclr8 Business Automation (Pty) Ltd</Company>
+    <Copyright>© 2026 Exclr8 Business Automation (Pty) Ltd</Copyright>
+    <Description>Native Avalonia terminal control for .NET. VT500-class parser (CSI / OSC / DCS / APC, full SGR including 24-bit RGB and SGR 4:N curly underline), reflow on resize, scrollback, OSC 8 hyperlinks, OSC 133 semantic prompts, OSC 7 working-directory tracking, OSC 9;4 progress, OSC 4 / 10 / 11 / 12 dynamic palette, programming-font ligatures, mouse reporting (1006 / 1016), modifyOtherKeys level 2, synchronized output (DECSET 2026), parser extensibility hooks, markers and decorations, custom link providers, VS16 emoji presentation, write coalescing with backpressure, and recovery primitives. No PTY plumbing — wire bytes via Write() and the Input / Resized events.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/exclr8/exclr8-terminal</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/exclr8/exclr8-terminal</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>terminal;avalonia;vt;ansi;xterm;tty;pty;emulator;cli;console</PackageTags>
+    <PackageReleaseNotes>See https://github.com/exclr8/exclr8-terminal/releases</PackageReleaseNotes>
+    <!-- Embeds source-link symbols + makes "Go to definition" land
+         in the actual repo source for debuggers that support it. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <!-- Deterministic build — same inputs produce byte-identical
+         output. Required for the source-link round-trip and for
+         supply-chain attestation. -->
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
   <ItemGroup>
@@ -27,6 +61,16 @@
          cleanly and the factory picks the kqueue / no-op backend
          instead. -->
     <PackageReference Include="System.Management" Version="9.0.0" />
+    <!-- Source Link puts repo URLs into the .pdb so consumers can
+         step into our source from their debugger. -->
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <!-- Pack the README and LICENSE alongside the assembly so the
+       NuGet UI shows them on the package page. -->
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\LICENSE"   Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

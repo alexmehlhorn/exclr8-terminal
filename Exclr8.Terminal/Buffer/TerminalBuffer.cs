@@ -435,6 +435,23 @@ public sealed class TerminalBuffer : IParserActions
         _parser    = new VtParser(this);
         _osc       = new OscDispatcher(bytes => ReplyToPty(bytes));
         ScrollBottom = rows - 1;
+
+        // Track the row of the most recent OSC 133 PromptStart so
+        // ClearScreenAndScrollback can preserve the user's prompt
+        // (and any in-progress wrapped input) when they hit Cmd+K.
+        // Markers handle scrollback-eviction tracking for free; on
+        // resize the marker auto-invalidates and we fall back to
+        // "preserve cursor row only".
+        _osc.SemanticPrompt += OnInternalSemanticPrompt;
+    }
+
+    private TerminalMarker? _promptStartMarker;
+
+    private void OnInternalSemanticPrompt(object? sender, SemanticPromptEventArgs e)
+    {
+        if (e.Kind != SemanticPromptKind.PromptStart) return;
+        _promptStartMarker?.Dispose();
+        _promptStartMarker = RegisterMarker(); // anchored to current cursor row
     }
 
     public TerminalCell[] GetVisibleRow(int r) => _active.GetRow(r);
@@ -571,13 +588,107 @@ public sealed class TerminalBuffer : IParserActions
         }
     }
 
-    /// <summary>Discard the scrollback buffer entirely (Cmd+K on macOS,
-    /// Ctrl+L / `clear` alternative). Snaps the view to the live
-    /// screen.</summary>
+    /// <summary>Discard the scrollback buffer entirely. Live screen
+    /// is preserved — this only drops the rows that have already
+    /// scrolled off the top. Snaps the view to the live screen.
+    /// Use <see cref="ClearScreenAndScrollback"/> for the
+    /// "Cmd+K-equivalent" behaviour where the user wants the entire
+    /// terminal blank.</summary>
     public void ClearScrollback()
     {
         _active.ClearScrollback();
         _viewport.Reset();
+        Bump();
+    }
+
+    /// <summary>"Clean up my screen" — wipe the noise above the
+    /// prompt, drop the scrollback, snap the prompt to the top, but
+    /// keep the user's in-progress input visible and usable. Wired
+    /// to Cmd+K / Ctrl+Shift+K.
+    ///
+    /// <para>Behaviour by case:</para>
+    /// <list type="bullet">
+    ///   <item><b>Alt-screen active:</b> no-op. The TUI owns the
+    ///         display; wiping it would vandalise vim/htop/less.</item>
+    ///   <item><b>OSC 133 prompt-tracking active:</b> preserve the
+    ///         row range from the most recent <c>PromptStart</c>
+    ///         marker through the current cursor row. Snaps that
+    ///         block to the top, blanks everything else, drops
+    ///         scrollback. Multi-line prompts and wrapped in-progress
+    ///         input survive.</item>
+    ///   <item><b>No OSC 133 marker (or it's been invalidated by a
+    ///         resize / scrollback eviction):</b> preserve just the
+    ///         cursor's row. Single-line prompt survives;
+    ///         multi-line decoration is lost but redraws on next
+    ///         interaction.</item>
+    /// </list>
+    /// <para>SGR pen, DEC modes, OSC 8 hyperlink table, palette
+    /// overrides — all preserved (use <see cref="ResetTerminal"/>
+    /// for the heavier RIS). The shell doesn't know we did this, so
+    /// any decorations / multi-line prompt parts that got wiped
+    /// will redraw on the next prompt cycle.</para>
+    /// </summary>
+    public void ClearScreenAndScrollback()
+    {
+        // Alt-screen TUIs own their painted state; wiping it would
+        // confuse the app. Cmd+K is meaningfully a no-op while in
+        // vim / htop / claude-code-on-alt-screen.
+        if (IsAltScreen) return;
+
+        // Determine the row range to preserve: [startRow, CursorRow]
+        // inclusive. Default to "just the cursor row" if no prompt
+        // marker is tracked or the marker is no longer convertible
+        // to a valid live-screen row.
+        int startRow = CursorRow;
+        if (_promptStartMarker != null && _promptStartMarker.IsValid)
+        {
+            int absRow = _promptStartMarker.Line;
+            int sbCount = _active.Scrollback.Count;
+            int visualRow = absRow - sbCount;
+            if (visualRow >= 0 && visualRow < Rows && visualRow <= CursorRow)
+                startRow = visualRow;
+        }
+        int preserveCount = CursorRow - startRow + 1;
+
+        // Snapshot the rows we want to keep BEFORE blanking — they
+        // live in the same _rows list we're about to wipe. Deep copy
+        // each row so we own the cell data independent of the
+        // live-screen array slots.
+        var snap = new TerminalCell[preserveCount][];
+        for (int i = 0; i < preserveCount; i++)
+        {
+            var src = _active.GetRow(startRow + i);
+            snap[i] = (TerminalCell[])src.Clone();
+        }
+
+        // Blank every live row + drop scrollback.
+        for (int r = 0; r < Rows; r++)
+        {
+            var row = _active.GetRow(r);
+            for (int c = 0; c < Cols; c++) row[c] = TerminalCell.Blank;
+            _active.SetWrapped(r, false);
+        }
+        _active.ClearScrollback();
+
+        // Restore the preserved block at the top.
+        for (int i = 0; i < preserveCount; i++)
+        {
+            var dst = _active.GetRow(i);
+            int n = Math.Min(snap[i].Length, dst.Length);
+            Array.Copy(snap[i], dst, n);
+        }
+
+        // Cursor moves to its position within the preserved block.
+        CursorRow = preserveCount - 1;
+        // CursorCol stays where it was — column unchanged.
+        _viewport.Reset();
+
+        // Re-anchor the prompt marker to the new top if we used it,
+        // otherwise drop it. Scrollback-eviction bumped via Clear()
+        // already invalidated the old marker.
+        _promptStartMarker?.Dispose();
+        _promptStartMarker = (preserveCount > 1) ? RegisterMarker(-(preserveCount - 1)) : null;
+
         Bump();
     }
 
@@ -1782,6 +1893,7 @@ public sealed class TerminalBuffer : IParserActions
             int src = n, dst = 0;
             while (src < Cols) row[dst++] = row[src++];
             while (dst < Cols) row[dst++] = BlankPenCell();
+            ScrubRowWidePairs(row);
         }
     }
 
@@ -1795,6 +1907,7 @@ public sealed class TerminalBuffer : IParserActions
             var row = _active.GetRow(r);
             for (int c = Cols - 1; c >= n; c--) row[c] = row[c - n];
             for (int c = 0; c < Math.Min(n, Cols); c++) row[c] = BlankPenCell();
+            ScrubRowWidePairs(row);
         }
     }
 
@@ -1809,6 +1922,7 @@ public sealed class TerminalBuffer : IParserActions
             var row = _active.GetRow(r);
             for (int c = Cols - 1; c >= CursorCol + n; c--) row[c] = row[c - n];
             for (int c = CursorCol; c < Math.Min(CursorCol + n, Cols); c++) row[c] = BlankPenCell();
+            ScrubRowWidePairs(row);
         }
     }
 
@@ -1824,6 +1938,7 @@ public sealed class TerminalBuffer : IParserActions
             int src = CursorCol + n, dst = CursorCol;
             while (src < Cols) row[dst++] = row[src++];
             while (dst < Cols) row[dst++] = BlankPenCell();
+            ScrubRowWidePairs(row);
         }
     }
 
@@ -1916,6 +2031,7 @@ public sealed class TerminalBuffer : IParserActions
         // there.
         if (mode == 1 || mode == 2)
             _active.SetWrapped(CursorRow, false);
+        ScrubRowWidePairs(row);
     }
 
     private void ClearRow(int r)
@@ -1923,12 +2039,15 @@ public sealed class TerminalBuffer : IParserActions
         var row = _active.GetRow(r);
         for (int c = 0; c < Cols; c++) row[c] = BlankPenCell();
         _active.SetWrapped(r, false);
+        // Whole-row blank can't have orphans (no IsWide / IsContinuation
+        // anywhere) so the scrub would no-op. Skip the walk.
     }
 
     private void EraseChars(int n)
     {
         var row = _active.GetRow(CursorRow);
         for (int i = 0; i < n && CursorCol + i < Cols; i++) row[CursorCol + i] = BlankPenCell();
+        ScrubRowWidePairs(row);
     }
 
     private void DeleteChars(int n)
@@ -1937,6 +2056,7 @@ public sealed class TerminalBuffer : IParserActions
         int src = CursorCol + n, dst = CursorCol;
         while (src < Cols) row[dst++] = row[src++];
         while (dst < Cols) row[dst++] = BlankPenCell();
+        ScrubRowWidePairs(row);
     }
 
     private void InsertBlanks(int n)
@@ -1944,6 +2064,49 @@ public sealed class TerminalBuffer : IParserActions
         var row = _active.GetRow(CursorRow);
         for (int c = Cols - 1;            c >= CursorCol + n; c--) row[c] = row[c - n];
         for (int c = CursorCol; c < CursorCol + n && c < Cols; c++) row[c] = BlankPenCell();
+        ScrubRowWidePairs(row);
+    }
+
+    /// <summary>Normalise wide-cell pair integrity across a row.
+    /// Any cell-erase / cell-shift operation that lands on one half
+    /// of a wide pair without honouring the other half will leave
+    /// "orphans": an IsWide cell whose neighbour is no longer
+    /// IsContinuation, or an IsContinuation cell whose left
+    /// neighbour is no longer IsWide. The renderer skips
+    /// IsContinuation cells, so orphans render as invisible gaps —
+    /// the "double-space and missing characters" symptom seen in
+    /// streaming sessions that mix CSI X / CSI P / DECIC / DECDC /
+    /// SL / SR with CJK or emoji content.
+    ///
+    /// <para>O(cols), called once per CSI mutation. CSI dispatches
+    /// are far less frequent than per-character Print, so this is
+    /// not on a hot path.</para>
+    /// </summary>
+    private static void ScrubRowWidePairs(TerminalCell[] row)
+    {
+        for (int c = 0; c < row.Length; c++)
+        {
+            bool isCont = (row[c].Flags2 & CellFlags2.IsContinuation) != 0;
+            bool isWide = (row[c].Flags2 & CellFlags2.IsWide)         != 0;
+            if (isCont && (c == 0 || (row[c - 1].Flags2 & CellFlags2.IsWide) == 0))
+            {
+                // Continuation with no preceding wide-left → strip
+                // the flag and clear the (already-blank) rune so the
+                // renderer treats it as an ordinary cell.
+                row[c].Flags2 &= ~CellFlags2.IsContinuation;
+                row[c].Rune    = 0;
+            }
+            if (isWide && (c + 1 >= row.Length
+                || (row[c + 1].Flags2 & CellFlags2.IsContinuation) == 0))
+            {
+                // Wide-left with no following continuation → demote
+                // to narrow. Keep the rune; the renderer can still
+                // draw it (clipped to one column if it overflows,
+                // which matches what a narrow-rendered wide glyph
+                // looks like in any other terminal).
+                row[c].Flags2 &= ~CellFlags2.IsWide;
+            }
+        }
     }
 
     private void SaveCursor()

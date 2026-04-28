@@ -118,18 +118,18 @@ public class BufferResizeTests
     }
 
     [Fact]
-    public void Resize_RowShrinkGrowCycleDoesNotInflateScrollback()
+    public void Resize_RowShrink_PreservesScrolledOutContentInScrollback()
     {
-        // Scenario: a TUI is parked with the cursor near the bottom
-        // (where input prompts and status lines live). Cell host shrinks
-        // → grows → shrinks repeatedly as the user toggles between tabs
-        // whose layouts have different row counts. Each shrink must
-        // NOT push live-screen rows into scrollback, otherwise the TUI's
-        // SIGWINCH redraw lays the same content down again and the user
-        // sees duplicated history.
+        // When a row-shrink can't fit the whole live screen (and
+        // dropping blank tails doesn't free enough rows), the rows
+        // that scroll off the top are real shell history. They must
+        // land in scrollback rather than being silently dropped —
+        // this matches iTerm2 / Terminal.app / WezTerm. The earlier
+        // "no-push" rule traded history loss for the TUI-redraw
+        // scrollback-inflation case; that tradeoff was wrong for the
+        // common shell-on-primary scenario where history is what the
+        // user actually wants preserved.
         var buf = NewBuffer(20, 10);
-        // Fill every row with content so blank-tail-drop can't absorb
-        // the shrink; cursor parks on the last row.
         for (int r = 0; r < 10; r++)
         {
             buf.Feed($"line{r}");
@@ -137,12 +137,33 @@ public class BufferResizeTests
         }
         int sbBefore = buf.ScrollbackCount;
 
-        for (int i = 0; i < 5; i++)
-        {
-            buf.Resize(20, 6);
-            buf.Resize(20, 10);
-        }
+        // Cursor is on row 9 (after "line9"). Shrinking to 6 rows
+        // forces 4 rows off the top: line0..line3.
+        buf.Resize(20, 6);
 
-        Assert.Equal(sbBefore, buf.ScrollbackCount);
+        Assert.True(buf.ScrollbackCount > sbBefore,
+            "scrolled-off rows should land in scrollback");
+        // Cursor stays on its content row, snapped into the new bottom.
+        Assert.Equal(5, buf.CursorRow);
+    }
+
+    [Fact]
+    public void Resize_AltScreenShrink_DropsRowsInsteadOfPreserving()
+    {
+        // Alt-screen has ScrollbackLimit = 0 by design — TUIs there
+        // own the display and redraw on SIGWINCH, so any rows we'd
+        // push to scrollback would just bloat memory before the next
+        // redraw clobbers the visible state. Verify the alt-screen
+        // path still drops on shrink.
+        var buf = NewBuffer(20, 10);
+        buf.Feed(CSI + "?1049h");           // enter alt-screen
+        for (int r = 0; r < 10; r++)
+        {
+            buf.Feed($"line{r}");
+            if (r < 9) buf.Feed("\r\n");
+        }
+        Assert.Equal(0, buf.ScrollbackCount); // alt-screen has none
+        buf.Resize(20, 6);
+        Assert.Equal(0, buf.ScrollbackCount); // still none after shrink
     }
 }

@@ -89,39 +89,47 @@ public sealed class ScreenBuffer
 
         if (cols != Cols)
         {
-            (cursorRow, cursorCol) = Reflow(cols, cursorRow, cursorCol);
+            // Pass the TARGET row count so Reflow places exactly
+            // `rows` entries in _rows and routes the rest into
+            // scrollback. Without this, Reflow would size to the
+            // OLD Rows count and the post-Reflow rows-shrink below
+            // would have to drop already-placed content from the top
+            // — silently losing genuine scrolled-out history.
+            (cursorRow, cursorCol) = Reflow(cols, rows, cursorRow, cursorCol);
             Cols = cols;
         }
 
-        if (rows > Rows)
+        // Use _rows.Count, not the Rows field — when Reflow ran above
+        // it sized _rows to match the target `rows` exactly, so the
+        // grow/shrink branches here are typically no-ops on a
+        // cols-changed resize. The branches matter for rows-only
+        // resize (no Reflow); they also handle the case where Reflow
+        // produced fewer redistributed rows than the target.
+        if (rows > _rows.Count)
         {
-            for (int i = Rows; i < rows; i++)
+            // Grow: pad with blank rows at the bottom. Always safe —
+            // we're never losing content.
+            while (_rows.Count < rows)
             {
                 _rows.Add(new TerminalCell[Cols]);
                 _rowsWrapped.Add(false);
             }
         }
-        else if (rows < Rows)
+        else if (rows < _rows.Count)
         {
-            // Shrink. Hard rule: layout-driven shrinks must NOT push
-            // live-screen rows into scrollback. If they did, repeated
-            // grow/shrink cycles (e.g. switching between tabs whose
-            // cells have different sizes, or any TUI that redraws
-            // its full screen on SIGWINCH) would push the same
-            // freshly-redrawn content into scrollback every cycle and
-            // the user sees duplicated history. Scrollback grows from
-            // genuine output scrolling off the top via ScrollUpRegion,
-            // never from resize.
-            //
-            // Strategy:
-            //   1. Drop blank tail rows (free, common after reflow).
-            //   2. Drop blank top rows (also free).
-            //   3. If we still need to shrink and the cursor is below
-            //      the new bottom, drop from the TOP — content shifts
-            //      up so the cursor stays onscreen. Cursor index moves
-            //      with content.
-            //   4. Otherwise drop from the BOTTOM.
-            int extra = Rows - rows;
+            // Shrink. Strategy:
+            //   1. Drop blank tail rows (free).
+            //   2. Drop blank top rows (also free, decrementing
+            //      cursor since content shifts up).
+            //   3. If we still need to shrink and the cursor is
+            //      below the new bottom, evict top rows. On the
+            //      primary screen they go to scrollback (real
+            //      shell history shouldn't vanish on resize); on
+            //      alt-screen they're dropped (alt has no
+            //      scrollback by design and TUIs redraw on
+            //      SIGWINCH).
+            //   4. Otherwise drop from the bottom.
+            int extra = _rows.Count - rows;
             while (extra > 0 && _rows.Count > 0 && IsBlankRow(_rows[^1]))
             {
                 _rows.RemoveAt(_rows.Count - 1);
@@ -140,6 +148,12 @@ public sealed class ScreenBuffer
                 int dropTop = Math.Min(extra, cursorRow - rows + 1);
                 for (int i = 0; i < dropTop; i++)
                 {
+                    if (ScrollbackLimit > 0)
+                    {
+                        // Push the top row into scrollback so genuine
+                        // shell history isn't silently lost on resize.
+                        Scrollback.Add(_rows[0], _rowsWrapped[0]);
+                    }
                     _rows.RemoveAt(0);
                     _rowsWrapped.RemoveAt(0);
                 }
@@ -166,7 +180,7 @@ public sealed class ScreenBuffer
     /// wrap boundary — a blank cell is left at the row's end if a
     /// wide cell would otherwise span. Returns the cursor position in
     /// the reflowed live screen.</summary>
-    private (int row, int col) Reflow(int newCols, int cursorRow, int cursorCol)
+    private (int row, int col) Reflow(int newCols, int newRows, int cursorRow, int cursorCol)
     {
         // Collect ALL existing rows (scrollback + live) as logical lines
         // in order. Each line is a list of cells; the boundary between
@@ -352,15 +366,22 @@ public sealed class ScreenBuffer
             newCursorCol = 0;
         }
 
-        // Split into scrollback (front) and live screen (last `Rows`).
-        // The alternate screen is configured with ScrollbackLimit = 0
-        // so its history is intentionally transient — reflow must
+        // Split into scrollback (front) and live screen (last
+        // `newRows`). Using the TARGET row count (not the buffer's
+        // current Rows) means the live screen ends up sized for the
+        // post-resize layout, and any overflow is routed into
+        // scrollback right here — instead of being placed on the
+        // live screen and then dropped by the rows-shrink step,
+        // which would lose genuine history.
+        //
+        // The alternate screen is configured with ScrollbackLimit =
+        // 0 so its history is intentionally transient — reflow must
         // honour that. Without the gate, reflow that produced more
         // rows than the live screen could hold would quietly leak
         // them into the alt screen's ring (capacity is clamped to a
         // minimum of 1 internally), and a later switch back to the
         // primary would expose ghost rows.
-        int liveCount = Rows;
+        int liveCount = newRows;
         int sbCount = ScrollbackLimit > 0
             ? Math.Max(0, redistributed.Count - liveCount)
             : 0;
@@ -389,7 +410,10 @@ public sealed class ScreenBuffer
         _rowsHead = 0;
 
         // Re-derive cursor in live-screen coordinates.
-        int outCursorRow = Math.Max(0, Math.Min(newCursorRow - sbCount, Rows - 1));
+        // Clamp against the new row count, not the old Rows — Reflow
+        // sized the live screen for newRows, so cursor positions
+        // beyond it are post-reflow invalid.
+        int outCursorRow = Math.Max(0, Math.Min(newCursorRow - sbCount, newRows - 1));
         int outCursorCol = Math.Max(0, Math.Min(newCursorCol, newCols - 1));
         return (outCursorRow, outCursorCol);
     }

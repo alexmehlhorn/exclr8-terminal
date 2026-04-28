@@ -88,6 +88,17 @@ public class TerminalControl : Control, IDisposable
     private (int Cols, int Rows)? _pendingResize;
     private static readonly TimeSpan ResizeDebounceDelay = TimeSpan.FromMilliseconds(50);
 
+    // Drag-select auto-scroll. When the user drag-selects past the
+    // top or bottom edge of the viewport, scroll the viewport in
+    // that direction and extend the selection to the edge so the
+    // selection grows with the scroll. Uses a timer because the
+    // pointer can be HELD outside the viewport without moving —
+    // OnPointerMoved would never fire again, but we still want the
+    // viewport to scroll as long as the button stays down.
+    private readonly DispatcherTimer _dragAutoScrollTimer;
+    private Point _lastDragPos;
+    private static readonly TimeSpan DragAutoScrollInterval = TimeSpan.FromMilliseconds(35);
+
     /// <summary>User typed — payload is the byte sequence ready for the
     /// PTY writer.</summary>
     public event EventHandler<ReadOnlyMemory<byte>>? Input;
@@ -532,6 +543,9 @@ public class TerminalControl : Control, IDisposable
 
         _resizeDebounceTimer = new DispatcherTimer { Interval = ResizeDebounceDelay };
         _resizeDebounceTimer.Tick += (_, _) => ApplyPendingResize();
+
+        _dragAutoScrollTimer = new DispatcherTimer { Interval = DragAutoScrollInterval };
+        _dragAutoScrollTimer.Tick += (_, _) => DragAutoScrollTick();
 
         this.GetObservable(BoundsProperty)
             .Subscribe(new AnonymousObserver<Rect>(_ => RecomputeGrid()));
@@ -984,8 +998,8 @@ public class TerminalControl : Control, IDisposable
             {
                 case Key.V: _ = PasteFromClipboardAsync(); e.Handled = true; return;
                 case Key.C: _ = CopySelectionAsync();      e.Handled = true; return;
-                case Key.A: _buffer.SelectAll();           e.Handled = true; return;
-                case Key.K: _buffer.ClearScrollback();     e.Handled = true; return;
+                case Key.A: _buffer.SelectAll();              e.Handled = true; return;
+                case Key.K: _buffer.ClearScreenAndScrollback(); e.Handled = true; return;
                 case Key.F:
                     FindRequested?.Invoke(this, EventArgs.Empty);
                     e.Handled = true;
@@ -1248,6 +1262,13 @@ public class TerminalControl : Control, IDisposable
             _pressedRow = row;
             _pressedCol = col;
         }
+        // Capture the pointer so we keep receiving OnPointerMoved
+        // events once the user drags past the top or bottom edge of
+        // the control. Without capture, Avalonia stops dispatching
+        // pointer events the moment the cursor leaves the control's
+        // bounds — which is exactly when the auto-scroll timer needs
+        // to know "the pointer is still off-screen, keep scrolling".
+        e.Pointer.Capture(this);
         e.Handled = true;
     }
 
@@ -1294,12 +1315,100 @@ public class TerminalControl : Control, IDisposable
                 }
                 if (_buffer.Selection != null)
                     _buffer.ExtendSelection(row, col);
+
+                // Auto-scroll handoff: if the pointer is outside the
+                // viewport vertically, the timer takes over and keeps
+                // scrolling + extending while the button stays down,
+                // even when the pointer doesn't move further. We track
+                // _lastDragPos so the tick has the latest X coord for
+                // the column endpoint.
+                _lastDragPos = pos;
+                bool outsideY = pos.Y < 0 || pos.Y >= Bounds.Height;
+                if (outsideY)
+                {
+                    if (!_dragAutoScrollTimer.IsEnabled) _dragAutoScrollTimer.Start();
+                }
+                else if (_dragAutoScrollTimer.IsEnabled)
+                {
+                    _dragAutoScrollTimer.Stop();
+                }
             }
         }
         else if (_buffer.MouseMode >= 1003 && _buffer.ScrollOffset == 0)
         {
             SendMouse(35, row, col, e.KeyModifiers, pressed: true); // btn=3 = motion without button
             e.Handled = true;
+        }
+    }
+
+    /// <summary>Tick handler for the drag-select auto-scroll timer.
+    /// Runs while the user holds the mouse button with the pointer
+    /// outside the viewport vertically — scrolls one line per tick
+    /// in the appropriate direction and extends the selection to
+    /// the edge cell so the highlight grows with the scroll.</summary>
+    private void DragAutoScrollTick()
+    {
+        // Defensive guards — if state changed between scheduling and
+        // tick (button released, selection cleared, scrollback empty),
+        // stop and bail.
+        if (!_mouseDown || _disposed)
+        {
+            _dragAutoScrollTimer.Stop();
+            return;
+        }
+        if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
+        {
+            // App-mode mouse reporting owns drag — don't fight it.
+            _dragAutoScrollTimer.Stop();
+            return;
+        }
+
+        bool above = _lastDragPos.Y < 0;
+        bool below = _lastDragPos.Y >= Bounds.Height;
+        if (!above && !below)
+        {
+            _dragAutoScrollTimer.Stop();
+            return;
+        }
+
+        if (above)
+        {
+            // Pointer is above the viewport — scroll up into
+            // scrollback (if there is any). Stop when we hit the top.
+            if (_buffer.ScrollOffset >= _buffer.ScrollbackCount)
+            {
+                _dragAutoScrollTimer.Stop();
+                return;
+            }
+            _buffer.ScrollViewUp(1);
+            ShowScrollbar();
+        }
+        else
+        {
+            // Pointer is below — scroll down toward the live screen.
+            // Stop once we're back to offset zero.
+            if (_buffer.ScrollOffset <= 0)
+            {
+                _dragAutoScrollTimer.Stop();
+                return;
+            }
+            _buffer.ScrollViewDown(1);
+            ShowScrollbar();
+        }
+
+        // Materialise the selection if the user pressed and dragged
+        // straight off-edge without any in-bounds movement.
+        if (_selectionPending)
+        {
+            _buffer.StartSelection(_pressedRow, _pressedCol);
+            _selectionPending = false;
+        }
+        if (_buffer.Selection != null)
+        {
+            int edgeRow = above ? 0 : _buffer.Rows - 1;
+            int col = Math.Clamp((int)(_lastDragPos.X / _renderer.CellWidth),
+                                 0, _buffer.Cols - 1);
+            _buffer.ExtendSelection(edgeRow, col);
         }
     }
 
@@ -1318,6 +1427,12 @@ public class TerminalControl : Control, IDisposable
         var (row, col) = GridPos(e.GetPosition(this));
         bool wasDown = _mouseDown;
         _mouseDown = false;
+        _dragAutoScrollTimer.Stop();
+        // Release the capture grabbed in OnPointerPressed for drag-
+        // selection. Without this the control would keep eating
+        // pointer events the user expects to land on neighbouring
+        // panes / windows.
+        if (wasDown) e.Pointer.Capture(null);
 
         if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
         {
@@ -1530,6 +1645,32 @@ public class TerminalControl : Control, IDisposable
     /// state. The nuclear option for "my terminal is broken, start
     /// over".</summary>
     public void Reset() => _buffer.ResetTerminal();
+
+    /// <summary>Wipe the live screen contents and scrollback ring,
+    /// move the cursor to (0,0), and snap the viewport to the live
+    /// bottom. SGR pen, DEC modes, OSC 8 / palette / title state are
+    /// preserved (use <see cref="Reset"/> for the heavier RIS).
+    /// Wired to Cmd+K / Ctrl+Shift+K — iTerm2's "Clear Buffer"
+    /// semantics. Note: the shell on the far side of the PTY won't
+    /// know the screen got cleared, so the prompt only redraws on
+    /// the next interaction.</summary>
+    public void ClearScreenAndScrollback() => _buffer.ClearScreenAndScrollback();
+
+    /// <summary>Call before connecting a freshly-spawned PTY whose
+    /// startup output you want to land on a clean canvas. Equivalent
+    /// to <see cref="Reset"/>, but named to make the intent obvious
+    /// at the integration site. Useful for apps that don't use
+    /// alt-screen for their welcome banner (Claude Code, some
+    /// REPLs) where dimension-detection races during startup
+    /// otherwise leave stacked partial renders in scrollback.
+    /// <example>
+    /// <code>
+    /// terminal.PrepareForNewSession();
+    /// pty.StdoutBytes.Subscribe(b =&gt; terminal.Write(b));
+    /// </code>
+    /// </example>
+    /// </summary>
+    public void PrepareForNewSession() => _buffer.ResetTerminal();
 
     /// <summary>True when there is a non-empty selection in the buffer.</summary>
     public bool HasSelection => _buffer.Selection != null;
@@ -1751,14 +1892,96 @@ public class TerminalControl : Control, IDisposable
     }
 
     // ---- Focus ----
+    //
+    // Two distinct concerns share the word "focus" here:
+    //
+    //   1. Local visual state — cursor outline (focused vs. just-an-
+    //      empty-rect), cursor blink reset. Tied to the *control's*
+    //      Avalonia focus, because that mirrors "where is keyboard
+    //      input going right now". Always handled in OnGotFocus /
+    //      OnLostFocus.
+    //
+    //   2. The DECSET 1004 PTY focus-event protocol — `\e[I` / `\e[O`
+    //      sent to the shell so apps like vim, claude, codex, tmux
+    //      can react to "the user left and came back". Tied to the
+    //      *top-level window* activation, NOT to control focus,
+    //      because in a host that hosts multiple terminal panes /
+    //      tabs the user switches between them constantly without
+    //      ever leaving the terminal session. Wiring focus events
+    //      to control focus made every tab switch fire \e[O \e[I,
+    //      and TUIs that aren't perfectly idempotent on focus-back
+    //      (Codex's prompt walking down per redraw) accumulate
+    //      visible drift. iTerm2 / Terminal.app / WezTerm all use
+    //      window-level focus for the same reason.
+    //
+    // Hosts that legitimately need pane-level focus tracking can
+    // opt back into control-level firing via FocusEventSource =
+    // FocusEventSource.Control.
+
+    /// <summary>Where DECSET 1004 focus events come from. Default
+    /// <see cref="FocusEventSource.TopLevel"/>: <c>\e[I</c> /
+    /// <c>\e[O</c> only fire when the OS window gains/loses
+    /// activation, so the user can switch terminal tabs without
+    /// notifying every shell that they "left". Set to
+    /// <see cref="FocusEventSource.Control"/> for the legacy
+    /// per-control behaviour.</summary>
+    public FocusEventSource FocusEventSource { get; set; } = FocusEventSource.TopLevel;
+
+    private TopLevel? _focusTopLevel;
+
+    protected override void OnAttachedToVisualTree(Avalonia.VisualTreeAttachmentEventArgs e)
+    {
+        base.OnAttachedToVisualTree(e);
+        _focusTopLevel = TopLevel.GetTopLevel(this);
+        if (_focusTopLevel is Window w)
+        {
+            w.Activated   += OnTopLevelActivated;
+            w.Deactivated += OnTopLevelDeactivated;
+        }
+    }
+
+    protected override void OnDetachedFromVisualTree(Avalonia.VisualTreeAttachmentEventArgs e)
+    {
+        base.OnDetachedFromVisualTree(e);
+        if (_focusTopLevel is Window w)
+        {
+            w.Activated   -= OnTopLevelActivated;
+            w.Deactivated -= OnTopLevelDeactivated;
+        }
+        _focusTopLevel = null;
+    }
+
+    private void OnTopLevelActivated(object? sender, EventArgs e)
+    {
+        if (FocusEventSource != FocusEventSource.TopLevel) return;
+        _buffer.NotifyFocus(true);
+        DrainBufferReplies();
+    }
+
+    private void OnTopLevelDeactivated(object? sender, EventArgs e)
+    {
+        if (FocusEventSource != FocusEventSource.TopLevel) return;
+        _buffer.NotifyFocus(false);
+        DrainBufferReplies();
+    }
+
+    private void DrainBufferReplies()
+    {
+        var replies = _buffer.TakeReplies();
+        if (replies != null) Output?.Invoke(this, replies);
+    }
 
     protected override void OnGotFocus(GotFocusEventArgs e)
     {
         base.OnGotFocus(e);
-        _buffer.NotifyFocus(true);
-        // NotifyFocus queues a reply via ReplyToPty; drain + forward.
-        var replies = _buffer.TakeReplies();
-        if (replies != null) Output?.Invoke(this, replies);
+        // PTY focus event only when the host opted into the legacy
+        // per-control source. Local visual state always updates so
+        // cursor outline + blink reflect the keyboard-focus position.
+        if (FocusEventSource == FocusEventSource.Control)
+        {
+            _buffer.NotifyFocus(true);
+            DrainBufferReplies();
+        }
         _blinkVisible = true;
         _renderer.BlinkVisible = true;
         InvalidateVisual();
@@ -1767,9 +1990,11 @@ public class TerminalControl : Control, IDisposable
     protected override void OnLostFocus(Avalonia.Interactivity.RoutedEventArgs e)
     {
         base.OnLostFocus(e);
-        _buffer.NotifyFocus(false);
-        var replies = _buffer.TakeReplies();
-        if (replies != null) Output?.Invoke(this, replies);
+        if (FocusEventSource == FocusEventSource.Control)
+        {
+            _buffer.NotifyFocus(false);
+            DrainBufferReplies();
+        }
         InvalidateVisual();
     }
 
@@ -1791,6 +2016,7 @@ public class TerminalControl : Control, IDisposable
         _scrollbarTimer.Stop();
         _syncOutputTimer.Stop();
         _resizeDebounceTimer.Stop();
+        _dragAutoScrollTimer.Stop();
 
         // The buffer is exposed publicly and a host may keep a
         // reference to it after disposing the control (e.g. for

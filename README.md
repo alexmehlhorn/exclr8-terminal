@@ -1,12 +1,66 @@
 # Exclr8.Terminal
 
+[![NuGet](https://img.shields.io/nuget/v/Exclr8.Terminal.svg)](https://www.nuget.org/packages/Exclr8.Terminal)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://github.com/exclr8/exclr8-terminal)
+
 A native Avalonia terminal control for .NET. Drop it into a view, feed
 it the bytes your process produces on one side, and forward the bytes
 it wants written back on the other. You get a fully-featured terminal —
 parser, renderer, selection, search, scrollback, the works — with no
 process-spawning or PTY plumbing baked in.
 
-Targets .NET 10 / Avalonia 11.3.
+Targets **.NET 10** and **Avalonia 11.3**.
+
+## Cross-platform
+
+Runs on **macOS**, **Windows**, and **Linux** — anywhere Avalonia
+runs. Same source, same package, identical API surface. Pixel
+rendering goes through Avalonia's Skia backend (so you get the same
+glyph shaping, ligature handling, and font metrics across platforms).
+
+Platform-specific code is contained in two clearly-isolated places:
+
+- **Process-tree watching** — pluggable `IProcessChildWatcher` with
+  three backends: `KQueueChildWatcher` (macOS / *BSD), `WmiChildWatcher`
+  (Windows, gated by `[SupportedOSPlatform("windows")]` so non-Windows
+  builds link cleanly), `NoopChildWatcher` (Linux fallback). The
+  factory picks the right one at runtime.
+- **Clipboard image paste** — uses Avalonia's cross-platform
+  `IClipboard.TryGetDataAsync` with platform-specific format
+  identifiers (`public.png` / `image/png` / `PNG` / `DeviceIndependentBitmap`)
+  so screenshot-to-clipboard from any of the three platforms hits.
+
+Everything else — parser, buffer, renderer, input, search, selection,
+reflow, ligatures, OSC handlers — is platform-agnostic .NET code.
+
+## Install
+
+```sh
+dotnet add package Exclr8.Terminal
+```
+
+Or in your `.csproj`:
+
+```xml
+<PackageReference Include="Exclr8.Terminal" Version="1.0.1" />
+```
+
+## Status
+
+Production-ready. ~370 unit tests covering the parser, buffer, search,
+selection, resize + reflow, SGR, DEC modes, OSC, DCS, character sets,
+wide characters, ligatures, dynamic palette, link providers, lifecycle
+events, and recovery primitives. Used in shipped products for daily
+work with shells, vim, helix, claude-code, codex, tmux, and friends.
+
+The library handles the **terminal-emulator** half of the problem.
+You're responsible for the **PTY half** (spawning the shell, wiring
+stdin/stdout/stderr, sending SIGWINCH on resize). On macOS / Linux a
+small `pty.h` wrapper does the job; on Windows ConPTY is the standard
+path. The control is intentionally agnostic — it works equally well
+with a local PTY, an SSH channel, an in-memory replay stream, or a
+recorded session.
 
 ## What it does
 
@@ -17,7 +71,7 @@ Targets .NET 10 / Avalonia 11.3.
 - **Two-screen model with reflow on resize** — primary + alternate
   screens, scrollback ring on the primary, resize-time line rejoin /
   re-split that follows DECAWM wrap flags through scrollback into the
-  live screen.
+  live screen. Resize preserves history.
 - **Full SGR styling** — 24-bit RGB, 256-palette indices, bold,
   italic, underline (single / double / curly / dotted / dashed),
   strikethrough, inverse, dim, blink, SGR 58 underline colour.
@@ -32,15 +86,18 @@ Targets .NET 10 / Avalonia 11.3.
 - **OSC 8 hyperlinks** + **plain-URL link providers** — `https?://`
   matching out of the box via `WebLinkProvider`; hosts can register
   their own `ILinkProvider` for issue numbers, file paths, vendor
-  schemes.
+  schemes. `LinkActivationPolicy` defaults to `http://` / `https://`
+  to keep `javascript:` and `file://` from arbitrary OSC 8 emitters
+  out of your host.
 - **Shell integration** — OSC 7 working directory, OSC 133 semantic
   prompts (PromptStart / PromptEnd / CommandStart / CommandEnd with
-  exit code), OSC 9 ; 4 progress reports.
+  exit code), OSC 9;4 taskbar / dock-badge progress.
 - **Dynamic palette** — OSC 4 / 10 / 11 / 12 mutations propagate to
   the renderer; shell-set defaults override the host theme;
   `PaletteChanged` fires for repaint.
-- **Scrollback** with pixel-smooth wheel / trackpad scrolling and an
-  auto-hiding scrollbar you can grab.
+- **Scrollback** with pixel-smooth wheel / trackpad scrolling, an
+  auto-hiding scrollbar you can grab, and **drag-select auto-scroll**
+  when the pointer leaves the viewport.
 - **Find-in-buffer** — case-insensitive (default), case-sensitive,
   whole-word, regex; debounced; runs off the UI thread; cancellable;
   navigate match-by-match.
@@ -57,7 +114,8 @@ Targets .NET 10 / Avalonia 11.3.
   (1002), any-event (1003); SGR (1006) and SGR-pixel (1016) encodings.
 - **Keyboard** — DECCKM application cursor keys, DECKPAM application
   keypad, modifyOtherKeys level 2 (`CSI > 4 ; 2 m`) for unambiguous
-  Ctrl+Shift+letter / Shift+Enter / Shift+Tab.
+  Ctrl+Shift+letter / Shift+Enter / Shift+Tab. AltGr-correct on
+  Windows / Linux (Ctrl+Alt-as-AltGr text isn't ESC-prefixed).
 - **Markers + decorations** — persistent line references that survive
   scroll-into-scrollback (`RegisterMarker`), with overlay
   decorations anchored to them (`RegisterDecoration`).
@@ -77,6 +135,10 @@ Targets .NET 10 / Avalonia 11.3.
 - **Resize debounce** — drag-resize gestures and reparent storms
   collapse into one buffer resize + `Resized` event after the burst
   settles.
+- **Top-level focus tracking** — DECSET 1004 `\e[I` / `\e[O` fire on
+  OS-window activation, not on internal pane / tab switches; matches
+  iTerm2 / Terminal.app / WezTerm behaviour and prevents TUI
+  redraw-storms on tab activation.
 - **Process-tree watching** — optional OS-level notifications
   (kqueue on macOS, WMI on Windows) when the shell forks or a
   descendant exits. Useful for "running process" badges and session
@@ -87,26 +149,93 @@ Targets .NET 10 / Avalonia 11.3.
 - **Diagnostic tracing** — opt-in protocol-trace channel surfaces
   every unhandled CSI / OSC / DCS / DEC mode for compatibility
   debugging without polluting the silent run.
-- **Recovery escape hatches** — `ClearActiveHyperlink()` / `SoftReset()`
-  / `Reset()` for stuck OSC 8 underlines, stuck SGR pen, and full
-  RIS-equivalent reset.
+- **Recovery primitives** — `ClearActiveHyperlink()` for stuck OSC 8
+  state, `SoftReset()` for stuck SGR pen, `Reset()` for full
+  RIS-equivalent reset, `ClearScreenAndScrollback()` for Cmd+K-style
+  cleanup that preserves the user's prompt block.
 - **Proper disposal** — timers, watchers, in-flight search, write
   queue, and buffer event subscriptions all shut down cleanly when
   the control is removed.
 
+## What it doesn't do
+
+So you know what to wire externally:
+
+- **Spawning shells / managing PTYs.** Bring your own `pty.h`/`ConPTY`
+  layer; the control just wants bytes in (`Write(...)`) and bytes out
+  (`Input` / `Output` events).
+- **Inline images** (sixel, iTerm2 IIP, kitty graphics). DCS handlers
+  exist (`RegisterDcsHandler`) so an image addon can plug in, but no
+  decoder ships in-box. Building one is a real project — pixel
+  storage, atlas management, GPU upload — and out of scope for the
+  core control.
+- **Kitty keyboard protocol** beyond modifyOtherKeys level 2.
+  Modern editors (helix, neovim) work great with what's there;
+  full kitty protocol with progressive enhancement and per-buffer
+  flag stacks isn't implemented.
+- **Sixel / ReGIS / Tektronix.**
+- **A11y / screen-reader** integration. Avalonia's `AutomationPeer`
+  surface isn't wired up.
+
 ## Quick start
 
-```csharp
-var terminal = new TerminalControl();
-// Host it in your layout wherever you want a terminal pane.
+Minimal Avalonia view with a working terminal panel — wire your PTY
+adapter into the four events:
 
-terminal.Write(bytesFromProvider);          // PTY → terminal
-terminal.Input  += (_, p) => Send(p);       // user → PTY
-terminal.Output += (_, p) => Send(p);       // DSR/DA replies → PTY
-terminal.Resized += (_, s) => Resize(s.Cols, s.Rows);
+```csharp
+using Avalonia.Controls;
+using Exclr8.Terminal;
+
+public class TerminalView : UserControl
+{
+    public TerminalView()
+    {
+        var terminal = new TerminalControl();
+        Content = terminal;
+
+        // PTY → terminal: bytes the shell produced go in.
+        // Call from anywhere; the control coalesces to the UI thread.
+        myPty.OnStdout(bytes => terminal.Write(bytes));
+
+        // user → PTY: bytes the user typed/pasted go out.
+        terminal.Input += (_, payload) => myPty.Write(payload.Span);
+
+        // terminal-protocol replies (DSR, DA, DECRQM, OSC queries).
+        terminal.Output += (_, payload) => myPty.Write(payload.Span);
+
+        // Cell grid changed — propagate to the PTY (SIGWINCH).
+        terminal.Resized += (_, size) => myPty.Resize(size.Cols, size.Rows);
+
+        // Click handler for OSC 8 / detected URLs.
+        terminal.HyperlinkClicked += (_, url) => OpenInBrowser(url);
+    }
+}
 ```
 
 That's the minimum. Everything else is optional.
+
+### Recommended host setup
+
+For a clean Claude Code / vim / Codex experience:
+
+```csharp
+// Issue Reset() before connecting a freshly-spawned PTY so dimension-
+// detection races during the app's startup don't leave stacked
+// partial renders in scrollback.
+terminal.PrepareForNewSession();
+
+// Restrict link activation to web schemes by default — OSC 8 can
+// emit any URL.
+terminal.LinkActivationPolicy = url =>
+    url.StartsWith("http://",  StringComparison.OrdinalIgnoreCase) ||
+    url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+
+// Detect plain URLs in shell output, not just OSC 8.
+terminal.RegisterLinkProvider(new WebLinkProvider());
+
+// Programming-font ligatures if you ship Fira Code / JetBrains Mono.
+terminal.EnableLigatures = true;
+```
 
 ## Public API surface
 
@@ -205,7 +334,7 @@ serialize, dynamic palette) is reachable via `terminal.Buffer`.
 | `AdjustFontSize(direction)` / `ResetFontSize()` | Cmd/Ctrl+= / -. |
 | `EnableLigatures` | OpenType liga/clig/calt for programming fonts. |
 | `ColorScheme` | `TerminalTheme` (foreground / background / cursor / 16-entry ANSI). |
-| `LineHeight` (via theme) / `CursorBlinkIntervalMs` (0 = no blink) | Visual tuning. |
+| `CursorBlinkIntervalMs` | Cursor blink period (0 = no blink). |
 
 ### Behaviour
 
@@ -214,14 +343,16 @@ serialize, dynamic palette) is reachable via `terminal.Buffer`.
 | `ScrollbackLimit` | Lines retained on the primary screen. |
 | `ScrollSensitivity` | Pixels per wheel notch (default 40 ≈ 3 lines). |
 | `WordSeparators` | Characters that bound double-click word selection. |
+| `FocusEventSource` | `TopLevel` (default — DECSET 1004 fires on OS-window focus) or `Control` (per-pane). |
 
 ### Recovery
 
 | Member | Purpose |
 |---|---|
 | `ClearActiveHyperlink()` | Force-clear a stuck OSC 8 link id. |
+| `ClearScreenAndScrollback()` | Cmd+K — wipes screen + scrollback, preserves the prompt block when OSC 133 is wired up. |
 | `SoftReset()` | DECSTR — clears SGR pen, cursor visibility, scroll region, charset slots. |
-| `Reset()` | RIS — clears both screens, scrollback, all DEC modes, palette overrides, OSC 8 / title state. |
+| `Reset()` / `PrepareForNewSession()` | RIS — clears both screens, scrollback, all DEC modes, palette overrides, OSC 8 / title state. |
 
 ### Process-tree watching
 
@@ -295,7 +426,7 @@ Reachable via `terminal.Buffer`. Hosts that build advanced UX use these.
 | `RegisterMarker` / `RegisterDecoration` | (above) |
 | `RegisterCsiHandler` / `RegisterOscHandler` / `RegisterEscHandler` / `RegisterDcsHandler` | (above) |
 | `Serialize()` | (above) |
-| `SoftResetTerminal()` / `ResetTerminal()` / `ClearActiveHyperlink()` | Recovery primitives. |
+| `SoftResetTerminal()` / `ResetTerminal()` / `ClearActiveHyperlink()` / `ClearScreenAndScrollback()` | Recovery primitives. |
 | `NotifyFocus(focused)` | Drive DECSET 1004 focus reports. |
 | `TryGetHyperlink(id, out url)` | Resolve an OSC 8 cell's link id. |
 
@@ -310,7 +441,7 @@ Reachable via `terminal.Buffer`. Hosts that build advanced UX use these.
 ## VT compatibility
 
 Implements VT100 / VT220 / much of VT420, plus the xterm extensions
-in active use. The full surface, with citations:
+in active use. The full surface:
 
 - **CSI**: CUU/CUD/CUF/CUB, CNL/CPL, CHA/HPA/HPR/VPA/VPR, CUP/HVP, CHT/CBT,
   ED/DECSED/EL/DECSEL, IL/DL, DCH, ICH, ECH, SU/SD, SL/SR, REP, TBC,
@@ -332,7 +463,8 @@ in active use. The full surface, with citations:
   C1 8-bit sequence starts (CSI/OSC/DCS/SOS/PM/APC).
 - **Reflow**: per-row wrap-flag tracking; resize joins wrapped runs
   into logical lines and re-splits at the new width; wide cells
-  never straddle a wrap boundary.
+  never straddle a wrap boundary; resize preserves shell history
+  by routing scrolled-out rows into scrollback (alt-screen excepted).
 
 ## Extensibility model
 
@@ -364,7 +496,7 @@ using var _ = terminal.Buffer.RegisterCsiHandler('z', '?', (ps, intermediates) =
 | Paste | ⌘ V | Ctrl + V, or Ctrl + Shift + V |
 | Select all | ⌘ A | Ctrl + Shift + A |
 | Open find | ⌘ F | Ctrl + Shift + F |
-| Clear scrollback | ⌘ K | Ctrl + Shift + K |
+| Clear screen + scrollback | ⌘ K | Ctrl + Shift + K |
 | Font bigger | ⌘ + | Ctrl + + |
 | Font smaller | ⌘ - | Ctrl + - |
 | Font reset | ⌘ 0 | Ctrl + 0 |
@@ -377,33 +509,59 @@ using var _ = terminal.Buffer.RegisterCsiHandler('z', '?', (ps, intermediates) =
 terminal.Dispose();
 ```
 
-Stops blink + scrollbar + sync-output + resize-debounce timers,
-cancels in-flight search, drains and discards the pending write
-queue, tears down the process-tree watcher (kqueue fd / WMI
-subscription), detaches buffer event handlers. Idempotent. Re-using
-a disposed instance is not supported.
-
-## Projects
-
-- **`Exclr8.Terminal/`** — the Avalonia control, the cell buffer,
-  the parser, the renderer, input mapping, link providers, marker /
-  decoration infrastructure, and the OS process-watch backends.
-- **`Exclr8.Terminal.Tests/`** — xUnit test suite (350+ tests)
-  covering the parser, buffer, selection, search, resize + reflow,
-  SGR, DEC modes, OSC, DCS, scroll region, character sets, wide
-  characters, ligatures, dynamic palette, link providers, lifecycle
-  events, recovery primitives, plus real-byte-stream replays
-  captured from common programs.
+Stops blink + scrollbar + sync-output + resize-debounce + drag-auto-
+scroll timers, cancels in-flight search, drains and discards the
+pending write queue, tears down the process-tree watcher (kqueue fd
+/ WMI subscription), detaches buffer event handlers. Idempotent.
+Re-using a disposed instance is not supported.
 
 ## Build + test
 
-```
+```sh
 dotnet build Exclr8.Terminal.slnx -c Debug
 dotnet test  Exclr8.Terminal.Tests/Exclr8.Terminal.Tests.csproj
 ```
 
 Targets .NET 10 / Avalonia 11.3.
 
+## Repository layout
+
+- **`Exclr8.Terminal/`** — the Avalonia control, the cell buffer,
+  the parser, the renderer, input mapping, link providers, marker /
+  decoration infrastructure, and the OS process-watch backends.
+- **`Exclr8.Terminal.Tests/`** — xUnit test suite covering the
+  parser, buffer, selection, search, resize + reflow, SGR, DEC
+  modes, OSC, DCS, scroll region, character sets, wide characters,
+  ligatures, dynamic palette, link providers, lifecycle events,
+  recovery primitives, plus real-byte-stream replays captured from
+  common programs.
+
+## Contributing
+
+Issues and pull requests are welcome. Please see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the bare-minimum process
+notes (branching, coding style, what counts as a good bug report,
+how to run tests). The short version: open an issue to discuss
+non-trivial changes before sinking time into a PR.
+
+## Inspirations / prior art
+
+The parser owes its shape to **xterm**'s state diagram (Paul Williams)
+and **xterm.js**'s `EscapeSequenceParser`. Many specific behaviours —
+reflow, OSC 133, cursor / link / selection semantics — borrow from
+**iTerm2**, **WezTerm**, **kitty**, and **Windows Terminal** where
+they've already worked out what users expect.
+
 ## License
 
-Private. © Exclr8.
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+```
+Copyright 2026 Exclr8 Business Automation (Pty) Ltd
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+```
