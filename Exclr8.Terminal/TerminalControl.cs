@@ -789,6 +789,30 @@ public class TerminalControl : Control, IDisposable
     /// gracefully and we don't want to surprise the host process.</summary>
     public const int PasteMaxBytes = 10 * 1024 * 1024;
 
+    /// <summary>Bytes per chunk when forwarding a paste to the
+    /// <see cref="Input"/> event. Set to 0 to send the whole
+    /// payload as one event (legacy behaviour).
+    ///
+    /// <para>Default 4096 matches the Windows ConPTY input pipe
+    /// buffer and the typical macOS PTY line-discipline buffer.
+    /// Sending larger blocks than the receive buffer can cause the
+    /// consumer to read incomplete chunks mid-paste and either
+    /// truncate or mishandle the rest — visible to the user as
+    /// "the paste cut off and the rest appeared somewhere weird."
+    /// xterm.js / iTerm2 / Terminal.app all chunk for the same
+    /// reason.</para>
+    /// </summary>
+    public int PasteChunkSize { get; set; } = 4096;
+
+    /// <summary>Optional delay between paste chunks, in
+    /// milliseconds. 0 (default) yields to the dispatcher between
+    /// chunks but doesn't sleep — fast pastes stay fast and the
+    /// consumer gets to drain its read pipe between chunks. Set to
+    /// a positive value (1–10 ms) when the consumer's read loop is
+    /// genuinely slow and you see truncation even with chunking.
+    /// </summary>
+    public int PasteChunkDelayMs { get; set; }
+
     /// <summary>
     /// Paste text into the terminal. Wraps in <c>ESC[200~</c> /
     /// <c>ESC[201~</c> when DECSET 2004 (bracketed paste) is active —
@@ -850,7 +874,55 @@ public class TerminalControl : Control, IDisposable
         {
             payload = Encoding.UTF8.GetBytes(text);
         }
-        RaiseInput(payload, InputLineOrigin.Pasted);
+
+        // For small pastes (under one chunk) send in one shot —
+        // matches the legacy behaviour and avoids the async overhead
+        // for short pastes which are the common case.
+        int chunkSize = PasteChunkSize;
+        if (chunkSize <= 0 || payload.Length <= chunkSize)
+        {
+            RaiseInput(payload, InputLineOrigin.Pasted);
+            return;
+        }
+
+        // Large paste: chunk + yield between chunks so the consumer
+        // can drain its read pipe. Fire-and-forget; the UI thread
+        // doesn't wait. Reading the chunked-send method end-to-end:
+        // the FIRST chunk carries the \e[200~ open-marker; the LAST
+        // carries \e[201~; each chunk is a contiguous slice of the
+        // already-built payload, so brackets never straddle a chunk
+        // boundary.
+        _ = SendPasteChunkedAsync(payload, chunkSize, PasteChunkDelayMs);
+    }
+
+    private async Task SendPasteChunkedAsync(byte[] payload, int chunkSize, int delayMs)
+    {
+        try
+        {
+            int offset = 0;
+            while (offset < payload.Length)
+            {
+                int len = Math.Min(chunkSize, payload.Length - offset);
+                var chunk = new byte[len];
+                Array.Copy(payload, offset, chunk, 0, len);
+                RaiseInput(chunk, InputLineOrigin.Pasted);
+                offset += len;
+                if (offset >= payload.Length) break;
+                if (delayMs > 0)
+                    await Task.Delay(delayMs).ConfigureAwait(true);
+                else
+                    // Yield to the dispatcher so the host's PTY writer
+                    // can drain its pipe between chunks. Without the
+                    // yield we'd hammer Input?.Invoke in a tight loop
+                    // on the UI thread and the consumer would never
+                    // get a chance to read.
+                    await Task.Yield();
+            }
+        }
+        catch (Exception ex)
+        {
+            TerminalLog.Error($"[TerminalControl] paste chunked-send failed: {ex.Message}");
+        }
     }
 
     /// <summary>Replace any <c>ESC [ 2 0 1 ~</c> sequence inside a
