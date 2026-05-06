@@ -806,27 +806,37 @@ public class TerminalControl : Control, IDisposable
     public event EventHandler<long>? PasteRejected;
 
     /// <summary>Bytes per chunk when forwarding a paste to the
-    /// <see cref="Input"/> event. Set to 0 to send the whole
-    /// payload as one event (legacy behaviour).
+    /// <see cref="Input"/> event. <b>Default 0 — chunking off.</b>
+    /// The whole payload fires as one <see cref="Input"/> event,
+    /// matching pre-1.0.2 behaviour and avoiding host-side write
+    /// races (see below).
     ///
-    /// <para>Default 4096 matches the Windows ConPTY input pipe
-    /// buffer and the typical macOS PTY line-discipline buffer.
-    /// Sending larger blocks than the receive buffer can cause the
-    /// consumer to read incomplete chunks mid-paste and either
-    /// truncate or mishandle the rest — visible to the user as
-    /// "the paste cut off and the rest appeared somewhere weird."
-    /// xterm.js / iTerm2 / Terminal.app all chunk for the same
-    /// reason.</para>
+    /// <para><b>When to enable.</b> Set to a positive value only if
+    /// your host's <see cref="Input"/> handler genuinely cannot
+    /// accept a large single write — e.g., a transport that frames
+    /// at a fixed size, or a slow consumer that times out paste
+    /// mode if it doesn't see the close marker promptly. 4096 is a
+    /// reasonable starting point (matches Windows ConPTY's input
+    /// pipe buffer).</para>
+    ///
+    /// <para><b>Important — host-side serialisation.</b> Once
+    /// chunking is on we fire multiple <see cref="Input"/> events
+    /// in quick succession. If your handler does
+    /// <c>async (_, p) =&gt; await pty.WriteAsync(p)</c> with no
+    /// serialisation, two writes will race on the same handle —
+    /// <see cref="System.IO.Stream.WriteAsync(byte[],int,int)"/>
+    /// is not thread-safe under concurrent calls and bytes will
+    /// interleave or get lost. Wrap the writer in a queue / lock /
+    /// SemaphoreSlim before turning chunking on.</para>
     /// </summary>
-    public int PasteChunkSize { get; set; } = 4096;
+    public int PasteChunkSize { get; set; }
 
     /// <summary>Optional delay between paste chunks, in
-    /// milliseconds. 0 (default) yields to the dispatcher between
-    /// chunks but doesn't sleep — fast pastes stay fast and the
-    /// consumer gets to drain its read pipe between chunks. Set to
-    /// a positive value (1–10 ms) when the consumer's read loop is
-    /// genuinely slow and you see truncation even with chunking.
-    /// </summary>
+    /// milliseconds. Only relevant when
+    /// <see cref="PasteChunkSize"/> &gt; 0. 0 (default) yields to
+    /// the dispatcher between chunks but doesn't sleep. Set to a
+    /// positive value (1–10 ms) if the consumer needs more breathing
+    /// room between chunks.</summary>
     public int PasteChunkDelayMs { get; set; }
 
     /// <summary>
