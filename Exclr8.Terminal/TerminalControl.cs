@@ -792,14 +792,31 @@ public class TerminalControl : Control, IDisposable
     /// <summary>
     /// Paste text into the terminal. Wraps in <c>ESC[200~</c> /
     /// <c>ESC[201~</c> when DECSET 2004 (bracketed paste) is active —
-    /// lets the shell distinguish typed vs pasted input. Rejects
-    /// anything containing NUL (0x00), which is a tell-tale sign of a
-    /// mis-identified binary payload that would confuse a PTY.
+    /// lets the shell distinguish typed vs pasted input.
+    ///
+    /// <para>The clipboard bytes are forwarded verbatim — NULs and
+    /// other control bytes are not stripped, matching iTerm2 /
+    /// Terminal.app behaviour. Consumers (shells, TUIs) decide what
+    /// to do with non-printable content.</para>
+    ///
+    /// <para>One exception: when bracketed paste is active, any
+    /// embedded <c>ESC [ 2 0 1 ~</c> close-marker in the body is
+    /// scrubbed. Without this, a paste containing the close marker
+    /// (either accidentally — e.g., copying terminal output that
+    /// previously contained the marker — or maliciously) would
+    /// prematurely terminate paste mode and the rest of the bytes
+    /// would land as if the user had typed them, including any
+    /// embedded newlines that submit the partial input. The user-
+    /// visible symptom is "the paste cut off and the rest appeared
+    /// somewhere weird." Replacing the marker with the open-marker
+    /// (<c>ESC [ 2 0 0 ~</c>) keeps paste mode open and the bytes
+    /// flowing; downstream apps see no functional difference because
+    /// the close-marker is a paste-protocol primitive, never part
+    /// of legitimate user content.</para>
     /// </summary>
     public void Paste(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
-        if (text.IndexOf('\0') >= 0) return; // binary payload — refuse
 
         // Paste is about to push PTY bytes that will move the cursor
         // and almost certainly paint over wherever the selection was.
@@ -823,12 +840,40 @@ public class TerminalControl : Control, IDisposable
             "\x1b[200~"u8.CopyTo(payload);
             Encoding.UTF8.GetBytes(text, payload.AsSpan(6, innerBytes));
             "\x1b[201~"u8.CopyTo(payload.AsSpan(6 + innerBytes));
+
+            // Scrub any embedded close marker in the body. We only
+            // touch bytes inside the brackets [6, 6+innerBytes); the
+            // framing markers themselves stay intact.
+            ScrubEmbeddedPasteClose(payload.AsSpan(6, innerBytes));
         }
         else
         {
             payload = Encoding.UTF8.GetBytes(text);
         }
         RaiseInput(payload, InputLineOrigin.Pasted);
+    }
+
+    /// <summary>Replace any <c>ESC [ 2 0 1 ~</c> sequence inside a
+    /// bracketed-paste body with <c>ESC [ 2 0 0 ~</c>. The 6-byte
+    /// pattern is unambiguous (no overlapping shorter prefix that
+    /// looks like a continuation) so a single linear scan suffices.
+    /// </summary>
+    private static void ScrubEmbeddedPasteClose(Span<byte> body)
+    {
+        // ESC [ 2 0 1 ~  →  ESC [ 2 0 0 ~  (just flip the '1' to '0')
+        for (int i = 0; i + 5 < body.Length; i++)
+        {
+            if (body[i]     == 0x1B  // ESC
+             && body[i + 1] == (byte)'['
+             && body[i + 2] == (byte)'2'
+             && body[i + 3] == (byte)'0'
+             && body[i + 4] == (byte)'1'
+             && body[i + 5] == (byte)'~')
+            {
+                body[i + 4] = (byte)'0';
+                i += 5; // skip past the rewritten sequence
+            }
+        }
     }
 
     public override void Render(DrawingContext ctx)
@@ -1831,19 +1876,6 @@ public class TerminalControl : Control, IDisposable
         await cb.SetDataAsync(transfer);
     }
 
-    // Image-bytes clipboard identifiers for "screenshot to clipboard"
-    // captures. TryGetFileAsync already covers Finder / Explorer file
-    // copies, so this list is only the raw-bytes variants — macOS UTIs
-    // and MIME types, plus the Windows CF_DIB / PNG format names
-    // Avalonia surfaces on win32 clipboard.
-    private static readonly string[] ImageFormats =
-    {
-        "public.png",  "image/png",  "PNG",
-        "public.tiff", "image/tiff",
-        "public.jpeg", "image/jpeg", "JPEG",
-        "DeviceIndependentBitmap", "image/bmp", "BMP",
-    };
-
     private async Task PasteFromClipboardAsyncCore()
     {
         var cb = TopLevel.GetTopLevel(this)?.Clipboard;
@@ -1852,8 +1884,16 @@ public class TerminalControl : Control, IDisposable
         using var transfer = await cb.TryGetDataAsync();
         if (transfer == null) return;
 
-        // 1. File reference (Finder copy, drag source). Avalonia
-        // normalises cross-platform file formats into DataFormat.File.
+        // Order matters here: image-bearing clipboards on every
+        // platform we care about ALSO surface a synthetic-text
+        // representation (UTF-8-decoded raw bytes, base64, image
+        // metadata, etc. — varies by source app) which Paste would
+        // otherwise forward to the shell as garbage. Try each
+        // structured form before falling through to text.
+
+        // 1. File reference (Finder copy, drag source, "Copy as path"
+        // shell extensions). Avalonia normalises cross-platform file
+        // formats into DataFormat.File.
         var file = await transfer.TryGetFileAsync();
         if (file != null)
         {
@@ -1861,23 +1901,38 @@ public class TerminalControl : Control, IDisposable
             if (!string.IsNullOrEmpty(path)) { Paste(path); return; }
         }
 
-        // 2. Image bytes (screenshot-to-clipboard). Spill to a temp
-        // file and paste the path — CLIs that accept image file
-        // arguments can then pick them up just as they would a
-        // dragged-in file.
-        foreach (var ident in ImageFormats)
+        // 2. Image bytes (screenshot-to-clipboard, "Copy Image"
+        // from a browser / image viewer, native paint apps).
+        // TryGetBitmapAsync is Avalonia's cross-platform image
+        // extractor — handles macOS public.png/public.tiff,
+        // Windows CF_DIB/CF_DIBV5/PNG, X11 image/png, etc.
+        // without us having to enumerate every OS-specific
+        // identifier. Spill to a temp PNG and paste the path so
+        // CLIs that accept image-file arguments can pick it up.
+        try
         {
-            var fmt  = DataFormat.CreateBytesPlatformFormat(ident);
-            var data = await transfer.TryGetValueAsync(fmt);
-            if (data is { Length: > 0 })
+            var bitmap = await transfer.TryGetBitmapAsync();
+            if (bitmap != null)
             {
-                var path = await WriteClipboardImageToTempAsync(data, ident);
+                var path = WriteClipboardBitmapToTemp(bitmap);
                 Paste(path);
                 return;
             }
         }
+        catch (Exception ex)
+        {
+            TerminalLog.Error($"[TerminalControl] clipboard bitmap decode failed: {ex.Message}");
+            // fall through to text
+        }
 
-        // 3. Plain text — the common case.
+        // 3. Plain text — the common case. This path only fires
+        // when neither file refs nor a decodable bitmap surfaced;
+        // for image-bearing clipboards the bitmap path above wins
+        // and we never get here. (That ordering matters: pasting
+        // the UTF-8-decoded bytes of a PNG produces literal
+        // garbage / NULs / spaces, and Paste's NUL-refuser would
+        // discard it anyway — leaving the user with an unhelpful
+        // silent paste failure.)
         var t = await transfer.TryGetTextAsync();
         if (!string.IsNullOrEmpty(t)) Paste(t);
     }
@@ -1887,25 +1942,21 @@ public class TerminalControl : Control, IDisposable
     /// the path (e.g. an IDE might use its own prefix).</summary>
     public static string PasteImageDirectoryName { get; set; } = "exclr8-terminal-paste";
 
-    /// <summary>Write clipboard image bytes to a temp file and return
-    /// its path. The file extension is derived from the clipboard
-    /// format so downstream tools can identify the image type
-    /// without sniffing. Async so a multi-MB screenshot doesn't stall
-    /// the UI thread while the file is written.</summary>
-    private static async Task<string> WriteClipboardImageToTempAsync(byte[] data, string format)
+    /// <summary>Save a clipboard <see cref="Avalonia.Media.Imaging.Bitmap"/>
+    /// to a temp PNG and return the path. Avalonia's
+    /// <c>Bitmap.Save(string)</c> picks the encoder by file
+    /// extension; PNG round-trips losslessly through any source
+    /// format and is the safest default for "this image was just
+    /// in the clipboard". The synchronous Save is fine — on the
+    /// rare occasions it's slow, that's the encoder running on
+    /// the UI thread for ~milliseconds; the alternative would be
+    /// queuing a Task and pasting an as-yet-unwritten path.</summary>
+    private static string WriteClipboardBitmapToTemp(Avalonia.Media.Imaging.Bitmap bitmap)
     {
-        string ext = format switch
-        {
-            "public.png"  or "image/png"  or "PNG"                         => ".png",
-            "public.tiff" or "image/tiff"                                  => ".tiff",
-            "public.jpeg" or "image/jpeg" or "JPEG"                        => ".jpg",
-            "DeviceIndependentBitmap" or "image/bmp" or "BMP"              => ".bmp",
-            _                                                              => ".bin",
-        };
         var dir = Path.Combine(Path.GetTempPath(), PasteImageDirectoryName);
         Directory.CreateDirectory(dir);
-        var path = Path.Combine(dir, $"paste-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}{ext}");
-        await File.WriteAllBytesAsync(path, data);
+        var path = Path.Combine(dir, $"paste-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}.png");
+        bitmap.Save(path);
         return path;
     }
 
