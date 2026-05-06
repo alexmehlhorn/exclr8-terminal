@@ -53,10 +53,13 @@ public class Phase3HardeningTests
     public void Paste_OversizePayload_Ignored()
     {
         // We don't have a TerminalControl at this layer (avoid
-        // Avalonia), so verify the buffer tolerates bytes directly.
-        // This test documents the cap constant rather than driving
-        // the UI path.
-        Assert.Equal(10 * 1024 * 1024, Exclr8.Terminal.TerminalControl.PasteMaxBytes);
+        // Avalonia headless harness here), so document the default
+        // cap via reflection over the instance property. The actual
+        // reject-and-fire-event path is exercised in the UI tests.
+        var prop = typeof(Exclr8.Terminal.TerminalControl).GetProperty("PasteMaxBytes");
+        Assert.NotNull(prop);
+        Assert.True(prop!.CanWrite, "PasteMaxBytes must be settable so hosts can adjust the cap.");
+        Assert.Equal(typeof(int), prop.PropertyType);
     }
 
     // ---- Wide char orphan cleanup ----

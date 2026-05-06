@@ -784,10 +784,26 @@ public class TerminalControl : Control, IDisposable
         }
     }
 
-    /// <summary>Hard cap on paste payload size. Past this the paste
-    /// is silently dropped — shells don't handle a 100 MiB paste
-    /// gracefully and we don't want to surprise the host process.</summary>
-    public const int PasteMaxBytes = 10 * 1024 * 1024;
+    /// <summary>Hard cap on paste payload size in bytes. Anything
+    /// larger is rejected — <see cref="PasteRejected"/> fires so
+    /// the host can show a UI prompt; the actual paste is dropped.
+    ///
+    /// <para>Default 50 MB — comfortably covers <c>pg_dump</c> of a
+    /// medium DB, large log tails, generated SQL / JSON, AI-context
+    /// content. The cap is mostly a "you definitely fat-fingered
+    /// the wrong clipboard" guard rather than a meaningful limit
+    /// for legitimate use. Set to <see cref="int.MaxValue"/> for no
+    /// effective cap.</para>
+    /// </summary>
+    public int PasteMaxBytes { get; set; } = 50 * 1024 * 1024;
+
+    /// <summary>Fires when a paste was rejected for being larger
+    /// than <see cref="PasteMaxBytes"/>. Argument is the size of
+    /// the rejected paste in bytes. Hosts use this to show a
+    /// "paste too large (X MB / max Y MB)" toast or confirm dialog.
+    /// Without subscribing the cap is silent — the paste does
+    /// nothing and the user has no way to know why.</summary>
+    public event EventHandler<long>? PasteRejected;
 
     /// <summary>Bytes per chunk when forwarding a paste to the
     /// <see cref="Input"/> event. Set to 0 to send the whole
@@ -848,7 +864,11 @@ public class TerminalControl : Control, IDisposable
         _buffer.ClearSelection();
 
         int innerBytes = Encoding.UTF8.GetByteCount(text);
-        if (innerBytes > PasteMaxBytes) return;
+        if (innerBytes > PasteMaxBytes)
+        {
+            PasteRejected?.Invoke(this, innerBytes);
+            return;
+        }
 
         byte[] payload;
         if (_buffer.BracketedPaste)
