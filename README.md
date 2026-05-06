@@ -2,7 +2,7 @@
 
 [![NuGet](https://img.shields.io/nuget/v/Exclr8.Terminal.svg)](https://www.nuget.org/packages/Exclr8.Terminal)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://github.com/exclr8/exclr8-terminal)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://github.com/alexmehlhorn/exclr8-terminal)
 
 A native Avalonia terminal control for .NET. Drop it into a view, feed
 it the bytes your process produces on one side, and forward the bytes
@@ -43,7 +43,7 @@ dotnet add package Exclr8.Terminal
 Or in your `.csproj`:
 
 ```xml
-<PackageReference Include="Exclr8.Terminal" Version="1.0.1" />
+<PackageReference Include="Exclr8.Terminal" Version="1.0.2" />
 ```
 
 ## Status
@@ -321,7 +321,11 @@ serialize, dynamic palette) is reachable via `terminal.Buffer`.
 
 | Member | Purpose |
 |---|---|
-| `Paste(string)` | Honours bracketed-paste mode. Refuses NUL-bearing payloads. |
+| `Paste(string)` | Honours bracketed-paste mode; scrubs any embedded `ESC [ 201 ~` close markers in the body so a malicious or accidental paste can't terminate paste mode early. Forwards bytes verbatim — NULs and other control bytes pass through, matching iTerm2 / Terminal.app. |
+| `PasteMaxBytes` | Hard cap on paste payload size in bytes. Default 50 MB. Settable; set to `int.MaxValue` for no effective cap. |
+| `PasteRejected` | `EventHandler<long>` — fires with the rejected size in bytes when a paste exceeded `PasteMaxBytes`. Subscribe to surface a "paste too large" toast; without a subscriber the cap is silent. |
+| `PasteChunkSize` | Bytes per chunk for split delivery into the `Input` event. **Default 0 — chunking off**, whole paste fires as one event. Opt-in only: enabling chunking requires the host to serialise its `Input`-event writer (queue / lock / `SemaphoreSlim`), otherwise concurrent `WriteAsync` calls race on the underlying handle. |
+| `PasteChunkDelayMs` | Optional inter-chunk delay (ms) when chunking is on. 0 yields without sleeping; 1–10 ms helps if the consumer is genuinely slow. |
 | `AllowClipboardAccess` | Gate for OSC 52 (off by default — remote can scrape clipboard otherwise). |
 | `ClipboardRequested` | OSC 52 set request — fires only when allowed. |
 | `PasteImageDirectoryName` | Static; sub-dir under temp for spilled clipboard images. |
