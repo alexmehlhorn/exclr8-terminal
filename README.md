@@ -43,7 +43,7 @@ dotnet add package Exclr8.Terminal
 Or in your `.csproj`:
 
 ```xml
-<PackageReference Include="Exclr8.Terminal" Version="1.0.3" />
+<PackageReference Include="Exclr8.Terminal" Version="1.0.4" />
 ```
 
 ## Status

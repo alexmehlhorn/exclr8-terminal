@@ -994,9 +994,36 @@ public class TerminalControl : Control, IDisposable
     private const int MinUsableCols = 10;
     private const int MinUsableRows = 3;
 
+    /// <summary>Pixel deadband around each cell-grid integer boundary.
+    /// Bounds wobbles smaller than this don't flip the grid by one
+    /// cell. Sized to absorb common host-side jitter sources — a
+    /// focus-ring border-thickness change of 1–2 px per side, font-
+    /// hinting nudges, scrollbar fade-in/out 1 px reserved space.
+    /// Without it: a 2 px Bounds change crosses an integer cell
+    /// boundary, RecomputeGrid emits a Resized event, the host
+    /// forwards to ConPTY, and ConPTY reframes the screen — which
+    /// on Windows + cmd.exe collapses cursor-traversed-but-unwritten
+    /// rows (the blanks from `echo.`) because the console screen
+    /// buffer can't distinguish them from default-padding rows.
+    /// 3 px covers both 1 px and 2 px chrome flips comfortably.</summary>
+    private const double GridBoundaryDeadbandPx = 3.0;
+
     private void RecomputeGrid()
     {
         var (cols, rows) = _renderer.ComputeGrid(Bounds.Size);
+
+        // Hysteresis around boundary-crossings. If the new tuple
+        // differs from the current one by exactly one cell on either
+        // axis AND Bounds is within GridBoundaryDeadbandPx of the
+        // boundary that flipped it, snap back to the current value.
+        // This protects against host-side layout jitter (e.g., a
+        // focus-ring border-thickness flip swinging the inner area
+        // by 2 px on every focus event) being misread as a real
+        // resize. Larger Bounds changes — a dragged window edge,
+        // splitter, font zoom — fall through unaffected.
+        cols = ApplyBoundaryHysteresis(cols, _buffer.Cols, Bounds.Width,  _renderer.CellWidth);
+        rows = ApplyBoundaryHysteresis(rows, _buffer.Rows, Bounds.Height, _renderer.CellHeight);
+
         // Either an unusable transient size or a return to the
         // current grid invalidates any earlier pending resize: that
         // stashed (cols, rows) was a momentary layout artefact, and
@@ -1018,6 +1045,23 @@ public class TerminalControl : Control, IDisposable
         _pendingResize = (cols, rows);
         _resizeDebounceTimer.Stop();
         _resizeDebounceTimer.Start();
+    }
+
+    private static int ApplyBoundaryHysteresis(int proposed, int current, double bounds, double cellSize)
+    {
+        if (proposed == current) return proposed;
+        if (cellSize <= 0)        return proposed;
+        // Single-cell flip only — multi-cell jumps are real resizes,
+        // pass straight through.
+        if (Math.Abs(proposed - current) != 1) return proposed;
+
+        // The boundary that the proposed value sits just past.
+        // Going from current 80 cols to proposed 79: boundary is
+        // 80 * cellWidth (we crossed below it). Proposed 81: boundary
+        // is 81 * cellWidth (we crossed above it). Pick whichever
+        // applies via Math.Max.
+        double boundary = Math.Max(proposed, current) * cellSize;
+        return Math.Abs(bounds - boundary) < GridBoundaryDeadbandPx ? current : proposed;
     }
 
     private void ApplyPendingResize()
