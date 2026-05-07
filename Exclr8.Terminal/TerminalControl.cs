@@ -2006,11 +2006,10 @@ public class TerminalControl : Control, IDisposable
         // 2. Image bytes (screenshot-to-clipboard, "Copy Image"
         // from a browser / image viewer, native paint apps).
         // TryGetBitmapAsync is Avalonia's cross-platform image
-        // extractor — handles macOS public.png/public.tiff,
-        // Windows CF_DIB/CF_DIBV5/PNG, X11 image/png, etc.
-        // without us having to enumerate every OS-specific
-        // identifier. Spill to a temp PNG and paste the path so
-        // CLIs that accept image-file arguments can pick it up.
+        // extractor; on a good day it handles macOS
+        // public.png/public.tiff, Windows CF_DIB/CF_DIBV5/PNG,
+        // X11 image/png. Spill to a temp PNG and paste the path
+        // so CLIs that accept image-file arguments can pick it up.
         try
         {
             var bitmap = await transfer.TryGetBitmapAsync();
@@ -2024,7 +2023,30 @@ public class TerminalControl : Control, IDisposable
         catch (Exception ex)
         {
             TerminalLog.Error($"[TerminalControl] clipboard bitmap decode failed: {ex.Message}");
-            // fall through to text
+            // fall through to raw-bytes fallback, then text
+        }
+
+        // 2b. Raw-bytes fallback. Avalonia's TryGetBitmapAsync on
+        // Windows misses real-world clipboards in practice — Snipping
+        // Tool, modern browsers and paint apps put PNG bytes under
+        // the "PNG" CF and CF_DIB / CF_DIBV5, but Avalonia 11.3 only
+        // surfaces those as DataFormat.Bitmap when the source app
+        // also wrote one of the formats Avalonia's decoder happens
+        // to recognise. When it doesn't, the typed extractor returns
+        // null and the user sees a silent paste failure. So: walk
+        // the items × formats matrix, pull bytes for any identifier
+        // that smells like an image, sniff magic bytes to confirm,
+        // and write to a temp file. Magic-byte sniffing beats
+        // identifier matching when the platform exposes a format
+        // string we don't recognise.
+        try
+        {
+            var imagePath = await TryWriteClipboardImageBytesAsync(transfer);
+            if (imagePath != null) { Paste(imagePath); return; }
+        }
+        catch (Exception ex)
+        {
+            TerminalLog.Error($"[TerminalControl] clipboard image-bytes fallback failed: {ex.Message}");
         }
 
         // 3. Plain text — the common case. This path only fires
@@ -2037,6 +2059,126 @@ public class TerminalControl : Control, IDisposable
         // silent paste failure.)
         var t = await transfer.TryGetTextAsync();
         if (!string.IsNullOrEmpty(t)) Paste(t);
+    }
+
+    // Identifiers worth pulling raw bytes for. Permissive — the magic-
+    // byte sniffer downstream is what actually decides whether to keep
+    // the payload. Strings cover Win32 clipboard format names,
+    // mime types (X11/Wayland and some Windows apps), and macOS UTIs.
+    private static readonly string[] s_clipboardImageIdentifiers =
+    {
+        "PNG",  "image/png",  "public.png",
+        "JFIF", "image/jpeg", "public.jpeg", "image/jpg",
+        "TIFF", "image/tiff", "public.tiff",
+        "image/bmp", "BMP",
+        // CF_DIB / CF_DIBV5 surface under several string names depending
+        // on the Avalonia backend version. We accept all of them and
+        // wrap a synthetic BMP file header on the way out.
+        "DeviceIndependentBitmap", "CF_DIB", "CF_DIBV5", "Format8", "Format17",
+    };
+
+    private static async Task<string?> TryWriteClipboardImageBytesAsync(IAsyncDataTransfer transfer)
+    {
+        List<string>? seen = null;
+        foreach (var item in transfer.Items)
+        {
+            foreach (var format in item.Formats)
+            {
+                (seen ??= new List<string>()).Add(format.Identifier);
+                if (Array.IndexOf(s_clipboardImageIdentifiers, format.Identifier) < 0) continue;
+
+                object? raw;
+                try { raw = await item.TryGetRawAsync(format); }
+                catch (Exception ex)
+                {
+                    TerminalLog.Error($"[TerminalControl] clipboard raw read failed for {format.Identifier}: {ex.Message}");
+                    continue;
+                }
+                if (raw is not byte[] bytes || bytes.Length == 0) continue;
+
+                var (ext, payload) = NormaliseClipboardImageBytes(bytes);
+                if (ext == null) continue;
+                return WriteClipboardBytesToTemp(payload, ext);
+            }
+        }
+
+        if (seen != null && seen.Count > 0)
+            TerminalLog.Trace($"[TerminalControl] clipboard had no decodable image bytes; formats present: {string.Join(", ", seen)}");
+        return null;
+    }
+
+    private static (string? Extension, byte[] Bytes) NormaliseClipboardImageBytes(byte[] bytes)
+    {
+        // Trust the bytes over the format identifier. Sources lie —
+        // an app that registers PNG bytes under a Win32 format named
+        // "Bitmap" is not unheard of.
+        if (bytes.Length >= 8 && bytes[0] == 0x89 && bytes[1] == (byte)'P' && bytes[2] == (byte)'N' && bytes[3] == (byte)'G')
+            return (".png", bytes);
+        if (bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+            return (".jpg", bytes);
+        if (bytes.Length >= 4 &&
+            ((bytes[0] == (byte)'I' && bytes[1] == (byte)'I' && bytes[2] == 0x2A && bytes[3] == 0x00) ||
+             (bytes[0] == (byte)'M' && bytes[1] == (byte)'M' && bytes[2] == 0x00 && bytes[3] == 0x2A)))
+            return (".tiff", bytes);
+        if (bytes.Length >= 2 && bytes[0] == (byte)'B' && bytes[1] == (byte)'M')
+            return (".bmp", bytes);
+
+        // CF_DIB / CF_DIBV5 — payload is a DIB (BITMAPINFOHEADER /
+        // BITMAPV4HEADER / BITMAPV5HEADER + colour table + pixels)
+        // WITHOUT the 14-byte BITMAPFILEHEADER. Prepend the header
+        // so the file we write is a valid .bmp readable by anything
+        // that ingests image paths.
+        if (bytes.Length >= 4)
+        {
+            int dibHeaderSize = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+            if (dibHeaderSize is 40 or 52 or 56 or 108 or 124)
+                return (".bmp", AddBmpFileHeader(bytes, dibHeaderSize));
+        }
+
+        return (null, bytes);
+    }
+
+    private static byte[] AddBmpFileHeader(byte[] dib, int dibHeaderSize)
+    {
+        // 14-byte BITMAPFILEHEADER: "BM" + file size + 4 bytes
+        // reserved + offset-to-pixels.
+        // Pixel offset = 14 + DIB header size + colour-table size.
+        // Colour table is biClrUsed * 4 bytes for paletted images
+        // (1/4/8 bpp); 0 otherwise. biClrUsed lives at offset 32
+        // in BITMAPINFOHEADER and equivalents (V4/V5 share layout).
+        int clrUsed = 0;
+        if (dib.Length >= 36)
+            clrUsed = dib[32] | (dib[33] << 8) | (dib[34] << 16) | (dib[35] << 24);
+        int bpp = 0;
+        if (dib.Length >= 16)
+            bpp = dib[14] | (dib[15] << 8);
+        if (clrUsed == 0 && bpp is 1 or 4 or 8)
+            clrUsed = 1 << bpp;
+        int pixelOffset = 14 + dibHeaderSize + clrUsed * 4;
+        int fileSize = 14 + dib.Length;
+
+        var output = new byte[fileSize];
+        output[0] = (byte)'B'; output[1] = (byte)'M';
+        output[2] = (byte)(fileSize);
+        output[3] = (byte)(fileSize >> 8);
+        output[4] = (byte)(fileSize >> 16);
+        output[5] = (byte)(fileSize >> 24);
+        // 6..9 reserved (zero by default)
+        output[10] = (byte)(pixelOffset);
+        output[11] = (byte)(pixelOffset >> 8);
+        output[12] = (byte)(pixelOffset >> 16);
+        output[13] = (byte)(pixelOffset >> 24);
+        System.Buffer.BlockCopy(dib, 0, output, 14, dib.Length);
+        return output;
+    }
+
+    private static string WriteClipboardBytesToTemp(byte[] bytes, string extension)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), PasteImageDirectoryName);
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, $"paste-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}{extension}");
+        File.WriteAllBytes(path, bytes);
+        return path;
     }
 
     /// <summary>Directory name under the OS temp dir where pasted
