@@ -27,9 +27,16 @@ Platform-specific code is contained in two clearly-isolated places:
   builds link cleanly), `NoopChildWatcher` (Linux fallback). The
   factory picks the right one at runtime.
 - **Clipboard image paste** — uses Avalonia's cross-platform
-  `IClipboard.TryGetDataAsync` with platform-specific format
-  identifiers (`public.png` / `image/png` / `PNG` / `DeviceIndependentBitmap`)
-  so screenshot-to-clipboard from any of the three platforms hits.
+  `IClipboard.TryGetDataAsync`. When Avalonia's typed bitmap
+  extractor misses (which on Windows includes Snipping Tool, modern
+  browsers, and most paint apps), a raw-bytes fallback walks the
+  clipboard items × formats matrix, pulls bytes for any known image
+  identifier (`PNG` / `image/png` / `public.png`, JPEG / TIFF / BMP
+  variants, `CF_DIB` / `CF_DIBV5`), magic-byte-sniffs to confirm,
+  prepends a synthetic `BITMAPFILEHEADER` for header-less DIB
+  payloads, and writes a temp file whose path is pasted. Combined,
+  the typed and raw paths cover screenshot-to-clipboard from every
+  source we've tested across the three platforms.
 
 Everything else — parser, buffer, renderer, input, search, selection,
 reflow, ligatures, OSC handlers — is platform-agnostic .NET code.
@@ -134,7 +141,12 @@ recorded session.
   producers.
 - **Resize debounce** — drag-resize gestures and reparent storms
   collapse into one buffer resize + `Resized` event after the burst
-  settles.
+  settles. A small pixel deadband around each cell-grid integer
+  boundary keeps host-side layout micro-jitter (focus-ring border
+  thickness flips, scrollbar fade, font-hinting nudges of 1–2 px)
+  from spuriously flipping the grid by one cell — important on
+  Windows where any spurious resize forwards to ConPTY and reframes
+  the screen.
 - **Top-level focus tracking** — DECSET 1004 `\e[I` / `\e[O` fire on
   OS-window activation, not on internal pane / tab switches; matches
   iTerm2 / Terminal.app / WezTerm behaviour and prevents TUI
@@ -236,6 +248,68 @@ terminal.RegisterLinkProvider(new WebLinkProvider());
 // Programming-font ligatures if you ship Fira Code / JetBrains Mono.
 terminal.EnableLigatures = true;
 ```
+
+### Host integration notes
+
+A few non-obvious gotchas if you're embedding the control inside a
+multi-pane layout, especially with `cmd.exe` on Windows:
+
+#### Don't change layout dimensions on focus
+
+If your host draws a focus ring around terminal cells, **do not flip
+`BorderThickness` (or any padding / margin) on focus**. A 1–2 px
+delta on focus change moves the inner area, the control sees a
+`Bounds` change, integer truncation in `RecomputeGrid` may flip the
+column or row count by one, and a `Resized` event fires. On Windows
+that propagates through `ResizePseudoConsole` and ConPTY reframes the
+screen — see the next note for why that's destructive.
+
+Use a constant-thickness border with a colour swap instead:
+
+```csharp
+// Always Thickness(2). Brush distinguishes focused / resting.
+Frame.BorderThickness = new Thickness(2);
+Frame.BorderBrush = focused ? FocusBrush : RestingBrush;
+```
+
+The control ships a 3 px deadband around single-cell boundary
+crossings as defence in depth, so most jitter sources are absorbed —
+but the cleanest fix is to not jitter the layout in the first place.
+
+#### ConPTY + cmd.exe loses blank rows on reframe
+
+On Windows hosting `cmd.exe` through ConPTY, any `ResizePseudoConsole`
+call causes ConPTY to reframe `cmd.exe`'s screen buffer. `cmd.exe`'s
+`echo.` (and any other "advance cursor without writing") leaves rows
+in their default-padding state — indistinguishable from rows the
+cursor never visited — and ConPTY's reframe collapses them away.
+The visible symptom is "blank lines disappear on resize". This is
+fundamental to how the Win32 console screen buffer represents
+unwritten cells; the control can't recover the rows once ConPTY
+emits the new frame. The only mitigation is **don't trigger
+spurious reframes** — see the focus-ring note above. macOS / Linux
+PTYs are byte streams and aren't affected.
+
+#### Window-level vs control-level focus reporting
+
+DECSET 1004 focus events (`\e[I` / `\e[O`) default to firing on
+**OS-window** activation, not on internal pane / tab switches.
+This matches iTerm2 / Terminal.app / WezTerm and avoids storms of
+focus-out / focus-in to every shell when the user clicks between
+panes inside one window. Set `terminal.FocusEventSource =
+FocusEventSource.Control` if you specifically want per-pane
+reporting.
+
+#### Paste interception
+
+The control owns `Cmd/Ctrl+V` end-to-end via
+`PasteFromClipboardAsync()` — clipboard read, image-bytes fallback,
+bracketed paste framing, all of it. **Don't intercept paste at the
+host level and feed text in via `terminal.Paste(text)` yourself**:
+that path skips the image-paste handling, and an image-only
+clipboard becomes a silent no-op. Either let the control handle
+paste natively, or call `PasteFromClipboardAsync()` from your own
+keybinding / menu so all the right work still happens.
 
 ## Public API surface
 
