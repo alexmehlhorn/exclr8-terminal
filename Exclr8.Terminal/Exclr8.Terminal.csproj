@@ -26,7 +26,7 @@
   <!-- ===== NuGet package metadata ===== -->
   <PropertyGroup>
     <PackageId>Exclr8.Terminal</PackageId>
-    <Version>1.0.4</Version>
+    <Version>1.0.5</Version>
     <Authors>Alexander Mehlhorn</Authors>
     <Company>Exclr8 Business Automation (Pty) Ltd</Company>
     <Copyright>© 2026 Exclr8 Business Automation (Pty) Ltd</Copyright>

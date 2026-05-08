@@ -85,8 +85,14 @@ public sealed class VtParser
     private char _dcsPrivatePrefix;
     private readonly StringBuilder _dcsIntermediates = new();
     private char _dcsFinal;
-    private char[] _dcsBuffer = new char[256];
+    // DCS payload accumulator — raw byte buffer for the same reason as
+    // the OSC accumulator above: a vendor DCS handler registered via
+    // RegisterDcsHandler may carry UTF-8 (a label, a comment), which
+    // would smear into Latin-1-style mojibake if we accumulated one
+    // char per byte. Decoded into _dcsCharBuffer at dispatch.
+    private byte[] _dcsBuffer = new byte[256];
     private int _dcsLen;
+    private char[] _dcsCharBuffer = new char[256];
 
     // UTF-8 accumulator — printable codepoints that span multiple bytes
     // are assembled here before dispatch to Print().
@@ -581,7 +587,7 @@ public sealed class VtParser
             int next = Math.Min(_dcsBuffer.Length * 2, DcsMaxLength);
             Array.Resize(ref _dcsBuffer, next);
         }
-        _dcsBuffer[_dcsLen++] = (char)b;
+        _dcsBuffer[_dcsLen++] = b;
     }
 
     private void DcsIgnore(byte b)
@@ -602,12 +608,27 @@ public sealed class VtParser
         // Ensure at least one parameter is recorded so the action gets a
         // consistent shape regardless of whether the sender included one.
         if (_dcsParamCount == 0) _dcsParams[_dcsParamCount++] = _dcsCurrentParam;
+
+        // UTF-8-decode the accumulated bytes into _dcsCharBuffer. Mirror
+        // of the OSC dispatch path: invalid sequences substitute U+FFFD
+        // so a mid-stream garbage byte doesn't desync, and char count is
+        // always <= byte count so the resize check is cheap.
+        var enc = System.Text.Encoding.UTF8;
+        int charCount = enc.GetCharCount(_dcsBuffer, 0, _dcsLen);
+        if (charCount > _dcsCharBuffer.Length)
+        {
+            int next = _dcsCharBuffer.Length;
+            while (next < charCount) next *= 2;
+            _dcsCharBuffer = new char[next];
+        }
+        int written = enc.GetChars(_dcsBuffer, 0, _dcsLen, _dcsCharBuffer, 0);
+
         _actions.DcsDispatch(
             _dcsFinal,
             new ReadOnlySpan<int>(_dcsParams, 0, _dcsParamCount),
             _dcsIntermediates.ToString(),
             _dcsPrivatePrefix,
-            _dcsBuffer.AsSpan(0, _dcsLen));
+            _dcsCharBuffer.AsSpan(0, written));
     }
 
     private void SosPmApcString(byte b)
