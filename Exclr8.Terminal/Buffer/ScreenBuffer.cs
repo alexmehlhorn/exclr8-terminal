@@ -429,10 +429,22 @@ public sealed class ScreenBuffer
         while (n > 0)
         {
             var cell = row[n - 1];
-            if (cell.Rune != 0) break;
+            // Real glyph (anything other than blank or literal space)
+            // anchors the row's length. Spaces alone are treated as
+            // padding — programs that BCE-erase to end of line emit
+            // either rune=0 or a literal space and rely on the bg
+            // attribute to colour the gap. For reflow we don't want
+            // those filler cells to make the logical line "wide
+            // enough" to occupy multiple rows when re-broken at a
+            // narrower width — that turns a single coloured line
+            // into N rows of trailing bg-only filler.
+            if (cell.Rune != 0 && cell.Rune != 0x20) break;
+            // Anything beyond a pure bg colour does anchor: foreground
+            // colour, underline / bold / italic flags, hyperlink runs.
+            // Only a cell that's "blank with at most a background"
+            // counts as trimmable BCE padding.
             if (cell.Flags != 0 || cell.Flags2 != 0) break;
-            if (cell.FgIndex != 0 || cell.BgIndex != 0) break;
-            if (cell.FgRgb != 0 || cell.BgRgb != 0) break;
+            if (cell.FgIndex != 0 || cell.FgRgb != 0) break;
             if (cell.HyperlinkId != 0) break;
             n--;
         }
