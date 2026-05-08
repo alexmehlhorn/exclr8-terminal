@@ -64,13 +64,17 @@ public sealed class VtParser
     private readonly int[] _subParams = new int[32];
     private char _privatePrefix;
     private readonly StringBuilder _intermediates = new();
-    // OSC payload accumulator — plain char[] + length instead of a
-    // StringBuilder so we can hand the payload to OscDispatch as a
-    // ReadOnlySpan<char>, avoiding a per-OSC string allocation.
-    // Grows up to OscMaxLength; consumers that need to retain the
-    // payload (title/URL storage) materialise a string themselves.
-    private char[] _oscBuffer = new char[256];
+    // OSC payload accumulator — kept as a raw byte buffer so multi-
+    // byte UTF-8 codepoints (terminal titles like "✳ Claude Code")
+    // can be reassembled cleanly at dispatch time instead of being
+    // smeared across one char per byte (Latin-1-style mojibake). The
+    // matching char buffer is sized lazily on dispatch from the
+    // decoded char count and reused across OSCs. Grows up to
+    // OscMaxLength; consumers that need to retain the payload
+    // (title/URL storage) materialise a string themselves.
+    private byte[] _oscBuffer = new byte[256];
     private int _oscLen;
+    private char[] _oscCharBuffer = new char[256];
 
     // DCS framing + payload — parameters and payload are dispatched
     // together when ST arrives. Allocated lazily; same hard cap as OSC
@@ -440,7 +444,7 @@ public sealed class VtParser
         _oscLen = 0;
     }
 
-    /// <summary>Hard cap on accumulated OSC payload length (chars).
+    /// <summary>Hard cap on accumulated OSC payload length (bytes).
     /// Anything past this is silently dropped until the sequence
     /// terminator arrives — prevents a runaway emitter from blowing
     /// memory.</summary>
@@ -455,19 +459,37 @@ public sealed class VtParser
             _intermediates.Clear();
             return;
         }
-        if (b < 0x20) return; // ignore other C0 in OSC
+        // C0 controls (other than the terminators above) aren't valid
+        // inside an OSC string. UTF-8 lead/continuation bytes are
+        // 0xC0-0xF7 / 0x80-0xBF respectively, all >= 0x20, so they
+        // pass through this filter and reach the UTF-8 decoder below.
+        if (b < 0x20) return;
         if (_oscLen >= OscMaxLength) return;
         if (_oscLen >= _oscBuffer.Length)
         {
             int next = Math.Min(_oscBuffer.Length * 2, OscMaxLength);
             Array.Resize(ref _oscBuffer, next);
         }
-        _oscBuffer[_oscLen++] = (char)b;
+        _oscBuffer[_oscLen++] = b;
     }
 
     private void DispatchOsc()
     {
-        _actions.OscDispatch(_oscBuffer.AsSpan(0, _oscLen));
+        // UTF-8-decode the accumulated bytes into _oscCharBuffer.
+        // Encoding.UTF8 substitutes U+FFFD for invalid sequences, so
+        // mid-sequence garbage doesn't desync the dispatcher. Char
+        // count is always <= byte count, so the resize check is
+        // proportional but cheap.
+        var enc = System.Text.Encoding.UTF8;
+        int charCount = enc.GetCharCount(_oscBuffer, 0, _oscLen);
+        if (charCount > _oscCharBuffer.Length)
+        {
+            int next = _oscCharBuffer.Length;
+            while (next < charCount) next *= 2;
+            _oscCharBuffer = new char[next];
+        }
+        int written = enc.GetChars(_oscBuffer, 0, _oscLen, _oscCharBuffer, 0);
+        _actions.OscDispatch(_oscCharBuffer.AsSpan(0, written));
     }
 
     // ------------------------------------------------------------------
