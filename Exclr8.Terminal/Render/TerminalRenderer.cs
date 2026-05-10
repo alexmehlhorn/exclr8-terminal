@@ -190,10 +190,21 @@ public sealed class TerminalRenderer
     private static uint ColorKey(Color c) =>
         ((uint)c.A << 24) | ((uint)c.R << 16) | ((uint)c.G << 8) | c.B;
 
+    // Brush and pen caches are unbounded by construction — keyed on
+    // every distinct (A,R,G,B) the renderer encounters. Long-running
+    // sessions against output that emits many distinct 24-bit RGB
+    // values (gradients, themed syntax highlighting, "rainbow" output
+    // from a hostile producer) accumulate ImmutableSolidColorBrush
+    // instances forever. Cap with a clear-on-overflow strategy: rebuild
+    // is cheap (a few field initialisations) so we don't pay the LRU
+    // bookkeeping that the FormattedText cache needs.
+    private const int ColorCacheMax = 1024;
+
     private ImmutableSolidColorBrush BrushFor(Color c)
     {
         uint key = ColorKey(c);
         if (_brushCache.TryGetValue(key, out var brush)) return brush;
+        if (_brushCache.Count >= ColorCacheMax) _brushCache.Clear();
         brush = new ImmutableSolidColorBrush(c);
         _brushCache[key] = brush;
         return brush;
@@ -203,6 +214,7 @@ public sealed class TerminalRenderer
     {
         var key = (ColorKey(c), (int)(thickness * 10));
         if (_penCache.TryGetValue(key, out var pen)) return pen;
+        if (_penCache.Count >= ColorCacheMax) _penCache.Clear();
         pen = new ImmutablePen(BrushFor(c), thickness);
         _penCache[key] = pen;
         return pen;

@@ -46,7 +46,12 @@ public sealed class PtyTerminalAdapter : IAsyncDisposable
     private CancellationTokenSource? _readCts;
     private Task? _readTask;
     private bool _wired;
-    private bool _disposed;
+    // Volatile so the read loop / dispatcher post lambda observe the
+    // Dispose-side write promptly. The .NET memory model lets a plain
+    // bool read see a stale value indefinitely on weakly-ordered
+    // architectures (Apple Silicon, ARM Linux); without the fence the
+    // pump or post can dispatch into a half-disposed adapter.
+    private volatile bool _disposed;
 
     /// <summary>Create an adapter bound to a control. Does not spawn
     /// anything until <see cref="StartAsync"/> is called.</summary>
@@ -120,16 +125,30 @@ public sealed class PtyTerminalAdapter : IAsyncDisposable
     }
 
     private void OnTerminalInput(object? sender, ReadOnlyMemory<byte> bytes)
+        => Send(bytes.Span);
+
+    /// <summary>Write bytes to the PTY through the same writer-lock
+    /// that serialises typed input. Use for programmatic injection
+    /// the host needs alongside keyboard input — e.g. terminal-emitted
+    /// DSR/DA replies (TerminalControl.Output), file-drop payloads
+    /// pasted as text, or host-driven command injection. Returns
+    /// <c>true</c> on success, <c>false</c> if no PTY is attached or
+    /// the underlying stream rejected the write (process exiting,
+    /// pipe torn down). The pipe-broken case is logged via
+    /// <see cref="TerminalLog"/> rather than thrown so a stray late
+    /// write doesn't escape to the host's UI thread.</summary>
+    public bool Send(ReadOnlySpan<byte> bytes)
     {
         var pty = _pty;
-        if (pty is null || bytes.IsEmpty) return;
+        if (pty is null || bytes.IsEmpty) return false;
         try
         {
             lock (_writerLock)
             {
-                pty.WriterStream.Write(bytes.Span);
+                pty.WriterStream.Write(bytes);
                 pty.WriterStream.Flush();
             }
+            return true;
         }
         catch (Exception ex)
         {
@@ -138,17 +157,30 @@ public sealed class PtyTerminalAdapter : IAsyncDisposable
             // to do at the input handler beyond logging so a single
             // bad write doesn't escape to the host's keyboard handler.
             TerminalLog.Error($"[PtyTerminalAdapter] write failed: {ex.Message}");
+            return false;
         }
     }
 
     private void OnTerminalResized(object? sender, (int Cols, int Rows) size)
+        => Resize(size.Cols, size.Rows);
+
+    /// <summary>Resize the underlying PTY directly. The adapter
+    /// already forwards <c>Terminal.Resized</c> events automatically;
+    /// this overload is for hosts that need to fire SIGWINCH without
+    /// a real layout change — e.g. catching up after a resize that
+    /// arrived between option-build and <see cref="StartAsync"/>, or
+    /// nudging a running TUI to redraw on cell focus. Returns
+    /// <c>true</c> on success, <c>false</c> when no PTY is attached
+    /// or the resize call threw.</summary>
+    public bool Resize(int cols, int rows)
     {
         var pty = _pty;
-        if (pty is null) return;
-        try { pty.Resize(size.Cols, size.Rows); }
+        if (pty is null || cols <= 0 || rows <= 0) return false;
+        try { pty.Resize(cols, rows); return true; }
         catch (Exception ex)
         {
             TerminalLog.Error($"[PtyTerminalAdapter] resize failed: {ex.Message}");
+            return false;
         }
     }
 

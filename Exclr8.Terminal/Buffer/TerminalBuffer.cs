@@ -337,6 +337,19 @@ public sealed class TerminalBuffer : IParserActions
             throw new ArgumentException("Marker is already disposed.", nameof(options));
         var dec = new TerminalDecoration(this, options);
         _decorations.Add(dec);
+        // Race: the marker may have disposed between the
+        // IsDisposed check above and the constructor's
+        // Marker.Disposed subscription, OR between that subscription
+        // and the Add above. In the first case Disposed is one-shot
+        // and our late subscription never fires. In the second the
+        // handler ran but RemoveDecoration was a no-op because we
+        // weren't in _decorations yet. Either way the orphan is in
+        // _decorations now — clean up by re-checking.
+        if (dec.Marker.IsDisposed)
+        {
+            dec.Dispose();
+            throw new ArgumentException("Marker is already disposed.", nameof(options));
+        }
         Bump();
         return dec;
     }
@@ -443,6 +456,34 @@ public sealed class TerminalBuffer : IParserActions
         // resize the marker auto-invalidates and we fall back to
         // "preserve cursor row only".
         _osc.SemanticPrompt += OnInternalSemanticPrompt;
+
+        // OSC 8 hyperlink ids are ushort. After 65535 distinct emissions
+        // they wrap; before the dispatcher recycles the id space we
+        // walk every cell and zero any HyperlinkId so on-screen cells
+        // cannot resolve to a recycled slot.
+        _osc.HyperlinkIdsRecycled += OnHyperlinkIdsRecycled;
+    }
+
+    private void OnHyperlinkIdsRecycled()
+    {
+        ZeroHyperlinkIds(_primary);
+        ZeroHyperlinkIds(_alternate);
+    }
+
+    private static void ZeroHyperlinkIds(ScreenBuffer screen)
+    {
+        for (int r = 0; r < screen.Rows; r++)
+        {
+            var row = screen.GetRow(r);
+            for (int c = 0; c < row.Length; c++)
+                if (row[c].HyperlinkId != 0) row[c].HyperlinkId = 0;
+        }
+        foreach (var row in screen.Scrollback)
+        {
+            if (row == null) continue;
+            for (int c = 0; c < row.Length; c++)
+                if (row[c].HyperlinkId != 0) row[c].HyperlinkId = 0;
+        }
     }
 
     private TerminalMarker? _promptStartMarker;
@@ -1367,12 +1408,12 @@ public sealed class TerminalBuffer : IParserActions
 
         switch (final)
         {
-            case 'A': MoveCursorRows(-Max1(p0)); return;
-            case 'B': MoveCursorRows(+Max1(p0)); return;
+            case 'A': MoveCursorUp  (Max1(p0)); return;
+            case 'B': MoveCursorDown(Max1(p0)); return;
             case 'C': CursorCol = Clamp(CursorCol + Max1(p0), 0, Cols - 1); return;
             case 'D': CursorCol = Clamp(CursorCol - Max1(p0), 0, Cols - 1); return;
-            case 'E': CursorCol = 0; MoveCursorRows(+Max1(p0)); return;
-            case 'F': CursorCol = 0; MoveCursorRows(-Max1(p0)); return;
+            case 'E': CursorCol = 0; MoveCursorDown(Max1(p0)); return;
+            case 'F': CursorCol = 0; MoveCursorUp  (Max1(p0)); return;
             case 'G': CursorCol = Clamp((p0 > 0 ? p0 : 1) - 1, 0, Cols - 1); return;
             case 'H':
             case 'f':
@@ -1393,7 +1434,7 @@ public sealed class TerminalBuffer : IParserActions
             case '`': CursorCol = Clamp((p0 > 0 ? p0 : 1) - 1, 0, Cols - 1); return; // HPA
             case 'a': CursorCol = Clamp(CursorCol + Max1(p0), 0, Cols - 1); return;  // HPR
             case 'd': CursorRow = Clamp((p0 > 0 ? p0 : 1) - 1, 0, Rows - 1); return;
-            case 'e': MoveCursorRows(+Max1(p0)); return;     // VPR
+            case 'e': MoveCursorDown(Max1(p0)); return;     // VPR
             case 'g': ClearTabStop(p0); return;             // TBC
             case 'h': SetAnsiMode(p, true);  return;         // SM (IRM, LNM)
             case 'l': SetAnsiMode(p, false); return;         // RM
@@ -1997,7 +2038,31 @@ public sealed class TerminalBuffer : IParserActions
         else                        _active.ScrollDownRegion(ScrollTop, ScrollBottom, 1);
     }
 
-    private void MoveCursorRows(int dy) => CursorRow = Clamp(CursorRow + dy, 0, Rows - 1);
+    /// <summary>
+    /// CUU (cursor-up). Per xterm, when the cursor starts inside the
+    /// scroll region [ScrollTop, ScrollBottom] the upward motion
+    /// clamps at ScrollTop — it does not pass above the top of the
+    /// region. When the cursor starts above the region (legal in
+    /// origin-mode-off), it clamps to the screen top instead. CPL
+    /// (CSI F) shares this behaviour.
+    /// </summary>
+    private void MoveCursorUp(int n)
+    {
+        int min = CursorRow >= ScrollTop ? ScrollTop : 0;
+        CursorRow = Clamp(CursorRow - n, min, Rows - 1);
+    }
+
+    /// <summary>
+    /// CUD (cursor-down) / VPR / CNL. Symmetric to <see cref="MoveCursorUp"/>:
+    /// when the cursor starts inside the scroll region, downward motion
+    /// clamps at ScrollBottom. When it starts below the region, it
+    /// clamps to the screen bottom.
+    /// </summary>
+    private void MoveCursorDown(int n)
+    {
+        int max = CursorRow <= ScrollBottom ? ScrollBottom : Rows - 1;
+        CursorRow = Clamp(CursorRow + n, 0, max);
+    }
 
     private void EraseDisplay(int mode)
     {

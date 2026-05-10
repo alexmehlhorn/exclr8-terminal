@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -151,7 +152,14 @@ public class TerminalControl : Control, IDisposable
     // Registered ILinkProviders. The renderer asks each per visible
     // row, on every frame; providers are expected to be cheap (regex
     // per row, no allocations beyond the matches themselves).
-    private readonly List<ILinkProvider> _linkProviders = new();
+    //
+    // Immutable + atomic swap: register/dispose can happen on any
+    // thread (provider disposable returned to the host gets called
+    // wherever the host disposes it), and the renderer + pointer
+    // handler both iterate on the UI thread. A plain List would race
+    // on concurrent Add/Remove vs. iteration. ImmutableList swaps
+    // cheaply and gives every reader a consistent snapshot.
+    private ImmutableList<ILinkProvider> _linkProviders = ImmutableList<ILinkProvider>.Empty;
     public IReadOnlyList<ILinkProvider> LinkProviders => _linkProviders;
 
     /// <summary>Register a custom link matcher. Returns a disposable
@@ -160,11 +168,22 @@ public class TerminalControl : Control, IDisposable
     public IDisposable RegisterLinkProvider(ILinkProvider provider)
     {
         if (provider == null) throw new ArgumentNullException(nameof(provider));
-        _linkProviders.Add(provider);
+        ImmutableList<ILinkProvider> prev, next;
+        do
+        {
+            prev = _linkProviders;
+            next = prev.Add(provider);
+        } while (System.Threading.Interlocked.CompareExchange(ref _linkProviders, next, prev) != prev);
         InvalidateVisual();
         return new ProviderRegistration(() =>
         {
-            _linkProviders.Remove(provider);
+            ImmutableList<ILinkProvider> p, n;
+            do
+            {
+                p = _linkProviders;
+                n = p.Remove(provider);
+                if (ReferenceEquals(p, n)) return; // already removed
+            } while (System.Threading.Interlocked.CompareExchange(ref _linkProviders, n, p) != p);
             InvalidateVisual();
         });
     }
@@ -320,11 +339,14 @@ public class TerminalControl : Control, IDisposable
     // deletion filter matching either ParentProcessId or ProcessId)
     // and the kqueue chain-watch pattern can surface a process's
     // death from two angles — its own watcher and its parent's.
-    // Bounded at ExitPidMemory to keep the set from growing
-    // unbounded on long-running sessions; on overflow we drop the
-    // whole set (worst case: the next dup would slip through, which
-    // is acceptable).
-    private readonly HashSet<int> _recentlyExitedPids = new();
+    //
+    // Bounded at ExitPidMemory with FIFO eviction. The earlier
+    // wholesale-clear-on-overflow let every in-flight WMI deletion
+    // duplicate slip through immediately after each clear, since the
+    // empty set's first Add for any pid succeeds. Single-oldest
+    // eviction keeps every other entry's dup-suppression intact.
+    private readonly HashSet<int>  _recentlyExitedPids   = new();
+    private readonly Queue<int>    _recentlyExitedOrder  = new();
     private const int ExitPidMemory = 1024;
     private IProcessChildWatcher? _processWatcher;
     private int _rootProcessId;
@@ -381,11 +403,18 @@ public class TerminalControl : Control, IDisposable
         remove
         {
             if (value == null) return;
+            IProcessChildWatcher? toDispose = null;
             lock (_processWatchLock)
             {
                 _processTreeChangedInner -= value;
-                if (ProcessTreeSubscriberCount == 0) StopWatcher_Locked();
+                if (ProcessTreeSubscriberCount == 0) toDispose = StopWatcher_Locked();
             }
+            // Dispose outside the lock: WMI's ManagementEventWatcher.Stop()
+            // synchronously waits for any in-flight EventArrived handler,
+            // which itself takes _processWatchLock — holding the lock
+            // here would deadlock the UI thread on a fork/exit racing
+            // with this remove.
+            if (toDispose != null) try { toDispose.Dispose(); } catch { }
         }
     }
 
@@ -406,7 +435,14 @@ public class TerminalControl : Control, IDisposable
         }
     }
 
-    private void StopWatcher_Locked()
+    /// <summary>
+    /// Detaches the watcher from the control's bookkeeping under the
+    /// caller's <see cref="_processWatchLock"/> and returns it so the
+    /// caller can <c>Dispose()</c> it OUTSIDE the lock. Disposing
+    /// inside the lock can deadlock — see the call sites for the
+    /// reason.
+    /// </summary>
+    private IProcessChildWatcher? StopWatcher_Locked()
     {
         var w = _processWatcher;
         _processWatcher = null;
@@ -414,13 +450,13 @@ public class TerminalControl : Control, IDisposable
         // Drop the recent-exit memory too — the watcher is gone, and
         // a future session shouldn't inherit stale suppression for
         // pids the OS might reuse.
-        _recentlyExitedPids.Clear();
+        RecentlyExitedClear_Locked();
         // Subscriber count is derived from
         // _processTreeChangedInner.GetInvocationList(); we don't
         // touch the delegate here, so the count stays accurate.
-        if (w == null) return;
+        if (w == null) return null;
         w.TreeChanged -= OnWatcherTreeChanged;
-        try { w.Dispose(); } catch { }
+        return w;
     }
 
     private void Watch_Locked(int pid)
@@ -432,7 +468,7 @@ public class TerminalControl : Control, IDisposable
         // pid. Without this, a reused root pid could have its next
         // exit suppressed as a dup (root pids never come through the
         // Created-event path that normally clears the entry).
-        _recentlyExitedPids.Remove(pid);
+        _recentlyExitedPids.Remove(pid); // queue ghost is harmless; cleared on its turn
         if (!_watchedPids.Add(pid)) return;
         try { _processWatcher?.Watch(pid); } catch (Exception ex)
         { TerminalLog.Error($"[TerminalControl] Watch({pid}) failed: {ex.Message}"); }
@@ -450,7 +486,48 @@ public class TerminalControl : Control, IDisposable
         // Re-targeting to a new root — start the dup-suppression
         // memory fresh so a pid from the previous session can't
         // silently mask an exit in the new one.
-    _recentlyExitedPids.Clear();
+        RecentlyExitedClear_Locked();
+    }
+
+    /// <summary>FIFO-ordered insert into the recently-exited dedup
+    /// memory. Returns true on a new entry (caller proceeds), false on
+    /// a duplicate (caller suppresses the event). Evicts the
+    /// genuinely oldest entry on overflow rather than wholesale
+    /// clearing the set, which preserved every other entry's dup
+    /// suppression.</summary>
+    private bool RecentlyExitedAdd_Locked(int pid)
+    {
+        if (!_recentlyExitedPids.Add(pid)) return false;
+        _recentlyExitedOrder.Enqueue(pid);
+        // Evict from the head until live count is back inside the cap.
+        // The queue may contain "ghost" pids (Watch_Locked-cleared
+        // entries that we left in the queue for cheapness); skip over
+        // them — set.Remove returning false costs nothing.
+        while (_recentlyExitedPids.Count > ExitPidMemory
+               && _recentlyExitedOrder.Count > 0)
+        {
+            int oldest = _recentlyExitedOrder.Dequeue();
+            _recentlyExitedPids.Remove(oldest);
+        }
+        // Ghost entries can otherwise grow the queue unboundedly when
+        // many Watch_Locked calls churn pids without the queue's head
+        // ever reaching them. Cap with a 2x safety margin.
+        if (_recentlyExitedOrder.Count > ExitPidMemory * 2)
+        {
+            int target = ExitPidMemory;
+            while (_recentlyExitedOrder.Count > target)
+            {
+                int p = _recentlyExitedOrder.Dequeue();
+                _recentlyExitedPids.Remove(p);
+            }
+        }
+        return true;
+    }
+
+    private void RecentlyExitedClear_Locked()
+    {
+        _recentlyExitedPids.Clear();
+        _recentlyExitedOrder.Clear();
     }
 
     /// <summary>Watcher callback. Fires on a backend thread (kqueue
@@ -475,9 +552,7 @@ public class TerminalControl : Control, IDisposable
             lock (_processWatchLock)
             {
                 _watchedPids.Remove(change.Pid);
-                if (_recentlyExitedPids.Count >= ExitPidMemory)
-                    _recentlyExitedPids.Clear();
-                duplicate = !_recentlyExitedPids.Add(change.Pid);
+                duplicate = !RecentlyExitedAdd_Locked(change.Pid);
             }
             if (duplicate) return;
         }
@@ -710,6 +785,23 @@ public class TerminalControl : Control, IDisposable
         if (WriteDropPolicy == WriteDropPolicy.OldestFirst
             && WriteQueueMaxBytes > 0)
         {
+            // Oversized single payload: a hostile or runaway producer
+            // can bypass the cap entirely with one chunk larger than
+            // WriteQueueMaxBytes (target goes negative, the drain loop
+            // empties the queue, but the unconditional enqueue below
+            // stores the whole oversized payload). Trim from the head
+            // and keep the freshest tail — same "newest wins" policy
+            // we apply to the queued chunks.
+            if (payload.Length > WriteQueueMaxBytes)
+            {
+                int keep = (int)WriteQueueMaxBytes;
+                long dropFromHead = payload.Length - keep;
+                var trimmed = new byte[keep];
+                System.Buffer.BlockCopy(payload, payload.Length - keep, trimmed, 0, keep);
+                DroppedBytes += dropFromHead;
+                payload = trimmed;
+            }
+
             long target = WriteQueueMaxBytes - payload.Length;
             while (System.Threading.Interlocked.Read(ref _writeQueuedBytes) > target
                    && _writeQueue.TryDequeue(out var dropped))
@@ -981,8 +1073,11 @@ public class TerminalControl : Control, IDisposable
     public override void Render(DrawingContext ctx)
     {
         base.Render(ctx);
+        // Snapshot once: a concurrent register/dispose mid-render
+        // would otherwise let Count and indexed access disagree.
+        var providers = _linkProviders;
         _renderer.Render(ctx, _buffer, Bounds.Size, IsFocused, _colorScheme,
-            _linkProviders.Count > 0 ? _linkProviders : null);
+            providers.Count > 0 ? providers : null);
         _lastRevision = _buffer.Revision;
     }
 
@@ -1405,13 +1500,16 @@ public class TerminalControl : Control, IDisposable
             // Plain-URL / custom link providers — most-recent wins. Run
             // only on click, not on every frame — keeps idle overhead at
             // zero. Convert the row to a string once per click attempt.
-            if (cells != null && _linkProviders.Count > 0)
+            // Snapshot the provider list once for a consistent iteration
+            // — concurrent register/dispose can swap it under us.
+            var providers = _linkProviders;
+            if (cells != null && providers.Count > 0)
             {
                 string rowText = RowText.Build(cells, out int[] colMap);
-                for (int i = _linkProviders.Count - 1; i >= 0; i--)
+                for (int i = providers.Count - 1; i >= 0; i--)
                 {
                     int seen = 0;
-                    foreach (var link in _linkProviders[i].Provide(rowText))
+                    foreach (var link in providers[i].Provide(rowText))
                     {
                         // Same per-row cap the renderer enforces — keeps
                         // a runaway provider from spinning here on click.
@@ -1941,8 +2039,14 @@ public class TerminalControl : Control, IDisposable
     /// search.</summary>
     public void Find(string? needle, SearchOptions? options = null)
     {
+        // Cancel the previous scan, but DON'T dispose the CTS here.
+        // The previous RunFindAsync task captured the CTS's token;
+        // disposing the CTS while the task is mid-await on the token
+        // races between OperationCanceledException (clean) and
+        // ObjectDisposedException (caught by the generic catch and
+        // logged as an error). Hand ownership to the task — it
+        // disposes in its finally.
         _searchCts?.Cancel();
-        _searchCts?.Dispose();
         _searchCts = null;
 
         if (string.IsNullOrEmpty(needle))
@@ -1954,11 +2058,12 @@ public class TerminalControl : Control, IDisposable
         var cts = new CancellationTokenSource();
         _searchCts = cts;
         int gen = ++_searchGeneration;
-        _ = RunFindAsync(needle, options ?? SearchOptions.Default, gen, cts.Token);
+        _ = RunFindAsync(needle, options ?? SearchOptions.Default, gen, cts);
     }
 
-    private async Task RunFindAsync(string needle, SearchOptions options, int gen, CancellationToken ct)
+    private async Task RunFindAsync(string needle, SearchOptions options, int gen, CancellationTokenSource cts)
     {
+        var ct = cts.Token;
         try
         {
             await Task.Delay(SearchDebounceMs, ct).ConfigureAwait(true);
@@ -1983,6 +2088,10 @@ public class TerminalControl : Control, IDisposable
         catch (Exception ex)
         {
             TerminalLog.Error($"[TerminalControl] Find failed: {ex.Message}");
+        }
+        finally
+        {
+            cts.Dispose();
         }
     }
 
@@ -2385,11 +2494,17 @@ public class TerminalControl : Control, IDisposable
         _buffer.SynchronizedOutputChanged -= OnSynchronizedOutputChanged;
         _buffer.PaletteChanged            -= OnPaletteChanged;
 
+        // Cancel only — RunFindAsync's finally disposes. Disposing
+        // here too would race the in-flight task and could throw
+        // ObjectDisposedException on its next await.
         _searchCts?.Cancel();
-        _searchCts?.Dispose();
         _searchCts = null;
 
-        lock (_processWatchLock) StopWatcher_Locked();
+        IProcessChildWatcher? toDispose;
+        lock (_processWatchLock) toDispose = StopWatcher_Locked();
+        // Dispose outside the lock to avoid the same deadlock the
+        // remove handler guards against.
+        if (toDispose != null) try { toDispose.Dispose(); } catch { }
 
         GC.SuppressFinalize(this);
     }

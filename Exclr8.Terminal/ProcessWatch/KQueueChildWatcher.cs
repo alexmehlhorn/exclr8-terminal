@@ -49,7 +49,11 @@ internal sealed class KQueueChildWatcher : IProcessChildWatcher
     private readonly ConcurrentDictionary<int, byte> _watched = new();
     private readonly Dictionary<int, HashSet<int>> _lastChildren = new();
     private readonly object _childrenLock = new();
-    private bool _disposed;
+    // Volatile so the pump thread observes Dispose-side flips promptly.
+    // Plain-bool reads can see stale values indefinitely on ARM /
+    // Apple Silicon and would let the pump dispatch through a closed
+    // kqueue fd.
+    private volatile bool _disposed;
 
     public event Action<ProcessTreeChange>? TreeChanged;
 
@@ -213,15 +217,17 @@ internal sealed class KQueueChildWatcher : IProcessChildWatcher
                     // here and consumers walk the tree themselves to
                     // figure out where the pid sits.
                     //
-                    // Reset the children snapshot too: the previous
-                    // program's children (if any) are gone from the
-                    // post-exec process's perspective. Without this,
-                    // a NOTE_FORK delivered after exec compares against
-                    // the pre-exec child set and might suppress the
-                    // first fork as a "duplicate" if pids happen to
-                    // line up.
+                    // Do NOT touch _lastChildren here. The previous
+                    // implementation replaced it with ListChildrenOf(pid),
+                    // which races a fork that happens between exec and
+                    // the listing call: the just-forked child lands in
+                    // the snapshot, and the subsequent NOTE_FORK skips
+                    // it as "already known". Leaving the snapshot
+                    // alone lets the next NOTE_FORK delta correctly
+                    // surface that immediate post-exec fork (and any
+                    // pre-exec children that survived stay in the
+                    // snapshot, so they're not re-emitted).
                     string? name = LookupProcessName(pid);
-                    lock (_childrenLock) _lastChildren[pid] = ListChildrenOf(pid);
                     try
                     {
                         TreeChanged?.Invoke(new ProcessTreeChange(

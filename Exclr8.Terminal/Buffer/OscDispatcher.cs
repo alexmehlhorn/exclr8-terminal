@@ -96,6 +96,17 @@ internal sealed class OscDispatcher
 
     private readonly Dictionary<ushort, string> _hyperlinks = new();
     private ushort _nextHyperlinkId = 1;
+
+    /// <summary>
+    /// Fires immediately before <see cref="_nextHyperlinkId"/> wraps
+    /// past 65535 and the dictionary is cleared. Subscribers (the
+    /// owning <see cref="TerminalBuffer"/>) walk every cell — primary
+    /// screen, primary scrollback, alternate screen — and zero any
+    /// non-zero <c>HyperlinkId</c>, so the recycled id slots cannot
+    /// silently rebind existing on-screen cells to whatever URL the
+    /// next OSC 8 sequence emits.
+    /// </summary>
+    public event Action? HyperlinkIdsRecycled;
     private string _windowTitle = string.Empty;
     private string _iconName    = string.Empty;
     private uint[]? _palette256;
@@ -318,24 +329,50 @@ internal sealed class OscDispatcher
     {
         // Quick path: nothing to decode.
         if (input.IndexOf('%') < 0) return new string(input);
-        var sb = new StringBuilder(input.Length);
+
+        // Per RFC 3986, percent-encoded octets in URIs decode to
+        // *bytes*, and the conventional encoding shells use for OSC 7
+        // paths is UTF-8. The earlier implementation appended each
+        // %xx straight into the StringBuilder as a single UTF-16
+        // code unit — that turned `%C3%A9` (UTF-8 for `é`) into the
+        // mojibake pair `Ã©`. Decode into a byte buffer first, then
+        // run the whole thing through UTF-8 to recover real glyphs.
+        // Non-`%` characters from the input are themselves UTF-16
+        // chars; encode them as UTF-8 into the same buffer so the
+        // final UTF-8 decode is uniform.
+        var utf8  = System.Text.Encoding.UTF8;
+        var bytes = new byte[utf8.GetMaxByteCount(input.Length)];
+        int n = 0;
+        int runStart = -1; // start of an unbroken non-% run; -1 = no run open
+
         for (int i = 0; i < input.Length; i++)
         {
             char c = input[i];
-            if (c == '%' && i + 2 < input.Length
-                && IsHex(input[i + 1]) && IsHex(input[i + 2]))
+            bool isEscape =
+                c == '%' && i + 2 < input.Length
+                && IsHex(input[i + 1]) && IsHex(input[i + 2]);
+
+            if (isEscape)
             {
+                if (runStart >= 0)
+                {
+                    n += utf8.GetBytes(input.Slice(runStart, i - runStart), bytes.AsSpan(n));
+                    runStart = -1;
+                }
                 int hi = HexVal(input[i + 1]);
                 int lo = HexVal(input[i + 2]);
-                sb.Append((char)((hi << 4) | lo));
+                bytes[n++] = (byte)((hi << 4) | lo);
                 i += 2;
             }
-            else
+            else if (runStart < 0)
             {
-                sb.Append(c);
+                runStart = i;
             }
         }
-        return sb.ToString();
+        if (runStart >= 0)
+            n += utf8.GetBytes(input[runStart..], bytes.AsSpan(n));
+
+        return utf8.GetString(bytes, 0, n);
     }
 
     private static bool IsHex(char c) =>
@@ -486,8 +523,27 @@ internal sealed class OscDispatcher
         {
             // URL gets retained — single string allocation here is
             // unavoidable.
+            //
+            // Wrap-and-recycle: with a ushort id we exhaust the space
+            // after 65535 distinct OSC 8 emissions. If we just kept
+            // assigning, the next sequence would land on id 1 and
+            // _hyperlinks[1] = newUrl would silently rebind every
+            // already-on-screen cell that points at id 1 to the new
+            // URL — a click on an old visible link opens something
+            // unrelated, and a hostile producer can deliberately
+            // exhaust ids to redirect a freshly emitted "https://..."
+            // onto a slot the user has been looking at. Before the
+            // recycle, drop the dictionary AND ask the buffer to walk
+            // every cell and zero any HyperlinkId so no on-screen cell
+            // can accidentally resolve to a recycled slot. Old links
+            // become non-clickable rather than misdirected.
+            if (_nextHyperlinkId == 0)
+            {
+                HyperlinkIdsRecycled?.Invoke();
+                _hyperlinks.Clear();
+                _nextHyperlinkId = 1;
+            }
             ActiveLinkId = _nextHyperlinkId++;
-            if (_nextHyperlinkId == 0) _nextHyperlinkId = 1;
             _hyperlinks[ActiveLinkId] = new string(urlSpan);
         }
     }
