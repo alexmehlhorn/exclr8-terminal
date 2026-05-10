@@ -1,7 +1,7 @@
 # Exclr8.Terminal
 
 [![NuGet](https://img.shields.io/nuget/v/Exclr8.Terminal.svg)](https://www.nuget.org/packages/Exclr8.Terminal)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://github.com/alexmehlhorn/exclr8-terminal)
 
 A native Avalonia terminal control for .NET. Drop it into a view, feed
@@ -10,7 +10,7 @@ it wants written back on the other. You get a fully-featured terminal —
 parser, renderer, selection, search, scrollback, the works — with no
 process-spawning or PTY plumbing baked in.
 
-Targets **.NET 10** and **Avalonia 11.3**.
+Targets **.NET 10** and **Avalonia 12.0**.
 
 ## Cross-platform
 
@@ -50,7 +50,7 @@ dotnet add package Exclr8.Terminal
 Or in your `.csproj`:
 
 ```xml
-<PackageReference Include="Exclr8.Terminal" Version="1.0.5" />
+<PackageReference Include="Exclr8.Terminal" Version="1.0.6" />
 ```
 
 ## Status
@@ -68,6 +68,17 @@ small `pty.h` wrapper does the job; on Windows ConPTY is the standard
 path. The control is intentionally agnostic — it works equally well
 with a local PTY, an SSH channel, an in-memory replay stream, or a
 recorded session.
+
+> **Want a working local PTY out of the box?** Add the optional
+> sister package
+> [`Exclr8.Terminal.Pty`](https://www.nuget.org/packages/Exclr8.Terminal.Pty) —
+> wires [Porta.Pty](https://www.nuget.org/packages/Porta.Pty) to a
+> `TerminalControl` in one `await adapter.StartAsync(options)` call
+> (read loop, writer lock, resize, dispose ordering, all included).
+> The core stays PTY-agnostic; the sister package is the spawn-and-go
+> layer for hosts that want a local shell. See
+> [`samples/SimpleTerminal`](samples/SimpleTerminal) for a complete
+> ~70-line example.
 
 ## What it does
 
@@ -632,14 +643,21 @@ they've already worked out what users expect.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [MIT License](LICENSE).
 
 ```
-Copyright 2026 Exclr8 Business Automation (Pty) Ltd
+Copyright (c) 2026 Exclr8 Business Automation (Pty) Ltd
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, subject to the conditions in the
+LICENSE file.
 ```
+
+The [`LICENSE`](LICENSE) file also reproduces the upstream MIT notices for
+**Avalonia** (the UI framework this control is built on) and **xterm.js**
+(whose `EscapeSequenceParser` shaped the parser's structure). Both are
+acknowledged in the *Inspirations / prior art* section above; this is the
+formal attribution.

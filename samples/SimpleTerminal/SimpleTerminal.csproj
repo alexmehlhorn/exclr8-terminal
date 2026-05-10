@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Minimal Avalonia app demonstrating Exclr8.Terminal +
+       Exclr8.Terminal.Pty: spawn the user's shell, wire it to a
+       TerminalControl, dispose cleanly on close. The whole point of
+       the sister package is to make this small. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <!-- Sample is not packed; just runs. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia"           Version="12.0.2" />
+    <PackageReference Include="Avalonia.Desktop"   Version="12.0.2" />
+    <PackageReference Include="Avalonia.Skia"      Version="12.0.2" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Exclr8.Terminal\Exclr8.Terminal.csproj" />
+    <ProjectReference Include="..\..\Exclr8.Terminal.Pty\Exclr8.Terminal.Pty.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Sister package to Exclr8.Terminal — wires Porta.Pty to a
+       TerminalControl so a host gets a working spawn-and-go terminal
+       without rewriting the read-loop / writer-lock / resize / dispose
+       glue every host needs. The core Exclr8.Terminal stays
+       PTY-agnostic; this package is the optional opt-in layer for
+       hosts that want a local PTY. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+
+  <!-- ===== NuGet package metadata ===== -->
+  <PropertyGroup>
+    <PackageId>Exclr8.Terminal.Pty</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Alexander Mehlhorn</Authors>
+    <Company>Exclr8 Business Automation (Pty) Ltd</Company>
+    <Copyright>© 2026 Exclr8 Business Automation (Pty) Ltd</Copyright>
+    <Description>Spawn-and-go PTY adapter for Exclr8.Terminal. Wires Porta.Pty (cross-platform pseudoterminal: macOS / Linux pty + Windows ConPTY) to a TerminalControl in a single StartAsync call — read loop, writer-lock-serialised input, resize forwarding, process-exit propagation, root-pid tracking, ordered async dispose. Optional sister package — the core control stays PTY-agnostic for SSH / replay / custom transport hosts.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/exclr8/exclr8-terminal</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/exclr8/exclr8-terminal</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>terminal;avalonia;pty;conpty;pseudoterminal;shell;exclr8</PackageTags>
+    <PackageReleaseNotes>See https://github.com/exclr8/exclr8-terminal/releases</PackageReleaseNotes>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ProjectReference for dev-time builds in this solution.
+         dotnet pack auto-promotes this to a transitive PackageReference
+         on Exclr8.Terminal at pack time, so consumers get the published
+         core package as a dependency. -->
+    <ProjectReference Include="..\Exclr8.Terminal\Exclr8.Terminal.csproj" />
+    <PackageReference Include="Porta.Pty" Version="1.0.7" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md"  Pack="true" PackagePath="\" />
+    <None Include="..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

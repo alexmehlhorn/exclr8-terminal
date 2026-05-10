@@ -2328,7 +2328,9 @@ public class TerminalControl : Control, IDisposable
         if (replies != null) Output?.Invoke(this, replies);
     }
 
-    protected override void OnGotFocus(GotFocusEventArgs e)
+    // Avalonia 12 unified focus event args: both overrides now take
+    // FocusChangedEventArgs (was GotFocusEventArgs / RoutedEventArgs in 11).
+    protected override void OnGotFocus(FocusChangedEventArgs e)
     {
         base.OnGotFocus(e);
         // PTY focus event only when the host opted into the legacy
@@ -2344,7 +2346,7 @@ public class TerminalControl : Control, IDisposable
         InvalidateVisual();
     }
 
-    protected override void OnLostFocus(Avalonia.Interactivity.RoutedEventArgs e)
+    protected override void OnLostFocus(FocusChangedEventArgs e)
     {
         base.OnLostFocus(e);
         if (FocusEventSource == FocusEventSource.Control)

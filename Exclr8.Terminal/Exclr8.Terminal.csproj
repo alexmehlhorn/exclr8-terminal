@@ -26,12 +26,12 @@
   <!-- ===== NuGet package metadata ===== -->
   <PropertyGroup>
     <PackageId>Exclr8.Terminal</PackageId>
-    <Version>1.0.5</Version>
+    <Version>1.0.6</Version>
     <Authors>Alexander Mehlhorn</Authors>
     <Company>Exclr8 Business Automation (Pty) Ltd</Company>
     <Copyright>© 2026 Exclr8 Business Automation (Pty) Ltd</Copyright>
     <Description>Native Avalonia terminal control for .NET. VT500-class parser (CSI / OSC / DCS / APC, full SGR including 24-bit RGB and SGR 4:N curly underline), reflow on resize, scrollback, OSC 8 hyperlinks, OSC 133 semantic prompts, OSC 7 working-directory tracking, OSC 9;4 progress, OSC 4 / 10 / 11 / 12 dynamic palette, programming-font ligatures, mouse reporting (1006 / 1016), modifyOtherKeys level 2, synchronized output (DECSET 2026), parser extensibility hooks, markers and decorations, custom link providers, VS16 emoji presentation, write coalescing with backpressure, and recovery primitives. No PTY plumbing — wire bytes via Write() and the Input / Resized events.</Description>
-    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/exclr8/exclr8-terminal</PackageProjectUrl>
     <RepositoryUrl>https://github.com/exclr8/exclr8-terminal</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
@@ -52,8 +52,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Avalonia" Version="11.3.12" />
-    <PackageReference Include="Avalonia.Skia" Version="11.3.12" />
+    <PackageReference Include="Avalonia" Version="12.0.2" />
+    <PackageReference Include="Avalonia.Skia" Version="12.0.2" />
     <!-- WMI for the WmiChildWatcher on Windows. System.Management
          ships cross-platform but the WMI runtime only exists on
          Windows — the Windows code path is guarded via
