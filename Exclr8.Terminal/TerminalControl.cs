@@ -47,6 +47,17 @@ public class TerminalControl : Control, IDisposable
     private bool _selectionPending;
     private int  _pressedRow = -1, _pressedCol = -1;
 
+    // True while a LOCAL drag-selection gesture is in flight — i.e. the
+    // press took the local-selection path (mouse reporting off, viewing
+    // scrollback, or Shift held to override app-mode reporting). Once a
+    // local gesture starts, the whole gesture stays local: without this,
+    // a drag that begins in scrollback and auto-scrolls down to
+    // ScrollOffset == 0 under a mouse-reporting app (claude, vim, htop)
+    // was handed off to the app MID-GESTURE — the selection froze at
+    // the scrollback boundary and the release never extended/copied it,
+    // so Cmd+C yielded only the pre-handoff fragment.
+    private bool _localSelectDrag;
+
     // Scrollbar drag state. When the user pointer-presses on the right-
     // edge strip we enter scrollbar-drag mode; subsequent PointerMoved
     // events update ScrollOffset until PointerReleased.
@@ -1478,13 +1489,20 @@ public class TerminalControl : Control, IDisposable
         _lastClickTime = now; _lastClickRow = row; _lastClickCol = col;
 
         // Mouse-reporting mode: forward to PTY as SGR (1006) click
-        // unless we're viewing scrollback.
-        if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
+        // unless we're viewing scrollback — or the user holds Shift,
+        // the xterm/iTerm convention for "let me select locally even
+        // though the app owns the mouse".
+        if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0
+            && !e.KeyModifiers.HasFlag(KeyModifiers.Shift))
         {
+            _localSelectDrag = false;
             SendMouse(btn, row, col, e.KeyModifiers, pressed: true);
             e.Handled = true;
             return;
         }
+        // Local-selection path from here on — pin the whole gesture
+        // local so a mid-drag ScrollOffset change can't hand it off.
+        _localSelectDrag = btn == 0;
 
         // OSC 8 hyperlink: single left-click on a linked cell opens the URL.
         if (_clickCount == 1 && btn == 0)
@@ -1587,13 +1605,13 @@ public class TerminalControl : Control, IDisposable
 
         if (_mouseDown)
         {
-            if (_buffer.MouseMode >= 1002 && _buffer.ScrollOffset == 0)
+            if (!_localSelectDrag && _buffer.MouseMode >= 1002 && _buffer.ScrollOffset == 0)
             {
                 SendMouse(_pressedBtn + 32, row, col, e.KeyModifiers, pressed: true);
                 e.Handled = true;
                 return;
             }
-            if (_buffer.MouseMode == 0 || _buffer.ScrollOffset > 0)
+            if (_localSelectDrag || _buffer.MouseMode == 0 || _buffer.ScrollOffset > 0)
             {
                 // First drag movement — materialise the selection
                 // anchored at the press position.
@@ -1645,9 +1663,12 @@ public class TerminalControl : Control, IDisposable
             _dragAutoScrollTimer.Stop();
             return;
         }
-        if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
+        if (!_localSelectDrag && _buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
         {
-            // App-mode mouse reporting owns drag — don't fight it.
+            // App-mode mouse reporting owns drag — don't fight it. A
+            // LOCAL gesture, however, keeps extending even after auto-
+            // scroll lands back at offset 0 (bailing here froze the
+            // selection at the scrollback boundary).
             _dragAutoScrollTimer.Stop();
             return;
         }
@@ -1723,12 +1744,18 @@ public class TerminalControl : Control, IDisposable
         // panes / windows.
         if (wasDown) e.Pointer.Capture(null);
 
-        if (_buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
+        // App-mode release pairs with an app-mode press. A LOCAL gesture
+        // (press taken locally — scrollback view or Shift override) must
+        // complete locally even if auto-scroll brought ScrollOffset back
+        // to 0 mid-drag; forwarding here froze the selection at the
+        // scrollback boundary and skipped the copy-on-release.
+        if (!_localSelectDrag && _buffer.MouseMode > 0 && _buffer.ScrollOffset == 0)
         {
             SendMouse(_pressedBtn, row, col, e.KeyModifiers, pressed: false);
             e.Handled = true;
             return;
         }
+        _localSelectDrag = false;
 
         if (wasDown)
         {
