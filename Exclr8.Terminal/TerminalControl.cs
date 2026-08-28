@@ -1215,6 +1215,21 @@ public class TerminalControl : Control, IDisposable
         }
     }
 
+    /// <summary>Line height multiplier: 1.0 = the font's natural line
+    /// height; &gt;1 grows the cell and keeps the text vertically
+    /// centered. Triggers cell re-measure and grid reflow.</summary>
+    public double LineHeightMultiplier
+    {
+        get => _renderer.LineHeightMultiplier;
+        set
+        {
+            if (Math.Abs(_renderer.LineHeightMultiplier - value) < 0.001) return;
+            _renderer.LineHeightMultiplier = value;
+            RecomputeGrid();
+            InvalidateVisual();
+        }
+    }
+
     /// <summary>Step the terminal font size by whole points. Positive
     /// direction enlarges (Cmd+=), negative shrinks (Cmd+-). Reflows
     /// the grid so the cell count matches the new cell metrics.</summary>

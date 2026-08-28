@@ -25,6 +25,38 @@ public sealed class TerminalRenderer
     public double CellWidth  { get; private set; }
     public double CellHeight { get; private set; }
 
+    // ===== Baseline pinning + line-height multiplier =====
+    // Wide (CJK) cells render standalone in DrawRow, each as its own
+    // FormattedText. A fallback font's ascent usually differs from the
+    // primary monospace font's, so top-left-aligned DrawText lets those
+    // glyphs drift vertically (mixed Latin/CJK rows look misaligned).
+    // Capture the canonical baseline of the primary font ("M") and pin
+    // every run to it by compensating with the ft.Baseline delta.
+    private double _cellBaseline;      // canonical baseline of the primary font, from row top
+    private double _naturalCellHeight; // font-natural line height (before multiplier)
+    private double _lineHeightMultiplier = 1.0;
+
+    /// <summary>Line height multiplier: 1.0 = the font's natural line
+    /// height; &gt;1 grows the cell and keeps the text vertically centered.
+    /// Re-measures the cell; callers should trigger a grid reflow.</summary>
+    public double LineHeightMultiplier
+    {
+        get => _lineHeightMultiplier;
+        set
+        {
+            var v = Math.Clamp(value, 1.0, 3.0);
+            if (Math.Abs(v - _lineHeightMultiplier) < 0.001) return;
+            _lineHeightMultiplier = v;
+            MeasureCell();
+        }
+    }
+
+    /// <summary>Absolute baseline Y for text drawn in a row starting at
+    /// <paramref name="rowTop"/>: pins the canonical baseline, vertically
+    /// centered inside the (possibly grown) cell.</summary>
+    private double BaselineY(double rowTop) =>
+        rowTop + (CellHeight - _naturalCellHeight) * 0.5 + _cellBaseline;
+
     /// <summary>Whether to draw a 1-px underline beneath OSC 8
     /// hyperlink cells. See <see cref="TerminalControl.ShowHyperlinkUnderline"/>
     /// for the rationale.</summary>
@@ -366,7 +398,8 @@ public sealed class TerminalRenderer
 
     private void MeasureCell()
     {
-        (CellWidth, CellHeight) = Measure(_typeface);
+        double baseline;
+        (CellWidth, _naturalCellHeight, baseline) = Measure(_typeface);
         UsingMonospaceFallback  = false;
         EffectiveFontFamily     = _fontFamily;
 
@@ -388,18 +421,22 @@ public sealed class TerminalRenderer
             // setter (would loop); rebuild the typeface directly.
             var fallback = PlatformMonospaceFamily();
             _typeface              = new Typeface(fallback);
-            (CellWidth, CellHeight) = Measure(_typeface);
+            (CellWidth, _naturalCellHeight, baseline) = Measure(_typeface);
             UsingMonospaceFallback  = true;
             EffectiveFontFamily     = fallback;
             InvalidateFontCaches();
         }
+        // Pin the canonical baseline and apply the line-height multiplier
+        // (cell grows, text stays vertically centered).
+        _cellBaseline = baseline;
+        CellHeight    = _naturalCellHeight * _lineHeightMultiplier;
     }
 
-    private (double w, double h) Measure(Typeface tf)
+    private (double w, double h, double baseline) Measure(Typeface tf)
     {
         var ft = new FormattedText("M", CultureInfo.InvariantCulture,
             FlowDirection.LeftToRight, tf, _fontSize, Brushes.White);
-        return (ft.WidthIncludingTrailingWhitespace, ft.Height);
+        return (ft.WidthIncludingTrailingWhitespace, ft.Height, ft.Baseline);
     }
 
     /// <summary>Platform default monospace family — always available
@@ -739,7 +776,10 @@ public sealed class TerminalRenderer
         var tf = TypefaceFor(bold, italic);
 
         var ft = FormattedTextForRun(_glyphSb, tf, _fontSize, fg);
-        ctx.DrawText(ft, new Point(x, y));
+        // Baseline pinning: standalone wide-cell (CJK) runs shape against a
+        // fallback font whose ascent differs from the primary font's;
+        // compensate by the ft.Baseline delta so all runs share one baseline.
+        ctx.DrawText(ft, new Point(x, BaselineY(y) - ft.Baseline));
 
         double w = ft.WidthIncludingTrailingWhitespace;
 
@@ -889,7 +929,7 @@ public sealed class TerminalRenderer
                                 char.ConvertFromUtf32(cell.Rune),
                                 CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
                                 _typeface, _fontSize, BrushFor(bgColor));
-                            ctx.DrawText(ft, new Point(x, y));
+                            ctx.DrawText(ft, new Point(x, BaselineY(y) - ft.Baseline)); // baseline pinning, same as glyph runs
                         }
                     }
                     break;
